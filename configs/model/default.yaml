@@ -1,0 +1,52 @@
+﻿visual:
+  backbone: open_clip_vit_b_16
+  model_name: ViT-B-16
+  pretrained: true
+  pretrained_tag: openai
+  force_quick_gelu: true
+  freeze_backbone: true
+  use_lora: true
+  lora_rank: 8
+  lora_alpha: 16
+  lora_dropout: 0.0
+  lora_target_semantics: [q_proj, v_proj]
+  lora_mapping_version: open_clip_mha_fused_qv_v1
+  lora_semantic_backend_mapping:
+    open_clip_vit_b_16:
+      attention_module: attn
+  token_dim: 512
+  hidden_dim: 512
+  proj_dim: 256
+  pooling:
+    score_hidden_dim: 256
+    pre_norm: true
+    output_post_norm: true
+    use_mean_residual: true
+    dropout: 0.0
+
+tactile:
+  input_dim: 36
+  num_taxels: 12
+  axis_dim: 3
+  content_encoder_type: cnn1d
+  content_hidden_dim: 256
+  content_layers: 2
+  content_kernel_size: 3
+  evidence_hidden_dim: 128
+  evidence_kernel_size: 3
+
+medium:
+  hidden_dim: 128
+
+attributes:
+  hidden_dim: 128
+  object_feature_dim: 128
+  stop_gradient: true
+
+policy:
+  hidden_dim: 256
+  film_hidden_dim: 128
+
+losses:
+  temperature_clip: 0.07
+  temperature_inv: 0.07

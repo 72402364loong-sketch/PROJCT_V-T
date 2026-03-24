@@ -1,0 +1,17 @@
+﻿name: split_unseen_fold2_v1
+kind: object_level_unseen
+train_object_ids:
+  - OBJ002
+  - OBJ004
+  - OBJ005
+  - OBJ006
+  - OBJ008
+  - OBJ012
+val_object_ids:
+  - OBJ001
+  - OBJ011
+test_object_ids:
+  - OBJ003
+  - OBJ007
+  - OBJ009
+  - OBJ010

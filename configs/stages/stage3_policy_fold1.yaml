@@ -1,0 +1,32 @@
+﻿name: stage3_policy_fold1
+stage_index: 3
+checkpoint_prefix: stage3
+best_checkpoint_name: stage3_best_interface_mae.pt
+split: data/splits/split_unseen_fold1_v1.yaml
+tail_mode: all_valid
+freeze_modules:
+  - visual_encoder
+  - content_encoder
+  - evidence_encoder
+  - medium_head
+  - attribute_head.shared
+  - attribute_head.fragility
+  - attribute_head.geometry
+  - attribute_head.surface
+loss_weights:
+  clip: 0.0
+  inv: 0.0
+  med: 0.0
+  attr: 0.0
+  pol: 2.0
+selection_metric: interface_mae
+maximize_metric: false
+tie_breakers:
+  - metric: overall_mae
+    mode: min
+  - metric: loss_pol
+    mode: min
+  - metric: epoch
+    mode: min
+train:
+  epochs: 15

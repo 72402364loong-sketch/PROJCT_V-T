@@ -1,0 +1,14 @@
+﻿name: probe_mechanism_v1
+kind: sample_level_random
+seed: 7
+object_ids:
+  - OBJ013
+  - OBJ014
+  - OBJ015
+  - OBJ016
+  - OBJ017
+  - OBJ018
+ratios:
+  train: 0.7
+  val: 0.15
+  test: 0.15

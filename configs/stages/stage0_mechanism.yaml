@@ -1,0 +1,12 @@
+name: stage0_mechanism
+split: data/splits/probe_mechanism_v1.yaml
+tail_mode: all_valid
+freeze_modules: []
+loss_weights:
+  clip: 1.0
+  inv: 1.0
+  med: 1.0
+  attr: 1.0
+  pol: 0.0
+selection_metric: medium_macro_f1
+maximize_metric: true

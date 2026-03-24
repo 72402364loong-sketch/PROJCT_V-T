@@ -1,0 +1,26 @@
+﻿name: stage4_joint_fold1
+stage_index: 4
+checkpoint_prefix: stage4
+best_checkpoint_name: stage4_best_interface_mae.pt
+split: data/splits/split_unseen_fold1_v1.yaml
+tail_mode: all_valid
+freeze_modules: []
+loss_weights:
+  clip: 1.0
+  inv: 0.5
+  med: 1.0
+  attr: 1.0
+  pol: 2.0
+selection_metric: interface_mae
+maximize_metric: false
+tie_breakers:
+  - metric: overall_mae
+    mode: min
+  - metric: medium_f1_interface
+    mode: max
+  - metric: medium_macro_f1
+    mode: max
+  - metric: epoch
+    mode: min
+train:
+  epochs: 15

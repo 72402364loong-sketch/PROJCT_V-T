@@ -1,0 +1,40 @@
+﻿run_name: baseline
+seed: 42
+device: cuda
+epochs: 20
+batch_size: 8
+num_workers: 0
+learning_rate: 0.0001
+base_learning_rate: 0.0001
+lora_learning_rate: 0.00005
+weight_decay: 0.0001
+warmup_ratio: 0.1
+min_lr_scale: 0.1
+amp_enabled: true
+grad_clip_norm: 1.0
+early_stopping_patience: 8
+log_tensorboard: true
+use_object_aware_sampler: true
+samples_per_object: 2
+
+default_allowed_trial_results:
+  train:
+    - stable
+  val:
+    - stable
+  test: null
+
+phase_class_weights:
+  Water: 1.0
+  Interface: 2.0
+  Air: 1.0
+
+loss_weights:
+  clip: 1.0
+  inv: 0.5
+  med: 1.0
+  attr: 1.0
+  pol: 2.0
+
+selection_metric: interface_mae
+maximize_metric: false

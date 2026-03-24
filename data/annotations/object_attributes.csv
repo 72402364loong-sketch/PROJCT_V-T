@@ -1,0 +1,19 @@
+﻿object_id,object_name,,fragility,geometry,surface,notes
+OBJ001,Ceramic cup,白色带把杯-后,fragile,cup-like,smooth,陶瓷
+OBJ002,Soup bowl,白色带把碗,fragile,bowl-like,smooth,陶瓷
+OBJ003,White bowl,白色开口大碗,fragile,bowl-like,smooth,陶瓷
+OBJ004,Hammered glass cup,锤纹带把杯,fragile,cup-like,matte,玻璃磨砂
+OBJ005,Black bowl,黑色碗,robust,bowl-like,smooth,塑料
+OBJ006,Blue wine glass,蓝色花瓶,fragile,constricted-opening,smooth,陶瓷
+OBJ007,Frosted glass cup,磨砂杯,fragile,cup-like,matte,玻璃磨砂
+OBJ008,Paper milk bottle,莫斯利安,compliant,cylindrical,smooth,硬质纸
+OBJ009,Plastic milk bottle,牛乳瓶,robust,cylindrical,smooth,塑料
+OBJ010,Light-colored wine glass,浅灰色花瓶,fragile,constricted-opening,smooth,陶瓷
+OBJ011,Mineral water bottle,雀巢优活,compliant,cylindrical,smooth,塑料
+OBJ012,Dark-colored wine glass,深绿色花瓶,fragile,constricted-opening,smooth,陶瓷
+OBJ013,Transparent glass mold,圆柱玻璃,fragile,cylindrical,smooth,玻璃
+OBJ014,"Silicone mold (white, soft)",圆柱硅胶白软,compliant,cylindrical,smooth,硅胶软
+OBJ015,"Silicone mold (white, rigid)",圆柱硅胶白硬,robust,cylindrical,smooth,硅胶硬
+OBJ016,Silicone mold (black),圆柱硅胶黑,robust,cylindrical,smooth,硅胶硬
+OBJ017,Silicone cup,圆柱开口,compliant,cup-like,smooth,硅胶
+OBJ018,Frosted glass mold,圆柱磨砂,fragile,cylindrical,matte,玻璃磨砂

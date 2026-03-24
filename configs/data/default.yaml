@@ -1,0 +1,42 @@
+﻿project_root: .
+data_root: data
+annotations_dir: data/annotations
+processed_dir: data/processed
+splits_dir: data/splits
+
+video_fps: 30.0
+tactile_dt: 0.039
+window_size_sec: 1.0
+window_stride_sec: 0.25
+interface_overlap_sec: 0.25
+stable_margin_sec: 0.25
+short_tail_min_sec: 0.5
+
+num_frames_per_window: 8
+image_size: 224
+roi:
+  x: 460
+  y: 28
+  width: 1024
+  height: 1024
+
+clip_mean: [0.48145466, 0.4578275, 0.40821073]
+clip_std: [0.26862954, 0.26130258, 0.27577711]
+
+normal_axis: z
+normal_reduce: signed-sum-after-sign-calibration
+normal_sign_version: tactile_signs_v1
+normal_sign_table:
+  finger0: [1.0, 1.0, 1.0, 1.0]
+  finger1: [1.0, 1.0, 1.0, 1.0]
+  finger2: [1.0, 1.0, 1.0, 1.0]
+
+tactile_points_per_window: 26
+standardize_tactile: true
+min_valid_ratio_video: 0.8
+min_valid_ratio_tactile: 0.8
+write_sidecar_cache: true
+
+ema_alpha_acdc: 0.1
+ema_alpha_expert: 0.1
+valid_tail_mode: all_valid

@@ -1,0 +1,30 @@
+﻿[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cross-medium-grasp"
+version = "0.1.0"
+description = "Cross-medium visual-tactile grasp learning project scaffold."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "numpy>=1.26",
+  "pandas>=2.2",
+  "PyYAML>=6.0",
+  "torch>=2.2",
+  "torchvision>=0.17",
+  "opencv-python>=4.9",
+  "tensorboard>=2.16",
+  "tqdm>=4.66",
+  "open_clip_torch>=3.3.0",
+  "peft>=0.18",
+  "matplotlib>=3.8",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+

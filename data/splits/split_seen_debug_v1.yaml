@@ -1,0 +1,20 @@
+﻿name: split_seen_debug_v1
+kind: sample_level_random
+seed: 7
+object_ids:
+  - OBJ001
+  - OBJ002
+  - OBJ003
+  - OBJ004
+  - OBJ005
+  - OBJ006
+  - OBJ007
+  - OBJ008
+  - OBJ009
+  - OBJ010
+  - OBJ011
+  - OBJ012
+ratios:
+  train: 0.7
+  val: 0.15
+  test: 0.15
