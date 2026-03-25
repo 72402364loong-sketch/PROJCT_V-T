@@ -177,7 +177,7 @@ def main() -> None:
 
     model = CrossMediumSystem(model_config)
     if init_path is not None:
-        init_info = load_model_weights(model, init_path, strict=True)
+        init_info = load_model_weights(model, init_path, strict=True, allow_lora_injection=True)
         print({'initialized_from': str(init_path), **init_info})
 
     if resume_context is not None and resume_context.get('run_dir'):
@@ -204,4 +204,5 @@ def main() -> None:
 
 if __name__ == '__main__':
     main()
+
 

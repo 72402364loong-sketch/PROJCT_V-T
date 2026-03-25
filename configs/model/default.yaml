@@ -17,6 +17,7 @@
   token_dim: 512
   hidden_dim: 512
   proj_dim: 256
+  max_windows_per_encode: 8
   pooling:
     score_hidden_dim: 256
     pre_norm: true
@@ -50,3 +51,4 @@ policy:
 losses:
   temperature_clip: 0.07
   temperature_inv: 0.07
+

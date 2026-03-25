@@ -20,7 +20,7 @@ from .tactile import (
     split_ac_dc,
     standardize_tactile_window,
 )
-from .video import load_window_frames, sample_frame_indices
+from .video import load_frames_by_indices, sample_frame_indices
 
 
 class CrossMediumSequenceDataset(Dataset):
@@ -218,15 +218,23 @@ class CrossMediumSequenceDataset(Dataset):
         expert_forces: list[float] = []
         has_expert: list[int] = []
 
+        window_video_specs: list[tuple[list[int], list[bool]]] = []
+        sampled_frame_indices: list[int] = []
         for window in windows:
             all_frame_indices = json.loads(window['video_frame_indices_json'])
             sampled_indices, frame_mask = sample_frame_indices(all_frame_indices, self.num_frames_per_window)
-            frame_array = load_window_frames(
-                video_path=video_path,
-                frame_indices=sampled_indices,
-                image_size=self.image_size,
-                roi=self.roi,
-            )
+            window_video_specs.append((sampled_indices, frame_mask))
+            sampled_frame_indices.extend(sampled_indices)
+
+        frame_map = load_frames_by_indices(
+            video_path=video_path,
+            frame_indices=sampled_frame_indices,
+            image_size=self.image_size,
+            roi=self.roi,
+        )
+
+        for window, (sampled_indices, frame_mask) in zip(windows, window_video_specs):
+            frame_array = np.stack([frame_map[int(frame_index)] for frame_index in sampled_indices], axis=0)
             frame_tensor = torch.from_numpy(frame_array).permute(0, 3, 1, 2)
             if self.clip_mean is not None and self.clip_std is not None:
                 frame_tensor = (frame_tensor - self.clip_mean) / self.clip_std
@@ -360,3 +368,4 @@ def sequence_collate_fn(batch: list[dict[str, Any]]) -> dict[str, Any]:
         'geometry_label': geometry_label,
         'surface_label': surface_label,
     }
+

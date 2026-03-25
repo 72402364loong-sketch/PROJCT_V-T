@@ -5,6 +5,19 @@ from pathlib import Path
 import pandas as pd
 
 from cmg.constants import infer_object_pool
+CSV_ENCODINGS = ('utf-8-sig', 'utf-8', 'gb18030')
+
+
+def read_csv_with_fallback(path: str | Path) -> pd.DataFrame:
+    last_error: UnicodeDecodeError | None = None
+    for encoding in CSV_ENCODINGS:
+        try:
+            return pd.read_csv(path, encoding=encoding)
+        except UnicodeDecodeError as exc:
+            last_error = exc
+    if last_error is not None:
+        raise last_error
+    return pd.read_csv(path)
 
 
 
@@ -22,7 +35,7 @@ def _normalize_category(value: str | float | None) -> str | None:
 
 
 def normalize_object_attributes(path: str | Path) -> pd.DataFrame:
-    frame = pd.read_csv(path)
+    frame = read_csv_with_fallback(path)
     rename_map: dict[str, str] = {}
     for column in frame.columns:
         text = str(column).strip()
@@ -55,7 +68,7 @@ def normalize_object_attributes(path: str | Path) -> pd.DataFrame:
 
 
 def normalize_sample_events(path: str | Path) -> pd.DataFrame:
-    frame = pd.read_csv(path)
+    frame = read_csv_with_fallback(path)
     for missing in ['trial_id', 'notes', 'sync_offset_sec', 'sync_audit_status', 'sync_audit_note']:
         if missing not in frame.columns:
             frame[missing] = pd.NA
@@ -101,3 +114,4 @@ def normalize_sample_events(path: str | Path) -> pd.DataFrame:
         'sync_audit_note',
     ]
     return frame[ordered_columns].sort_values('sample_id').reset_index(drop=True)
+

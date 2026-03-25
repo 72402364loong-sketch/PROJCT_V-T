@@ -66,6 +66,21 @@ def sample_frame_indices(indices: list[int], num_frames: int) -> tuple[list[int]
     return sampled, mask
 
 
+def preprocess_frame(
+    frame: np.ndarray,
+    *,
+    image_size: int,
+    roi: dict[str, int] | None,
+) -> np.ndarray:
+    frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    if roi:
+        x, y = roi['x'], roi['y']
+        w, h = roi['width'], roi['height']
+        frame = frame[y : y + h, x : x + w]
+    frame = cv2.resize(frame, (image_size, image_size), interpolation=cv2.INTER_LINEAR)
+    return frame.astype(np.float32) / 255.0
+
+
 def load_frame_at_index(
     video_path: str | Path,
     frame_index: int,
@@ -80,13 +95,43 @@ def load_frame_at_index(
     capture.release()
     if not success:
         raise RuntimeError(f'Unable to decode frame {frame_index} from {video_path}.')
-    frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    if roi:
-        x, y = roi['x'], roi['y']
-        w, h = roi['width'], roi['height']
-        frame = frame[y : y + h, x : x + w]
-    frame = cv2.resize(frame, (image_size, image_size), interpolation=cv2.INTER_LINEAR)
-    return frame.astype(np.float32) / 255.0
+    return preprocess_frame(frame, image_size=image_size, roi=roi)
+
+
+def load_frames_by_indices(
+    video_path: str | Path,
+    frame_indices: list[int],
+    image_size: int,
+    roi: dict[str, int] | None,
+) -> dict[int, np.ndarray]:
+    if cv2 is None:
+        raise RuntimeError('opencv-python is required for video decoding.')
+    if not frame_indices:
+        raise RuntimeError(f'No frame indices requested for {video_path}.')
+
+    unique_indices = sorted({int(frame_index) for frame_index in frame_indices})
+    capture = cv2.VideoCapture(str(video_path))
+    if not capture.isOpened():
+        raise FileNotFoundError(f'Unable to open video: {video_path}')
+
+    frames: dict[int, np.ndarray] = {}
+    try:
+        for frame_index in unique_indices:
+            capture.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
+            success, frame = capture.read()
+            if not success:
+                capture.release()
+                capture = cv2.VideoCapture(str(video_path))
+                if not capture.isOpened():
+                    raise FileNotFoundError(f'Unable to reopen video: {video_path}')
+                capture.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
+                success, frame = capture.read()
+            if not success:
+                raise RuntimeError(f'Unable to decode frame {frame_index} from {video_path}.')
+            frames[frame_index] = preprocess_frame(frame, image_size=image_size, roi=roi)
+    finally:
+        capture.release()
+    return frames
 
 
 def load_window_frames(
@@ -95,23 +140,13 @@ def load_window_frames(
     image_size: int,
     roi: dict[str, int] | None,
 ) -> np.ndarray:
-    if cv2 is None:
-        raise RuntimeError('opencv-python is required for video decoding.')
-    capture = cv2.VideoCapture(str(video_path))
-    frames: list[np.ndarray] = []
-    for frame_index in frame_indices:
-        capture.set(cv2.CAP_PROP_POS_FRAMES, int(frame_index))
-        success, frame = capture.read()
-        if not success:
-            break
-        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        if roi:
-            x, y = roi['x'], roi['y']
-            w, h = roi['width'], roi['height']
-            frame = frame[y : y + h, x : x + w]
-        frame = cv2.resize(frame, (image_size, image_size), interpolation=cv2.INTER_LINEAR)
-        frames.append(frame.astype(np.float32) / 255.0)
-    capture.release()
+    frame_map = load_frames_by_indices(
+        video_path=video_path,
+        frame_indices=frame_indices,
+        image_size=image_size,
+        roi=roi,
+    )
+    frames = [frame_map[int(frame_index)] for frame_index in frame_indices]
     if not frames:
         raise RuntimeError(f'No frames decoded from {video_path} at {json.dumps(frame_indices)}')
     return np.stack(frames, axis=0)

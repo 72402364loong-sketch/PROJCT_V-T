@@ -22,5 +22,8 @@ tie_breakers:
     mode: max
   - metric: epoch
     mode: min
+model:
+  visual:
+    use_lora: true
 train:
   epochs: 15

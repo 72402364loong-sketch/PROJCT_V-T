@@ -277,6 +277,7 @@ class VisualEncoder(nn.Module):
         self.adapter: nn.Module | None = None
         self.token_projection: nn.Module = nn.Identity()
         self.lora_mapping_version = None
+        self.max_windows_per_encode = max(1, int(config.get('max_windows_per_encode', 8)))
 
         if backbone_name in {'open_clip_vit_b_16', 'clip_vit_b_16', 'vit_b_16'} and open_clip is not None:
             self.backbone_kind = 'open_clip'
@@ -359,14 +360,22 @@ class VisualEncoder(nn.Module):
 
     def forward(self, video: torch.Tensor, frame_mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         batch_size, time_steps = video.shape[:2]
-        frames = video.reshape(batch_size * time_steps, *video.shape[2:])
-        if self.backbone_kind == 'open_clip':
-            features = self._forward_open_clip_frames(frames)
-        else:
-            features = self.backbone(frames)
-            if self.adapter is not None:
-                features = self.adapter(features)
-        tokens = self.token_projection(features).reshape(batch_size, time_steps, -1)
+        token_chunks: list[torch.Tensor] = []
+
+        # Chunk window sequences before the visual backbone to keep full-length samples on GPU.
+        for start in range(0, batch_size, self.max_windows_per_encode):
+            stop = min(batch_size, start + self.max_windows_per_encode)
+            video_chunk = video[start:stop]
+            frames = video_chunk.reshape(video_chunk.shape[0] * time_steps, *video.shape[2:])
+            if self.backbone_kind == 'open_clip':
+                features = self._forward_open_clip_frames(frames)
+            else:
+                features = self.backbone(frames)
+                if self.adapter is not None:
+                    features = self.adapter(features)
+            token_chunks.append(self.token_projection(features).reshape(video_chunk.shape[0], time_steps, -1))
+
+        tokens = torch.cat(token_chunks, dim=0)
         window_features = self.temporal_pool(tokens, frame_mask)
         aligned = F.normalize(self.align_head(window_features), dim=-1)
         return window_features, aligned
@@ -560,6 +569,8 @@ class PolicyHead(nn.Module):
         hidden = (1.0 + gamma) * hidden + beta
         hidden = F.gelu(self.hidden_layer(hidden))
         return self.output_layer(hidden).squeeze(-1)
+
+
 
 
 

@@ -20,5 +20,9 @@ tie_breakers:
     mode: min
   - metric: epoch
     mode: min
+model:
+  visual:
+    use_lora: false
 train:
   epochs: 20
+  batch_size: 2

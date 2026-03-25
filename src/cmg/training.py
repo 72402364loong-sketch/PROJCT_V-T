@@ -122,15 +122,66 @@ def load_checkpoint_context(path: str | Path) -> dict[str, Any]:
     }
 
 
-def load_model_weights(model: nn.Module, path: str | Path, *, strict: bool = True) -> dict[str, Any]:
+def remap_open_clip_lora_keys(
+    state_dict: dict[str, torch.Tensor],
+    target_state_keys: set[str],
+) -> tuple[dict[str, torch.Tensor], dict[str, str]]:
+    remapped: dict[str, torch.Tensor] = {}
+    remap_log: dict[str, str] = {}
+    for key, value in state_dict.items():
+        candidate = key
+        if '.attn.' in key and '.attn.base_attn.' not in key:
+            maybe = key.replace('.attn.', '.attn.base_attn.')
+            if maybe in target_state_keys:
+                candidate = maybe
+        remapped[candidate] = value
+        if candidate != key:
+            remap_log[key] = candidate
+    return remapped, remap_log
+
+
+
+def is_allowed_lora_injection_mismatch(key: str) -> bool:
+    return 'lora_' in key
+
+
+
+def load_model_weights(
+    model: nn.Module,
+    path: str | Path,
+    *,
+    strict: bool = True,
+    allow_lora_injection: bool = False,
+) -> dict[str, Any]:
     context = load_checkpoint_context(path)
     checkpoint = context['checkpoint']
     state_dict = checkpoint['model'] if isinstance(checkpoint, dict) and 'model' in checkpoint else checkpoint
+    remapped_keys: dict[str, str] = {}
+    if allow_lora_injection:
+        state_dict, remapped_keys = remap_open_clip_lora_keys(state_dict, set(model.state_dict().keys()))
+        strict = False
     incompatible = model.load_state_dict(state_dict, strict=strict)
+    missing_keys = list(incompatible.missing_keys)
+    unexpected_keys = list(incompatible.unexpected_keys)
+    if allow_lora_injection:
+        disallowed_missing = [key for key in missing_keys if not is_allowed_lora_injection_mismatch(key)]
+        disallowed_unexpected = [key for key in unexpected_keys if not is_allowed_lora_injection_mismatch(key)]
+        if disallowed_missing or disallowed_unexpected:
+            details = {
+                'missing_keys': missing_keys,
+                'unexpected_keys': unexpected_keys,
+                'remapped_keys': remapped_keys,
+            }
+            raise RuntimeError(
+                'Checkpoint initialization encountered mismatched keys beyond the expected LoRA injection delta: '
+                + json.dumps(details, ensure_ascii=False)
+            )
     return {
         'checkpoint_path': context['checkpoint_path'],
-        'missing_keys': list(incompatible.missing_keys),
-        'unexpected_keys': list(incompatible.unexpected_keys),
+        'missing_keys': missing_keys,
+        'unexpected_keys': unexpected_keys,
+        'remapped_keys': remapped_keys,
+        'allow_lora_injection': allow_lora_injection,
         'stage_name': context['stage_name'],
         'run_dir': context['run_dir'],
         'run_config_path': context['run_config_path'],
@@ -612,6 +663,7 @@ class Trainer:
             scaler=self.scaler if training else None,
             grad_clip_norm=self.grad_clip_norm,
         )
+
 
 
 

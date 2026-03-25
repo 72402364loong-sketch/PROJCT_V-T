@@ -14,6 +14,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from cmg.constants import FRAGILITY_TO_INDEX, GEOMETRY_TO_INDEX, SURFACE_TO_INDEX
+from cmg.data.annotations import read_csv_with_fallback
 from cmg.data.video import get_video_metadata
 
 ALLOWED_TRIAL_RESULTS = {'stable', 'partial_slip', 'fail'}
@@ -209,8 +210,8 @@ def main() -> None:
     object_path = project_root / 'data' / 'annotations' / 'object_attributes.csv'
     sample_path = project_root / 'data' / 'annotations' / 'sample_events.csv'
 
-    objects_raw = pd.read_csv(object_path)
-    samples_raw = pd.read_csv(sample_path)
+    objects_raw = read_csv_with_fallback(object_path)
+    samples_raw = read_csv_with_fallback(sample_path)
     object_issues, objects = validate_object_attributes(objects_raw)
     sample_issues = validate_sample_events(project_root, samples_raw, set(objects['object_id'].tolist()))
     all_issues = object_issues + sample_issues
@@ -242,3 +243,4 @@ def main() -> None:
 
 if __name__ == '__main__':
     main()
+
