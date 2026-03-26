@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import json
 from pathlib import Path
@@ -21,6 +21,7 @@ from .tactile import (
     standardize_tactile_window,
 )
 from .video import load_frames_by_indices, sample_frame_indices
+from .visual_cache import load_sample_visual_feature_cache, resolve_sample_visual_feature_cache_path, resolve_visual_feature_cache_dir
 
 
 class CrossMediumSequenceDataset(Dataset):
@@ -47,6 +48,7 @@ class CrossMediumSequenceDataset(Dataset):
         normalization_trial_results: Iterable[str] | None = None,
         tail_mode: str = 'all_valid',
         allowed_trial_results: Iterable[str] | None = None,
+        visual_feature_cache_dir: str | Path | None = None,
     ) -> None:
         self.project_root = Path(project_root)
         self.split_path = Path(split_path)
@@ -68,6 +70,7 @@ class CrossMediumSequenceDataset(Dataset):
         self.allowed_trial_results = None if allowed_trial_results is None else {str(value).strip().lower() for value in allowed_trial_results}
         self.normalization_trial_results = None if normalization_trial_results is None else {str(value).strip().lower() for value in normalization_trial_results}
         self.tail_mode = tail_mode
+        self.visual_feature_cache_dir = resolve_visual_feature_cache_dir(self.project_root, visual_feature_cache_dir)
 
         samples_path = self.project_root / 'data' / 'processed' / 'samples.csv'
         windows_path = self.project_root / 'data' / 'processed' / 'windows.csv'
@@ -193,7 +196,6 @@ class CrossMediumSequenceDataset(Dataset):
     def __getitem__(self, index: int) -> dict[str, Any]:
         sample = self.sample_records[index]
         windows = self.windows_by_sample[sample['sample_id']]
-        video_path = self._resolve_data_path(sample['video_path'])
         tactile_path = self._resolve_data_path(sample['tactile_path'])
         tactile_array = load_tactile_array(tactile_path)
         tactile_high, tactile_low = split_ac_dc(tactile_array, alpha=self.acdc_alpha)
@@ -206,8 +208,9 @@ class CrossMediumSequenceDataset(Dataset):
             normal_sign_table=self.normal_sign_table,
         )
 
-        video_windows: list[torch.Tensor] = []
-        frame_masks: list[torch.Tensor] = []
+        visual_feature_windows: list[torch.Tensor] | None = None
+        video_windows: list[torch.Tensor] | None = None
+        frame_masks: list[torch.Tensor] | None = None
         tactile_high_windows: list[torch.Tensor] = []
         tactile_low_windows: list[torch.Tensor] = []
         tactile_window_masks: list[torch.Tensor] = []
@@ -218,29 +221,47 @@ class CrossMediumSequenceDataset(Dataset):
         expert_forces: list[float] = []
         has_expert: list[int] = []
 
-        window_video_specs: list[tuple[list[int], list[bool]]] = []
-        sampled_frame_indices: list[int] = []
+        cache_path = None
+        if self.visual_feature_cache_dir is not None:
+            cache_path = resolve_sample_visual_feature_cache_path(self.project_root, self.visual_feature_cache_dir, str(sample['sample_id']))
+        if cache_path is not None and cache_path.exists():
+            payload = load_sample_visual_feature_cache(cache_path)
+            feature_map = {
+                str(window_id): payload['visual_features'][index]
+                for index, window_id in enumerate(payload['window_ids'].tolist())
+            }
+            visual_feature_windows = [
+                torch.from_numpy(np.asarray(feature_map[str(window['window_id'])], dtype=np.float32))
+                for window in windows
+            ]
+        else:
+            video_path = self._resolve_data_path(sample['video_path'])
+            video_windows = []
+            frame_masks = []
+            window_video_specs: list[tuple[list[int], list[bool]]] = []
+            sampled_frame_indices: list[int] = []
+            for window in windows:
+                all_frame_indices = json.loads(window['video_frame_indices_json'])
+                sampled_indices, frame_mask = sample_frame_indices(all_frame_indices, self.num_frames_per_window)
+                window_video_specs.append((sampled_indices, frame_mask))
+                sampled_frame_indices.extend(sampled_indices)
+
+            frame_map = load_frames_by_indices(
+                video_path=video_path,
+                frame_indices=sampled_frame_indices,
+                image_size=self.image_size,
+                roi=self.roi,
+            )
+
+            for window, (sampled_indices, frame_mask) in zip(windows, window_video_specs):
+                frame_array = np.stack([frame_map[int(frame_index)] for frame_index in sampled_indices], axis=0)
+                frame_tensor = torch.from_numpy(frame_array).permute(0, 3, 1, 2)
+                if self.clip_mean is not None and self.clip_std is not None:
+                    frame_tensor = (frame_tensor - self.clip_mean) / self.clip_std
+                video_windows.append(frame_tensor)
+                frame_masks.append(torch.tensor(frame_mask, dtype=torch.bool))
+
         for window in windows:
-            all_frame_indices = json.loads(window['video_frame_indices_json'])
-            sampled_indices, frame_mask = sample_frame_indices(all_frame_indices, self.num_frames_per_window)
-            window_video_specs.append((sampled_indices, frame_mask))
-            sampled_frame_indices.extend(sampled_indices)
-
-        frame_map = load_frames_by_indices(
-            video_path=video_path,
-            frame_indices=sampled_frame_indices,
-            image_size=self.image_size,
-            roi=self.roi,
-        )
-
-        for window, (sampled_indices, frame_mask) in zip(windows, window_video_specs):
-            frame_array = np.stack([frame_map[int(frame_index)] for frame_index in sampled_indices], axis=0)
-            frame_tensor = torch.from_numpy(frame_array).permute(0, 3, 1, 2)
-            if self.clip_mean is not None and self.clip_std is not None:
-                frame_tensor = (frame_tensor - self.clip_mean) / self.clip_std
-            video_windows.append(frame_tensor)
-            frame_masks.append(torch.tensor(frame_mask, dtype=torch.bool))
-
             start_idx = int(window['tactile_start_idx'])
             end_idx = int(window['tactile_end_idx'])
             tactile_high_window = tactile_high[start_idx:end_idx]
@@ -273,6 +294,7 @@ class CrossMediumSequenceDataset(Dataset):
             'sample_index': self.sample_index[sample['sample_id']],
             'object_id': sample['object_id'],
             'object_index': self.object_index[sample['object_id']],
+            'visual_feature_windows': visual_feature_windows,
             'video_windows': video_windows,
             'frame_masks': frame_masks,
             'tactile_high_windows': tactile_high_windows,
@@ -292,15 +314,24 @@ class CrossMediumSequenceDataset(Dataset):
 
 def sequence_collate_fn(batch: list[dict[str, Any]]) -> dict[str, Any]:
     batch_size = len(batch)
-    max_windows = max(len(item['video_windows']) for item in batch)
-    num_frames = batch[0]['video_windows'][0].shape[0]
-    channels = batch[0]['video_windows'][0].shape[1]
-    height = batch[0]['video_windows'][0].shape[2]
-    width = batch[0]['video_windows'][0].shape[3]
+    max_windows = max(len(item['tactile_high_windows']) for item in batch)
     max_tactile = max(max(item['tactile_high_windows'][window_index].shape[0] for window_index in range(len(item['tactile_high_windows']))) for item in batch)
+    use_visual_features = batch[0].get('visual_feature_windows') is not None
 
-    video = torch.zeros(batch_size, max_windows, num_frames, channels, height, width, dtype=torch.float32)
-    frame_mask = torch.zeros(batch_size, max_windows, num_frames, dtype=torch.bool)
+    visual_features = None
+    video = None
+    frame_mask = None
+    if use_visual_features:
+        feature_dim = batch[0]['visual_feature_windows'][0].shape[0]
+        visual_features = torch.zeros(batch_size, max_windows, feature_dim, dtype=torch.float32)
+    else:
+        num_frames = batch[0]['video_windows'][0].shape[0]
+        channels = batch[0]['video_windows'][0].shape[1]
+        height = batch[0]['video_windows'][0].shape[2]
+        width = batch[0]['video_windows'][0].shape[3]
+        video = torch.zeros(batch_size, max_windows, num_frames, channels, height, width, dtype=torch.float32)
+        frame_mask = torch.zeros(batch_size, max_windows, num_frames, dtype=torch.bool)
+
     tactile_high = torch.zeros(batch_size, max_windows, max_tactile, 36, dtype=torch.float32)
     tactile_low = torch.zeros(batch_size, max_windows, max_tactile, 36, dtype=torch.float32)
     tactile_mask = torch.zeros(batch_size, max_windows, max_tactile, dtype=torch.bool)
@@ -327,16 +358,19 @@ def sequence_collate_fn(batch: list[dict[str, Any]]) -> dict[str, Any]:
         fragility_label[batch_index] = int(item['fragility_label'])
         geometry_label[batch_index] = int(item['geometry_label'])
         surface_label[batch_index] = int(item['surface_label'])
-        num_windows_item = len(item['video_windows'])
+        num_windows_item = len(item['tactile_high_windows'])
         window_lengths[batch_index] = num_windows_item
         for window_index in range(num_windows_item):
-            frames = item['video_windows'][window_index]
-            frames_valid = item['frame_masks'][window_index]
+            if use_visual_features:
+                visual_features[batch_index, window_index] = item['visual_feature_windows'][window_index]
+            else:
+                frames = item['video_windows'][window_index]
+                frames_valid = item['frame_masks'][window_index]
+                video[batch_index, window_index, :frames.shape[0]] = frames
+                frame_mask[batch_index, window_index, :frames_valid.shape[0]] = frames_valid
             high = item['tactile_high_windows'][window_index]
             low = item['tactile_low_windows'][window_index]
             tactile_valid = item['tactile_window_masks'][window_index]
-            video[batch_index, window_index, :frames.shape[0]] = frames
-            frame_mask[batch_index, window_index, :frames_valid.shape[0]] = frames_valid
             tactile_high[batch_index, window_index, :high.shape[0]] = high
             tactile_low[batch_index, window_index, :low.shape[0]] = low
             tactile_mask[batch_index, window_index, :tactile_valid.shape[0]] = tactile_valid
@@ -352,6 +386,7 @@ def sequence_collate_fn(batch: list[dict[str, Any]]) -> dict[str, Any]:
         'object_ids': object_ids,
         'object_index': object_index,
         'sample_index': sample_index,
+        'visual_features': visual_features,
         'video': video,
         'frame_mask': frame_mask,
         'tactile_high': tactile_high,
@@ -368,4 +403,3 @@ def sequence_collate_fn(batch: list[dict[str, Any]]) -> dict[str, Any]:
         'geometry_label': geometry_label,
         'surface_label': surface_label,
     }
-

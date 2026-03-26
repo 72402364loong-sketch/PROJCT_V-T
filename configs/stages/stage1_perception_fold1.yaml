@@ -1,4 +1,4 @@
-﻿name: stage1_perception_fold1
+name: stage1_perception_fold1
 stage_index: 1
 checkpoint_prefix: stage1
 best_checkpoint_name: stage1_best_joint_f1.pt
@@ -20,9 +20,13 @@ tie_breakers:
     mode: min
   - metric: epoch
     mode: min
+data:
+  visual_feature_cache_dir: data/processed/cache/visual_stage1_perception_fold1
 model:
   visual:
     use_lora: false
 train:
   epochs: 20
   batch_size: 2
+  num_workers: 4
+  val_every_n_epochs: 2

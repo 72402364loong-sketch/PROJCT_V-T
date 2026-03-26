@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import torch
 from torch import nn
@@ -22,6 +22,7 @@ class CrossMediumSystem(nn.Module):
         medium_config = model_config['medium']
         policy_config = model_config['policy']
         proj_dim = int(visual_config['proj_dim'])
+        self.visual_proj_dim = proj_dim
         visual_hidden_dim = int(visual_config.get('hidden_dim', visual_config.get('token_dim', proj_dim)))
         self.stop_gradient = bool(attribute_config.get('stop_gradient', True))
 
@@ -62,14 +63,18 @@ class CrossMediumSystem(nn.Module):
         return attribute_outputs, g_obj, task_context
 
     def forward(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-        batch_size, max_windows = batch['video'].shape[:2]
-        flat_video = batch['video'].reshape(batch_size * max_windows, *batch['video'].shape[2:])
-        flat_frame_mask = batch['frame_mask'].reshape(batch_size * max_windows, batch['frame_mask'].shape[-1])
+        batch_size, max_windows = batch['window_mask'].shape
         flat_tactile_high = batch['tactile_high'].reshape(batch_size * max_windows, *batch['tactile_high'].shape[2:])
         flat_tactile_low = batch['tactile_low'].reshape(batch_size * max_windows, *batch['tactile_low'].shape[2:])
         flat_tactile_mask = batch['tactile_mask'].reshape(batch_size * max_windows, batch['tactile_mask'].shape[-1])
 
-        h_v, z_v = self.visual_encoder(flat_video, flat_frame_mask)
+        if batch.get('visual_features') is not None:
+            h_v = batch['visual_features'].reshape(batch_size * max_windows, batch['visual_features'].shape[-1])
+            z_v = h_v.new_zeros((h_v.shape[0], self.visual_proj_dim))
+        else:
+            flat_video = batch['video'].reshape(batch_size * max_windows, *batch['video'].shape[2:])
+            flat_frame_mask = batch['frame_mask'].reshape(batch_size * max_windows, batch['frame_mask'].shape[-1])
+            h_v, z_v = self.visual_encoder(flat_video, flat_frame_mask)
         z_content, z_t = self.content_encoder(flat_tactile_high, flat_tactile_mask)
         z_med_window = self.evidence_encoder(flat_tactile_low, flat_tactile_mask)
         z_med_sequence = z_med_window.reshape(batch_size, max_windows, -1)

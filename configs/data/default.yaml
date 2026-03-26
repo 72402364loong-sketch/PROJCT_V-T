@@ -1,4 +1,4 @@
-﻿project_root: .
+project_root: .
 data_root: data
 annotations_dir: data/annotations
 processed_dir: data/processed
@@ -36,6 +36,7 @@ standardize_tactile: true
 min_valid_ratio_video: 0.8
 min_valid_ratio_tactile: 0.8
 write_sidecar_cache: true
+visual_feature_cache_dir: null
 
 ema_alpha_acdc: 0.1
 ema_alpha_expert: 0.1

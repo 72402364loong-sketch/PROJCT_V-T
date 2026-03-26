@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import csv
 import json
@@ -441,6 +441,7 @@ class Trainer:
         self.scaler = torch.amp.GradScaler('cuda', enabled=self.amp_enabled)
         self.grad_clip_norm = float(config.get('grad_clip_norm', 0.0))
         self.early_stopping_patience = int(config.get('early_stopping_patience', 0))
+        self.val_every_n_epochs = max(1, int(config.get('val_every_n_epochs', 1)))
         self.selection_metric = str(stage_config.get('selection_metric', config.get('selection_metric', 'interface_mae')))
         self.maximize_metric = bool(stage_config.get('maximize_metric', config.get('maximize_metric', False)))
         self.tie_breakers = list(stage_config.get('tie_breakers', []))
@@ -485,6 +486,12 @@ class Trainer:
         if self.selection_metric == 'joint_score':
             return float(0.6 * metrics['medium_macro_f1'] + 0.4 * metrics['attr_macro_f1_avg'])
         return float(metrics[self.selection_metric])
+
+    def _should_run_validation(self, epoch: int) -> bool:
+        if self.val_every_n_epochs <= 1:
+            return True
+        final_epoch = int(self.config['epochs'])
+        return epoch == self.start_epoch or epoch % self.val_every_n_epochs == 0 or epoch == final_epoch
 
     def _log_scalars(self, metrics: dict[str, Any], epoch: int) -> None:
         if self.writer is None:
@@ -592,14 +599,19 @@ class Trainer:
     def fit(self) -> dict[str, Any]:
         best_record = self._load_existing_best()
         best_metrics = best_record.get('metrics', {})
+        latest_val_metrics = best_record.get('metrics', {}).copy() if isinstance(best_record.get('metrics'), dict) else {}
         stale_epochs = 0
         try:
             for epoch in range(self.start_epoch, int(self.config['epochs']) + 1):
                 train_metrics = self.run_epoch(self.train_loader, training=True)
-                val_metrics = self.run_epoch(self.val_loader, training=False)
-                val_metrics['selection_value'] = self._selection_value(val_metrics)
+                validation_ran = self._should_run_validation(epoch)
+                val_metrics = None
+                if validation_ran:
+                    val_metrics = self.run_epoch(self.val_loader, training=False)
+                    val_metrics['selection_value'] = self._selection_value(val_metrics)
+                    latest_val_metrics = val_metrics.copy()
                 metrics = {f'train_{k}': v for k, v in train_metrics.items()}
-                metrics.update({f'val_{k}': v for k, v in val_metrics.items()})
+                metrics.update({f'val_{k}': v for k, v in latest_val_metrics.items()})
                 metrics['epoch'] = epoch
                 metrics['learning_rate'] = float(self.optimizer.param_groups[0]['lr'])
                 for group_index, group in enumerate(self.optimizer.param_groups):
@@ -609,23 +621,25 @@ class Trainer:
                     handle.write(json.dumps(metrics, ensure_ascii=False) + '\n')
                 self._append_metrics_csv(metrics)
                 self._log_scalars(metrics, epoch)
-                self.save_checkpoint(self.generic_latest_path, epoch, val_metrics)
-                self.save_checkpoint(self.named_latest_path, epoch, val_metrics)
-                if self._is_better(val_metrics, epoch, best_record):
-                    best_record = {
-                        'selection_value': float(val_metrics['selection_value']),
-                        'metrics': val_metrics,
-                        'epoch': epoch,
-                    }
-                    best_metrics = val_metrics
-                    self.save_checkpoint(self.generic_best_path, epoch, val_metrics)
-                    self.save_checkpoint(self.named_best_path, epoch, val_metrics)
-                    self._write_best_record(epoch, val_metrics, float(val_metrics['selection_value']))
-                    stale_epochs = 0
-                else:
-                    stale_epochs += 1
-                if self.early_stopping_patience > 0 and stale_epochs >= self.early_stopping_patience:
-                    break
+                latest_metrics_for_checkpoint = val_metrics if val_metrics is not None else latest_val_metrics
+                self.save_checkpoint(self.generic_latest_path, epoch, latest_metrics_for_checkpoint)
+                self.save_checkpoint(self.named_latest_path, epoch, latest_metrics_for_checkpoint)
+                if val_metrics is not None:
+                    if self._is_better(val_metrics, epoch, best_record):
+                        best_record = {
+                            'selection_value': float(val_metrics['selection_value']),
+                            'metrics': val_metrics,
+                            'epoch': epoch,
+                        }
+                        best_metrics = val_metrics
+                        self.save_checkpoint(self.generic_best_path, epoch, val_metrics)
+                        self.save_checkpoint(self.named_best_path, epoch, val_metrics)
+                        self._write_best_record(epoch, val_metrics, float(val_metrics['selection_value']))
+                        stale_epochs = 0
+                    else:
+                        stale_epochs += 1
+                    if self.early_stopping_patience > 0 and stale_epochs >= self.early_stopping_patience:
+                        break
         finally:
             if self.writer is not None:
                 self.writer.close()

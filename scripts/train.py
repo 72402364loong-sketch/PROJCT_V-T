@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import argparse
 import random
@@ -30,6 +30,10 @@ def load_current_configs(project_root: Path, stage_path: Path) -> tuple[dict, di
     train_config = deep_update(train_config, stage_config.get('train', {}))
     train_config = deep_update(train_config, {'run_name': stage_config['name']})
     return data_config, model_config, train_config, stage_config
+
+
+RUNTIME_DATA_OVERRIDE_KEYS = {'visual_feature_cache_dir'}
+RUNTIME_TRAIN_OVERRIDE_KEYS = {'num_workers', 'pin_memory', 'persistent_workers', 'val_every_n_epochs'}
 
 
 def apply_resume_config(
@@ -65,6 +69,21 @@ def apply_resume_config(
     return data_config, model_config, train_config, stage_config
 
 
+def apply_runtime_overrides(
+    data_config: dict,
+    train_config: dict,
+    current_data_config: dict,
+    current_train_config: dict,
+) -> tuple[dict, dict]:
+    for key in RUNTIME_DATA_OVERRIDE_KEYS:
+        if key in current_data_config:
+            data_config[key] = current_data_config[key]
+    for key in RUNTIME_TRAIN_OVERRIDE_KEYS:
+        if key in current_train_config:
+            train_config[key] = current_train_config[key]
+    return data_config, train_config
+
+
 def set_global_seed(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
@@ -96,6 +115,7 @@ def make_dataset(project_root: Path, split_path: Path, subset: str, data_config:
         normalization_trial_results=train_config.get('default_allowed_trial_results', {}).get('train'),
         tail_mode=stage_config.get('tail_mode', data_config.get('valid_tail_mode', 'all_valid')),
         allowed_trial_results=allowed_trial_results,
+        visual_feature_cache_dir=data_config.get('visual_feature_cache_dir'),
     )
 
 
@@ -104,7 +124,10 @@ def make_train_loader(train_dataset: CrossMediumSequenceDataset, train_config: d
     common_kwargs = {
         'num_workers': int(train_config['num_workers']),
         'collate_fn': sequence_collate_fn,
+        'pin_memory': bool(train_config.get('pin_memory', False)),
     }
+    if int(train_config['num_workers']) > 0 and bool(train_config.get('persistent_workers', False)):
+        common_kwargs['persistent_workers'] = True
     if bool(train_config.get('use_object_aware_sampler', False)):
         batch_sampler = ObjectAwareBatchSampler(
             train_dataset,
@@ -151,6 +174,8 @@ def main() -> None:
     resume_context = load_checkpoint_context(resume_path) if resume_path is not None else None
 
     data_config, model_config, train_config, stage_config = load_current_configs(project_root, stage_path)
+    current_data_config = data_config.copy()
+    current_train_config = train_config.copy()
     if resume_context is not None:
         data_config, model_config, train_config, stage_config = apply_resume_config(
             data_config,
@@ -159,6 +184,18 @@ def main() -> None:
             stage_config,
             resume_context,
         )
+        data_config, train_config = apply_runtime_overrides(
+            data_config,
+            train_config,
+            current_data_config,
+            current_train_config,
+        )
+
+    if data_config.get('visual_feature_cache_dir') and (
+        float(stage_config.get('loss_weights', {}).get('clip', 0.0)) > 0.0
+        or float(stage_config.get('loss_weights', {}).get('inv', 0.0)) > 0.0
+    ):
+        raise ValueError('visual feature cache only supports stages with clip/inv loss weights disabled.')
 
     set_global_seed(int(train_config.get('seed', 42)))
     split_path = project_root / stage_config['split']
@@ -172,6 +209,8 @@ def main() -> None:
         batch_size=int(train_config['batch_size']),
         shuffle=False,
         num_workers=int(train_config['num_workers']),
+        pin_memory=bool(train_config.get('pin_memory', False)),
+        persistent_workers=int(train_config['num_workers']) > 0 and bool(train_config.get('persistent_workers', False)),
         collate_fn=sequence_collate_fn,
     )
 

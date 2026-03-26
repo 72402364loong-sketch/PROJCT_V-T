@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import torch
 import torch.nn.functional as F
@@ -70,31 +70,50 @@ def compute_losses(
     stable_phases = batch['stable_phases'].reshape(-1)
 
     losses: dict[str, torch.Tensor] = {}
-    losses['med'] = F.cross_entropy(medium_logits[window_mask], phase_targets[window_mask], weight=phase_class_weights)
-    losses['frag'] = F.cross_entropy(fragility_logits[window_mask], repeated_fragility[window_mask])
-    losses['geom'] = F.cross_entropy(geometry_logits[window_mask], repeated_geometry[window_mask])
-    losses['surf'] = F.cross_entropy(surface_logits[window_mask], repeated_surface[window_mask])
-    losses['attr'] = losses['frag'] + losses['geom'] + losses['surf']
+    zero = medium_logits.new_tensor(0.0)
+    med_weight = float(loss_weights.get('med', 0.0))
+    attr_weight = float(loss_weights.get('attr', 0.0))
+    clip_weight = float(loss_weights.get('clip', 0.0))
+    inv_weight = float(loss_weights.get('inv', 0.0))
+    pol_weight = float(loss_weights.get('pol', 0.0))
 
-    stable_valid = stable_mask.nonzero(as_tuple=False).flatten()
-    losses['clip'] = info_nce_loss(outputs['z_v'][stable_valid], outputs['z_t'][stable_valid], temperature=temperature_clip)
+    losses['med'] = F.cross_entropy(medium_logits[window_mask], phase_targets[window_mask], weight=phase_class_weights) if med_weight > 0.0 else zero
+    if attr_weight > 0.0:
+        losses['frag'] = F.cross_entropy(fragility_logits[window_mask], repeated_fragility[window_mask])
+        losses['geom'] = F.cross_entropy(geometry_logits[window_mask], repeated_geometry[window_mask])
+        losses['surf'] = F.cross_entropy(surface_logits[window_mask], repeated_surface[window_mask])
+        losses['attr'] = losses['frag'] + losses['geom'] + losses['surf']
+    else:
+        losses['frag'] = zero
+        losses['geom'] = zero
+        losses['surf'] = zero
+        losses['attr'] = zero
 
-    stable_water_air = stable_mask & (stable_phases >= 0)
-    stable_indices = stable_water_air.nonzero(as_tuple=False).flatten()
-    losses['inv'] = supcon_cross_medium_loss(
-        outputs['z_content'][stable_indices],
-        repeated_object[stable_indices],
-        repeated_sample[stable_indices],
-        stable_phases[stable_indices],
-        temperature=temperature_inv,
-    )
+    if clip_weight > 0.0:
+        stable_valid = stable_mask.nonzero(as_tuple=False).flatten()
+        losses['clip'] = info_nce_loss(outputs['z_v'][stable_valid], outputs['z_t'][stable_valid], temperature=temperature_clip)
+    else:
+        losses['clip'] = zero
+
+    if inv_weight > 0.0:
+        stable_water_air = stable_mask & (stable_phases >= 0)
+        stable_indices = stable_water_air.nonzero(as_tuple=False).flatten()
+        losses['inv'] = supcon_cross_medium_loss(
+            outputs['z_content'][stable_indices],
+            repeated_object[stable_indices],
+            repeated_sample[stable_indices],
+            stable_phases[stable_indices],
+            temperature=temperature_inv,
+        )
+    else:
+        losses['inv'] = zero
 
     force_targets = batch['expert_forces'].reshape(-1)
     has_expert = batch['has_expert'].reshape(-1) & window_mask
-    if has_expert.any():
+    if pol_weight > 0.0 and has_expert.any():
         losses['pol'] = F.mse_loss(outputs['force_pred'][has_expert], force_targets[has_expert])
     else:
-        losses['pol'] = outputs['force_pred'].new_tensor(0.0)
+        losses['pol'] = zero
 
     total = (
         loss_weights.get('clip', 0.0) * losses['clip']

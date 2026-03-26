@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import math
 from typing import Any
@@ -49,10 +49,18 @@ class TemporalAttentionPooling(nn.Module):
 
     def forward(self, sequence: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
         scores = torch.einsum('bld,d->bl', sequence, self.query) / math.sqrt(sequence.shape[-1])
+        invalid_rows = None
         if mask is not None:
-            scores = scores.masked_fill(~mask, float('-inf'))
+            safe_mask = mask.bool().clone()
+            invalid_rows = ~safe_mask.any(dim=-1)
+            if invalid_rows.any():
+                safe_mask[invalid_rows, 0] = True
+            scores = scores.masked_fill(~safe_mask, float('-inf'))
         weights = torch.softmax(scores, dim=-1)
-        return torch.einsum('bl,bld->bd', weights, sequence)
+        pooled = torch.einsum('bl,bld->bd', weights, sequence)
+        if invalid_rows is not None and invalid_rows.any():
+            pooled[invalid_rows] = 0.0
+        return pooled
 
 
 class VisualTemporalAttentionPooling(nn.Module):

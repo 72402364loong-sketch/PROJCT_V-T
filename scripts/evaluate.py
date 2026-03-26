@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import argparse
 import json
@@ -85,6 +85,11 @@ def main() -> None:
         stage_config,
         checkpoint_context,
     )
+    if data_config.get('visual_feature_cache_dir') and (
+        float(stage_config.get('loss_weights', {}).get('clip', 0.0)) > 0.0
+        or float(stage_config.get('loss_weights', {}).get('inv', 0.0)) > 0.0
+    ):
+        raise ValueError('visual feature cache only supports stages with clip/inv loss weights disabled.')
     split_path = project_root / stage_config['split']
 
     allowed_trial_results = ['stable'] if args.only_stable else None
@@ -109,6 +114,7 @@ def main() -> None:
         normalization_trial_results=train_config.get('default_allowed_trial_results', {}).get('train'),
         tail_mode=stage_config.get('tail_mode', data_config.get('valid_tail_mode', 'all_valid')),
         allowed_trial_results=allowed_trial_results,
+        visual_feature_cache_dir=data_config.get('visual_feature_cache_dir'),
     )
     loader = DataLoader(
         dataset,
