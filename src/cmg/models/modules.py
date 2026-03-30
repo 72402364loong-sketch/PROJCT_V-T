@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import math
 from typing import Any
@@ -560,8 +560,9 @@ class MultiAttributeHead(nn.Module):
 
 
 class PolicyHead(nn.Module):
-    def __init__(self, input_dim: int, hidden_dim: int, film_hidden_dim: int) -> None:
+    def __init__(self, input_dim: int, hidden_dim: int, film_hidden_dim: int, *, head_type: str = 'legacy') -> None:
         super().__init__()
+        self.head_type = str(head_type)
         self.input_layer = nn.Linear(input_dim, hidden_dim)
         self.hidden_layer = nn.Linear(hidden_dim, hidden_dim)
         self.film = nn.Sequential(
@@ -570,15 +571,24 @@ class PolicyHead(nn.Module):
             nn.Linear(film_hidden_dim, hidden_dim * 2),
         )
         self.output_layer = nn.Linear(hidden_dim, 1)
+        self.interface_output_layer = nn.Linear(hidden_dim, 1) if self.head_type == 'interface_residual' else None
 
-    def forward(self, task_context: torch.Tensor, p_medium: torch.Tensor) -> torch.Tensor:
+    def forward(self, task_context: torch.Tensor, p_medium: torch.Tensor) -> dict[str, torch.Tensor]:
         hidden = F.gelu(self.input_layer(task_context))
         gamma, beta = self.film(p_medium).chunk(2, dim=-1)
         hidden = (1.0 + gamma) * hidden + beta
         hidden = F.gelu(self.hidden_layer(hidden))
-        return self.output_layer(hidden).squeeze(-1)
-
-
-
-
-
+        base_force = self.output_layer(hidden).squeeze(-1)
+        interface_gate = p_medium[..., 1] if p_medium.shape[-1] > 1 else torch.zeros_like(base_force)
+        if self.interface_output_layer is not None:
+            interface_delta = self.interface_output_layer(hidden).squeeze(-1)
+            force_pred = base_force + interface_gate * interface_delta
+        else:
+            interface_delta = torch.zeros_like(base_force)
+            force_pred = base_force
+        return {
+            'force_pred': force_pred,
+            'force_base': base_force,
+            'force_interface_delta': interface_delta,
+            'interface_gate': interface_gate,
+        }

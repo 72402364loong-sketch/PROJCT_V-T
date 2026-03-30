@@ -1,4 +1,6 @@
-from __future__ import annotations
+﻿from __future__ import annotations
+
+from typing import Any
 
 import torch
 import torch.nn.functional as F
@@ -45,11 +47,68 @@ def supcon_cross_medium_loss(
 
 
 
+def compute_policy_loss(
+    outputs: dict[str, torch.Tensor],
+    *,
+    force_targets: torch.Tensor,
+    has_expert: torch.Tensor,
+    phase_targets: torch.Tensor,
+    stable_mask: torch.Tensor,
+    window_mask: torch.Tensor,
+    zero: torch.Tensor,
+    policy_loss_config: dict[str, Any] | None,
+) -> torch.Tensor:
+    force_pred = outputs['force_pred'].reshape(-1)
+    policy_config = policy_loss_config or {}
+    policy_type = str(policy_config.get('type', 'mse'))
+
+    if policy_type in {'interface_weighted_smooth_l1', 'interface_residual_weighted_smooth_l1'}:
+        all_weight = float(policy_config.get('all_weight', 1.0))
+        interface_weight = float(policy_config.get('interface_weight', 4.0))
+        stable_weight = float(policy_config.get('stable_weight', 0.5))
+        quiet_weight = float(policy_config.get('quiet_weight', 0.0))
+        beta = float(policy_config.get('beta', 1.0))
+
+        total = zero
+        if all_weight > 0.0:
+            total = total + all_weight * F.smooth_l1_loss(
+                force_pred[has_expert],
+                force_targets[has_expert],
+                beta=beta,
+            )
+
+        interface_expert = has_expert & (phase_targets == 1)
+        if interface_weight > 0.0 and interface_expert.any():
+            total = total + interface_weight * F.smooth_l1_loss(
+                force_pred[interface_expert],
+                force_targets[interface_expert],
+                beta=beta,
+            )
+
+        stable_expert = has_expert & stable_mask
+        if stable_weight > 0.0 and stable_expert.any():
+            total = total + stable_weight * F.smooth_l1_loss(
+                force_pred[stable_expert],
+                force_targets[stable_expert],
+                beta=beta,
+            )
+
+        if quiet_weight > 0.0 and 'force_interface_delta' in outputs and 'interface_gate' in outputs:
+            interface_delta = outputs['force_interface_delta'].reshape(-1)[window_mask]
+            interface_gate = outputs['interface_gate'].reshape(-1)[window_mask]
+            total = total + quiet_weight * torch.mean(((1.0 - interface_gate) * interface_delta) ** 2)
+        return total
+
+    return F.mse_loss(force_pred[has_expert], force_targets[has_expert])
+
+
+
 def compute_losses(
     outputs: dict[str, torch.Tensor],
     batch: dict[str, torch.Tensor],
     *,
     loss_weights: dict[str, float],
+    policy_loss_config: dict[str, Any] | None,
     temperature_clip: float,
     temperature_inv: float,
     phase_class_weights: torch.Tensor,
@@ -111,7 +170,16 @@ def compute_losses(
     force_targets = batch['expert_forces'].reshape(-1)
     has_expert = batch['has_expert'].reshape(-1) & window_mask
     if pol_weight > 0.0 and has_expert.any():
-        losses['pol'] = F.mse_loss(outputs['force_pred'][has_expert], force_targets[has_expert])
+        losses['pol'] = compute_policy_loss(
+            outputs,
+            force_targets=force_targets,
+            has_expert=has_expert,
+            phase_targets=phase_targets,
+            stable_mask=stable_mask,
+            window_mask=window_mask,
+            zero=zero,
+            policy_loss_config=policy_loss_config,
+        )
     else:
         losses['pol'] = zero
 

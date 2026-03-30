@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
 from pathlib import Path
@@ -104,6 +104,7 @@ class CrossMediumSequenceDataset(Dataset):
             sample_id: group.sort_values('window_start').to_dict('records')
             for sample_id, group in self.windows.groupby('sample_id')
         }
+        self._annotate_sample_records_with_interface_stats()
         self.object_index = {
             object_id: index
             for index, object_id in enumerate(sorted(self.samples['object_id'].unique().tolist()))
@@ -123,6 +124,23 @@ class CrossMediumSequenceDataset(Dataset):
             self.tactile_high_std = np.asarray(stats['high_std'], dtype=np.float32)
             self.tactile_low_mean = np.asarray(stats['low_mean'], dtype=np.float32)
             self.tactile_low_std = np.asarray(stats['low_std'], dtype=np.float32)
+
+    def _annotate_sample_records_with_interface_stats(self) -> None:
+        interface_index = int(PHASE_TO_INDEX['Interface'])
+        for sample in self.sample_records:
+            sample_id = str(sample['sample_id'])
+            windows = self.windows_by_sample.get(sample_id, [])
+            total_windows = len(windows)
+            interface_window_count = 0
+            trial_result = str(sample.get('trial_result', '')).strip().lower()
+            has_expert_supervision = trial_result == 'stable'
+            for window in windows:
+                phase_label = str(window['phase_label'])
+                if int(PHASE_TO_INDEX[phase_label]) == interface_index:
+                    interface_window_count += 1
+            sample['interface_window_count'] = int(interface_window_count)
+            sample['interface_expert_count'] = int(interface_window_count if has_expert_supervision else 0)
+            sample['interface_window_ratio'] = float(interface_window_count / max(1, total_windows))
 
     def __len__(self) -> int:
         return len(self.sample_records)
@@ -403,3 +421,4 @@ def sequence_collate_fn(batch: list[dict[str, Any]]) -> dict[str, Any]:
         'geometry_label': geometry_label,
         'surface_label': surface_label,
     }
+

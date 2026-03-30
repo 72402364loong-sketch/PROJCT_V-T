@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import csv
 import json
@@ -142,7 +142,7 @@ def remap_open_clip_lora_keys(
 
 
 def is_allowed_lora_injection_mismatch(key: str) -> bool:
-    return 'lora_' in key
+    return 'lora_' in key or key.startswith('policy_head.interface_output_layer.')
 
 
 
@@ -287,6 +287,10 @@ def run_model_epoch(
     interface_abs = 0.0
     interface_sq = 0.0
     interface_count = 0
+    interface_signed_sum = 0.0
+    interface_hits_100 = 0
+    interface_hits_200 = 0
+    interface_hits_300 = 0
     combined_attr_correct = 0
     combined_attr_count = 0
 
@@ -302,6 +306,7 @@ def run_model_epoch(
                     outputs,
                     batch,
                     loss_weights=stage_config.get('loss_weights', {}),
+                    policy_loss_config=stage_config.get('policy_loss'),
                     temperature_clip=float(model_config['losses']['temperature_clip']),
                     temperature_inv=float(model_config['losses']['temperature_inv']),
                     phase_class_weights=phase_class_weights,
@@ -360,9 +365,15 @@ def run_model_epoch(
             if interface_mask.any():
                 pred_interface = force_pred[interface_mask]
                 target_interface = batch['expert_forces'][interface_mask]
-                interface_abs += float(torch.abs(pred_interface - target_interface).sum().item())
-                interface_sq += float(((pred_interface - target_interface) ** 2).sum().item())
+                interface_error = pred_interface - target_interface
+                abs_interface_error = torch.abs(interface_error)
+                interface_abs += float(abs_interface_error.sum().item())
+                interface_sq += float((interface_error ** 2).sum().item())
                 interface_count += int(pred_interface.numel())
+                interface_signed_sum += float(interface_error.sum().item())
+                interface_hits_100 += int((abs_interface_error <= 100.0).sum().item())
+                interface_hits_200 += int((abs_interface_error <= 200.0).sum().item())
+                interface_hits_300 += int((abs_interface_error <= 300.0).sum().item())
 
     denom = max(1, len(loader))
     frag_macro_f1 = macro_f1_from_confusion(frag_confusion)
@@ -395,6 +406,10 @@ def run_model_epoch(
         'stable_mse': stable_sq / max(1, stable_count),
         'interface_mae': interface_abs / max(1, interface_count),
         'interface_mse': interface_sq / max(1, interface_count),
+        'interface_bias': interface_signed_sum / max(1, interface_count),
+        'interface_hit_rate_100': interface_hits_100 / max(1, interface_count),
+        'interface_hit_rate_200': interface_hits_200 / max(1, interface_count),
+        'interface_hit_rate_300': interface_hits_300 / max(1, interface_count),
         'joint_score': 0.6 * macro_f1_from_confusion(phase_confusion) + 0.4 * ((frag_macro_f1 + geom_macro_f1 + surf_macro_f1) / 3.0),
         'medium_confusion': phase_confusion.tolist(),
         'fragility_confusion': frag_confusion.tolist(),
@@ -677,6 +692,9 @@ class Trainer:
             scaler=self.scaler if training else None,
             grad_clip_norm=self.grad_clip_norm,
         )
+
+
+
 
 
 

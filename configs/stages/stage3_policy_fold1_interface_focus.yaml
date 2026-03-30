@@ -1,0 +1,52 @@
+﻿name: stage3_policy_fold1_interface_focus
+stage_index: 3
+checkpoint_prefix: stage3_interface_focus
+best_checkpoint_name: stage3_interface_focus_best_interface_mae.pt
+split: data/splits/split_unseen_fold1_v1.yaml
+tail_mode: all_valid
+freeze_modules:
+  - visual_encoder
+  - content_encoder
+  - evidence_encoder
+  - medium_head
+  - attribute_head.shared
+  - attribute_head.fragility
+  - attribute_head.geometry
+  - attribute_head.surface
+  - attribute_head.object_projection
+loss_weights:
+  clip: 0.0
+  inv: 0.0
+  med: 0.0
+  attr: 0.0
+  pol: 1.0
+policy_loss:
+  type: interface_weighted_smooth_l1
+  all_weight: 1.0
+  interface_weight: 4.0
+  stable_weight: 0.5
+  beta: 1.0
+selection_metric: interface_mae
+maximize_metric: false
+tie_breakers:
+  - metric: overall_mae
+    mode: min
+  - metric: loss_pol
+    mode: min
+  - metric: epoch
+    mode: min
+data:
+  num_frames_per_window: 4
+model:
+  visual:
+    use_lora: true
+    max_windows_per_encode: 2
+train:
+  epochs: 6
+  batch_size: 2
+  num_workers: 4
+  val_every_n_epochs: 1
+  early_stopping_patience: 2
+  learning_rate: 0.00001
+  base_learning_rate: 0.00001
+  lora_learning_rate: 0.000005

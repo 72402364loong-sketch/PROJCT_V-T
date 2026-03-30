@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import argparse
 import random
@@ -15,7 +15,13 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from cmg.config import deep_update, load_yaml
-from cmg.data import CrossMediumSequenceDataset, ObjectAwareBatchSampler, sequence_collate_fn
+from cmg.data import (
+    CrossMediumSequenceDataset,
+    InterfaceAwareObjectBatchSampler,
+    InterfaceAwareSequenceSampler,
+    ObjectAwareBatchSampler,
+    sequence_collate_fn,
+)
 from cmg.models import CrossMediumSystem
 from cmg.training import Trainer, load_checkpoint_context, load_model_weights
 
@@ -121,6 +127,9 @@ def make_dataset(project_root: Path, split_path: Path, subset: str, data_config:
 
 def make_train_loader(train_dataset: CrossMediumSequenceDataset, train_config: dict) -> DataLoader:
     batch_size = int(train_config['batch_size'])
+    sampling_mode = str(train_config.get('sampling_mode', '') or '').strip().lower()
+    interface_alpha = float(train_config.get('interface_sampler_alpha', 1.0))
+    min_interface_expert_windows = int(train_config.get('interface_sampler_min_expert_windows', 1))
     common_kwargs = {
         'num_workers': int(train_config['num_workers']),
         'collate_fn': sequence_collate_fn,
@@ -128,7 +137,34 @@ def make_train_loader(train_dataset: CrossMediumSequenceDataset, train_config: d
     }
     if int(train_config['num_workers']) > 0 and bool(train_config.get('persistent_workers', False)):
         common_kwargs['persistent_workers'] = True
-    if bool(train_config.get('use_object_aware_sampler', False)):
+
+    if sampling_mode == 'interface_object_aware':
+        batch_sampler = InterfaceAwareObjectBatchSampler(
+            train_dataset,
+            batch_size=batch_size,
+            samples_per_object=int(train_config.get('samples_per_object', 2)),
+            alpha=interface_alpha,
+            min_interface_expert_windows=min_interface_expert_windows,
+            seed=int(train_config.get('seed', 42)),
+        )
+        return DataLoader(train_dataset, batch_sampler=batch_sampler, **common_kwargs)
+
+    if sampling_mode == 'interface_aware':
+        sampler = InterfaceAwareSequenceSampler(
+            train_dataset,
+            alpha=interface_alpha,
+            min_interface_expert_windows=min_interface_expert_windows,
+            seed=int(train_config.get('seed', 42)),
+        )
+        return DataLoader(
+            train_dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            sampler=sampler,
+            **common_kwargs,
+        )
+
+    if sampling_mode == 'object_aware' or bool(train_config.get('use_object_aware_sampler', False)):
         batch_sampler = ObjectAwareBatchSampler(
             train_dataset,
             batch_size=batch_size,
@@ -136,6 +172,7 @@ def make_train_loader(train_dataset: CrossMediumSequenceDataset, train_config: d
             seed=int(train_config.get('seed', 42)),
         )
         return DataLoader(train_dataset, batch_sampler=batch_sampler, **common_kwargs)
+
     return DataLoader(
         train_dataset,
         batch_size=batch_size,
@@ -243,5 +280,7 @@ def main() -> None:
 
 if __name__ == '__main__':
     main()
+
+
 
 

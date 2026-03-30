@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import torch
 from torch import nn
@@ -48,6 +48,7 @@ class CrossMediumSystem(nn.Module):
             input_dim=policy_input_dim,
             hidden_dim=int(policy_config['hidden_dim']),
             film_hidden_dim=int(policy_config['film_hidden_dim']),
+            head_type=str(policy_config.get('head_type', 'legacy')),
         )
 
     def _build_task_context(
@@ -82,7 +83,7 @@ class CrossMediumSystem(nn.Module):
         flat_medium = p_medium.reshape(batch_size * max_windows, -1)
 
         attribute_outputs, g_obj, task_context = self._build_task_context(h_v, z_content)
-        force_pred = self.policy_head(task_context, flat_medium)
+        policy_outputs = self.policy_head(task_context, flat_medium)
 
         return {
             'h_v': h_v,
@@ -100,7 +101,10 @@ class CrossMediumSystem(nn.Module):
             'geometry_entropy': attribute_outputs['geometry_entropy'],
             'surface_entropy': attribute_outputs['surface_entropy'],
             'g_obj': g_obj,
-            'force_pred': force_pred,
+            'force_pred': policy_outputs['force_pred'],
+            'force_base': policy_outputs['force_base'],
+            'force_interface_delta': policy_outputs['force_interface_delta'],
+            'interface_gate': policy_outputs['interface_gate'],
         }
 
     def forward_online_step(
@@ -114,7 +118,7 @@ class CrossMediumSystem(nn.Module):
         z_med_window = self.evidence_encoder(batch['tactile_low'], batch['tactile_mask'])
         medium_logits, p_medium, next_hidden = self.medium_head.step(z_med_window, hidden_state=medium_hidden)
         attribute_outputs, g_obj, task_context = self._build_task_context(h_v, z_content)
-        force_pred = self.policy_head(task_context, p_medium)
+        policy_outputs = self.policy_head(task_context, p_medium)
         return {
             'h_v': h_v,
             'z_v': z_v,
@@ -131,5 +135,8 @@ class CrossMediumSystem(nn.Module):
             'geometry_entropy': attribute_outputs['geometry_entropy'],
             'surface_entropy': attribute_outputs['surface_entropy'],
             'g_obj': g_obj,
-            'force_pred': force_pred,
+            'force_pred': policy_outputs['force_pred'],
+            'force_base': policy_outputs['force_base'],
+            'force_interface_delta': policy_outputs['force_interface_delta'],
+            'interface_gate': policy_outputs['interface_gate'],
         }
