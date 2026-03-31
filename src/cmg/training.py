@@ -142,7 +142,15 @@ def remap_open_clip_lora_keys(
 
 
 def is_allowed_lora_injection_mismatch(key: str) -> bool:
-    return 'lora_' in key or key.startswith('policy_head.interface_output_layer.')
+    return (
+        'lora_' in key
+        or key.startswith('policy_head.input_layer.')
+        or key.startswith('policy_head.hidden_layer.')
+        or key.startswith('policy_head.output_layer.')
+        or key.startswith('policy_head.interface_output_layer.')
+        or key.startswith('policy_head.base_')
+        or key.startswith('policy_head.residual_')
+    )
 
 
 
@@ -173,7 +181,7 @@ def load_model_weights(
                 'remapped_keys': remapped_keys,
             }
             raise RuntimeError(
-                'Checkpoint initialization encountered mismatched keys beyond the expected LoRA injection delta: '
+                'Checkpoint initialization encountered mismatched keys beyond the expected stage-to-stage architecture delta: '
                 + json.dumps(details, ensure_ascii=False)
             )
     return {
@@ -692,6 +700,7 @@ class Trainer:
             scaler=self.scaler if training else None,
             grad_clip_norm=self.grad_clip_norm,
         )
+
 
 
 

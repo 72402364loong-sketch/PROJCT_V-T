@@ -1,18 +1,37 @@
-﻿.venv/
+﻿# Python 基础
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
+*.py[cod]
+*$py.class
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
-.idea/
-.vscode/
-.codex_tmp/
 
+# 虚拟环境 (匹配 .venv, .venv310, venv 等)
+.venv*
+venv/
+env/
+
+# 编辑器与系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# --- 重点：科研数据与模型权重 ---
+
+# 忽略整个 data 文件夹（包括 raw.zip 和所有子目录）
+data/
+*.zip
+*.tar.gz
+*.7z
+
+# 忽略所有运行日志和模型权重
 runs/
 evals/
-data/raw/
-data/processed/
+*.pt
+*.pth
+*.ckpt
+lightning_logs/
 
+# 日志
 *.log

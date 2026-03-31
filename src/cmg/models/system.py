@@ -44,11 +44,13 @@ class CrossMediumSystem(nn.Module):
             + int(tactile_config['content_hidden_dim'])
             + int(attribute_config['object_feature_dim'])
         )
+        policy_state_dim = int(tactile_config['evidence_hidden_dim']) + int(medium_config['hidden_dim']) + 3
         self.policy_head = PolicyHead(
             input_dim=policy_input_dim,
             hidden_dim=int(policy_config['hidden_dim']),
             film_hidden_dim=int(policy_config['film_hidden_dim']),
             head_type=str(policy_config.get('head_type', 'legacy')),
+            state_input_dim=policy_state_dim,
         )
 
     def _build_task_context(
@@ -79,11 +81,13 @@ class CrossMediumSystem(nn.Module):
         z_content, z_t = self.content_encoder(flat_tactile_high, flat_tactile_mask)
         z_med_window = self.evidence_encoder(flat_tactile_low, flat_tactile_mask)
         z_med_sequence = z_med_window.reshape(batch_size, max_windows, -1)
-        medium_logits, p_medium, medium_hidden = self.medium_head(z_med_sequence, batch['window_lengths'])
+        medium_logits, p_medium, medium_hidden, medium_sequence_features = self.medium_head(z_med_sequence, batch['window_lengths'])
         flat_medium = p_medium.reshape(batch_size * max_windows, -1)
+        flat_medium_features = medium_sequence_features.reshape(batch_size * max_windows, -1)
+        state_context = torch.cat([z_med_window, flat_medium_features, flat_medium], dim=-1)
 
         attribute_outputs, g_obj, task_context = self._build_task_context(h_v, z_content)
-        policy_outputs = self.policy_head(task_context, flat_medium)
+        policy_outputs = self.policy_head(task_context, flat_medium, state_context=state_context)
 
         return {
             'h_v': h_v,
@@ -94,6 +98,7 @@ class CrossMediumSystem(nn.Module):
             'medium_logits': medium_logits,
             'medium_probs': p_medium,
             'medium_hidden': medium_hidden,
+            'medium_sequence_features': medium_sequence_features,
             'fragility_logits': attribute_outputs['fragility_logits'],
             'geometry_logits': attribute_outputs['geometry_logits'],
             'surface_logits': attribute_outputs['surface_logits'],
@@ -116,9 +121,10 @@ class CrossMediumSystem(nn.Module):
         h_v, z_v = self.visual_encoder(batch['video'], batch['frame_mask'])
         z_content, z_t = self.content_encoder(batch['tactile_high'], batch['tactile_mask'])
         z_med_window = self.evidence_encoder(batch['tactile_low'], batch['tactile_mask'])
-        medium_logits, p_medium, next_hidden = self.medium_head.step(z_med_window, hidden_state=medium_hidden)
+        medium_logits, p_medium, next_hidden, medium_step_features = self.medium_head.step(z_med_window, hidden_state=medium_hidden)
+        state_context = torch.cat([z_med_window, medium_step_features, p_medium], dim=-1)
         attribute_outputs, g_obj, task_context = self._build_task_context(h_v, z_content)
-        policy_outputs = self.policy_head(task_context, p_medium)
+        policy_outputs = self.policy_head(task_context, p_medium, state_context=state_context)
         return {
             'h_v': h_v,
             'z_v': z_v,
@@ -128,6 +134,7 @@ class CrossMediumSystem(nn.Module):
             'medium_logits': medium_logits,
             'medium_probs': p_medium,
             'medium_hidden': next_hidden,
+            'medium_sequence_features': medium_step_features,
             'fragility_logits': attribute_outputs['fragility_logits'],
             'geometry_logits': attribute_outputs['geometry_logits'],
             'surface_logits': attribute_outputs['surface_logits'],

@@ -488,7 +488,7 @@ class MediumBeliefHead(nn.Module):
         self.gru = nn.GRU(input_dim, hidden_dim, batch_first=True)
         self.classifier = nn.Linear(hidden_dim, 3)
 
-    def forward(self, sequence: torch.Tensor, lengths: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def forward(self, sequence: torch.Tensor, lengths: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         packed = pack_padded_sequence(
             sequence,
             lengths.cpu(),
@@ -503,18 +503,19 @@ class MediumBeliefHead(nn.Module):
         )
         logits = self.classifier(outputs)
         probabilities = torch.softmax(logits, dim=-1)
-        return logits, probabilities, hidden[-1]
+        return logits, probabilities, hidden[-1], outputs
 
     def step(
         self,
         window_features: torch.Tensor,
         *,
         hidden_state: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         outputs, next_hidden = self.gru(window_features.unsqueeze(1), hidden_state)
-        logits = self.classifier(outputs[:, 0])
+        current_features = outputs[:, 0]
+        logits = self.classifier(current_features)
         probabilities = torch.softmax(logits, dim=-1)
-        return logits, probabilities, next_hidden
+        return logits, probabilities, next_hidden, current_features
 
 
 class MultiAttributeHead(nn.Module):
@@ -560,26 +561,85 @@ class MultiAttributeHead(nn.Module):
 
 
 class PolicyHead(nn.Module):
-    def __init__(self, input_dim: int, hidden_dim: int, film_hidden_dim: int, *, head_type: str = 'legacy') -> None:
+    def __init__(
+        self,
+        input_dim: int,
+        hidden_dim: int,
+        film_hidden_dim: int,
+        *,
+        head_type: str = 'legacy',
+        state_input_dim: int | None = None,
+    ) -> None:
         super().__init__()
         self.head_type = str(head_type)
-        self.input_layer = nn.Linear(input_dim, hidden_dim)
-        self.hidden_layer = nn.Linear(hidden_dim, hidden_dim)
+        self.state_input_dim = input_dim if state_input_dim is None else int(state_input_dim)
         self.film = nn.Sequential(
             nn.Linear(3, film_hidden_dim),
             nn.GELU(),
             nn.Linear(film_hidden_dim, hidden_dim * 2),
         )
-        self.output_layer = nn.Linear(hidden_dim, 1)
-        self.interface_output_layer = nn.Linear(hidden_dim, 1) if self.head_type == 'interface_residual' else None
 
-    def forward(self, task_context: torch.Tensor, p_medium: torch.Tensor) -> dict[str, torch.Tensor]:
+        if self.head_type == 'state_residual':
+            self.input_layer = None
+            self.hidden_layer = None
+            self.output_layer = None
+            self.interface_output_layer = None
+            self.base_state_input_layer = nn.Linear(self.state_input_dim, hidden_dim)
+            self.base_hidden_layer = nn.Linear(hidden_dim, hidden_dim)
+            self.base_output_layer = nn.Linear(hidden_dim, 1)
+            self.residual_task_input_layer = nn.Linear(input_dim, hidden_dim)
+            self.residual_state_input_layer = nn.Linear(self.state_input_dim, hidden_dim)
+            self.residual_hidden_layer = nn.Linear(hidden_dim, hidden_dim)
+            self.residual_output_layer = nn.Linear(hidden_dim, 1)
+        else:
+            self.input_layer = nn.Linear(input_dim, hidden_dim)
+            self.hidden_layer = nn.Linear(hidden_dim, hidden_dim)
+            self.output_layer = nn.Linear(hidden_dim, 1)
+            self.interface_output_layer = nn.Linear(hidden_dim, 1) if self.head_type == 'interface_residual' else None
+            self.base_state_input_layer = None
+            self.base_hidden_layer = None
+            self.base_output_layer = None
+            self.residual_task_input_layer = None
+            self.residual_state_input_layer = None
+            self.residual_hidden_layer = None
+            self.residual_output_layer = None
+
+    def forward(
+        self,
+        task_context: torch.Tensor,
+        p_medium: torch.Tensor,
+        *,
+        state_context: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
+        interface_gate = p_medium[..., 1] if p_medium.shape[-1] > 1 else torch.zeros(task_context.shape[0], device=task_context.device)
+
+        if self.head_type == 'state_residual':
+            if state_context is None:
+                raise RuntimeError('state_residual policy head requires state_context.')
+            base_hidden = F.gelu(self.base_state_input_layer(state_context))
+            base_hidden = F.gelu(self.base_hidden_layer(base_hidden))
+            base_force = self.base_output_layer(base_hidden).squeeze(-1)
+
+            residual_hidden = F.gelu(
+                self.residual_task_input_layer(task_context) + self.residual_state_input_layer(state_context)
+            )
+            gamma, beta = self.film(p_medium).chunk(2, dim=-1)
+            residual_hidden = (1.0 + gamma) * residual_hidden + beta
+            residual_hidden = F.gelu(self.residual_hidden_layer(residual_hidden))
+            interface_delta = self.residual_output_layer(residual_hidden).squeeze(-1)
+            force_pred = base_force + interface_gate * interface_delta
+            return {
+                'force_pred': force_pred,
+                'force_base': base_force,
+                'force_interface_delta': interface_delta,
+                'interface_gate': interface_gate,
+            }
+
         hidden = F.gelu(self.input_layer(task_context))
         gamma, beta = self.film(p_medium).chunk(2, dim=-1)
         hidden = (1.0 + gamma) * hidden + beta
         hidden = F.gelu(self.hidden_layer(hidden))
         base_force = self.output_layer(hidden).squeeze(-1)
-        interface_gate = p_medium[..., 1] if p_medium.shape[-1] > 1 else torch.zeros_like(base_force)
         if self.interface_output_layer is not None:
             interface_delta = self.interface_output_layer(hidden).squeeze(-1)
             force_pred = base_force + interface_gate * interface_delta
@@ -592,3 +652,4 @@ class PolicyHead(nn.Module):
             'force_interface_delta': interface_delta,
             'interface_gate': interface_gate,
         }
+
