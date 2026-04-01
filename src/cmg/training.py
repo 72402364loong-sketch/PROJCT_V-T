@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import csv
 import json
@@ -299,6 +299,19 @@ def run_model_epoch(
     interface_hits_100 = 0
     interface_hits_200 = 0
     interface_hits_300 = 0
+    control_overall_abs = 0.0
+    control_overall_sq = 0.0
+    control_overall_count = 0
+    control_reference_abs = 0.0
+    control_reference_sq = 0.0
+    control_reference_count = 0
+    control_interface_abs = 0.0
+    control_interface_sq = 0.0
+    control_interface_count = 0
+    control_interface_signed_sum = 0.0
+    control_interface_hits_100 = 0
+    control_interface_hits_200 = 0
+    control_interface_hits_300 = 0
     combined_attr_correct = 0
     combined_attr_count = 0
 
@@ -385,6 +398,38 @@ def run_model_epoch(
                 interface_hits_200 += int((abs_interface_error <= 200.0).sum().item())
                 interface_hits_300 += int((abs_interface_error <= 300.0).sum().item())
 
+        control_mask = batch['has_control_target'] & window_mask if 'has_control_target' in batch else expert_mask
+        if control_mask.any():
+            pred_control = force_pred[control_mask]
+            target_control = batch['control_force_targets'][control_mask] if 'control_force_targets' in batch else batch['expert_forces'][control_mask]
+            control_abs_error = torch.abs(pred_control - target_control)
+            control_sq_error = (pred_control - target_control) ** 2
+            control_overall_abs += float(control_abs_error.sum().item())
+            control_overall_sq += float(control_sq_error.sum().item())
+            control_overall_count += int(control_abs_error.numel())
+
+            reference_control_mask = control_mask & batch['reference_supervision_masks'] if 'reference_supervision_masks' in batch else control_mask.new_zeros(control_mask.shape)
+            if reference_control_mask.any():
+                pred_reference = force_pred[reference_control_mask]
+                target_reference = batch['control_force_targets'][reference_control_mask] if 'control_force_targets' in batch else batch['expert_forces'][reference_control_mask]
+                control_reference_abs += float(torch.abs(pred_reference - target_reference).sum().item())
+                control_reference_sq += float(((pred_reference - target_reference) ** 2).sum().item())
+                control_reference_count += int(pred_reference.numel())
+
+            interface_control_mask = control_mask & batch['delta_supervision_masks'] if 'delta_supervision_masks' in batch else (control_mask & (batch['phase_labels'] == 1))
+            if interface_control_mask.any():
+                pred_control_interface = force_pred[interface_control_mask]
+                target_control_interface = batch['control_force_targets'][interface_control_mask] if 'control_force_targets' in batch else batch['expert_forces'][interface_control_mask]
+                control_interface_error = pred_control_interface - target_control_interface
+                abs_control_interface_error = torch.abs(control_interface_error)
+                control_interface_abs += float(abs_control_interface_error.sum().item())
+                control_interface_sq += float((control_interface_error ** 2).sum().item())
+                control_interface_count += int(pred_control_interface.numel())
+                control_interface_signed_sum += float(control_interface_error.sum().item())
+                control_interface_hits_100 += int((abs_control_interface_error <= 100.0).sum().item())
+                control_interface_hits_200 += int((abs_control_interface_error <= 200.0).sum().item())
+                control_interface_hits_300 += int((abs_control_interface_error <= 300.0).sum().item())
+
     denom = max(1, len(loader))
     frag_macro_f1 = macro_f1_from_confusion(frag_confusion)
     geom_macro_f1 = macro_f1_from_confusion(geom_confusion)
@@ -420,6 +465,16 @@ def run_model_epoch(
         'interface_hit_rate_100': interface_hits_100 / max(1, interface_count),
         'interface_hit_rate_200': interface_hits_200 / max(1, interface_count),
         'interface_hit_rate_300': interface_hits_300 / max(1, interface_count),
+        'control_overall_mae': control_overall_abs / max(1, control_overall_count),
+        'control_overall_mse': control_overall_sq / max(1, control_overall_count),
+        'control_reference_mae': control_reference_abs / max(1, control_reference_count),
+        'control_reference_mse': control_reference_sq / max(1, control_reference_count),
+        'control_interface_mae': control_interface_abs / max(1, control_interface_count),
+        'control_interface_mse': control_interface_sq / max(1, control_interface_count),
+        'control_interface_bias': control_interface_signed_sum / max(1, control_interface_count),
+        'control_interface_hit_rate_100': control_interface_hits_100 / max(1, control_interface_count),
+        'control_interface_hit_rate_200': control_interface_hits_200 / max(1, control_interface_count),
+        'control_interface_hit_rate_300': control_interface_hits_300 / max(1, control_interface_count),
         'joint_score': 0.6 * macro_f1_from_confusion(phase_confusion) + 0.4 * ((frag_macro_f1 + geom_macro_f1 + surf_macro_f1) / 3.0),
         'medium_confusion': phase_confusion.tolist(),
         'fragility_confusion': frag_confusion.tolist(),
@@ -702,14 +757,3 @@ class Trainer:
             scaler=self.scaler if training else None,
             grad_clip_norm=self.grad_clip_norm,
         )
-
-
-
-
-
-
-
-
-
-
-

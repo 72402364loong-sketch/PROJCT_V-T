@@ -29,6 +29,7 @@ def load_tactile_array(path: str | Path) -> np.ndarray:
     return array
 
 
+
 def ema_filter(sequence: np.ndarray, alpha: float) -> np.ndarray:
     if sequence.size == 0:
         return sequence.copy()
@@ -39,10 +40,26 @@ def ema_filter(sequence: np.ndarray, alpha: float) -> np.ndarray:
     return output
 
 
+
+def zero_phase_ema_filter(sequence: np.ndarray, alpha: float) -> np.ndarray:
+    if sequence.size == 0:
+        return sequence.copy()
+    forward = ema_filter(sequence, alpha=alpha)
+    backward = ema_filter(forward[::-1].copy(), alpha=alpha)
+    return backward[::-1].astype(np.float32)
+
+
+
+def build_tactile_time_axis(length: int, dt: float, *, offset_sec: float = 0.0) -> np.ndarray:
+    return (float(offset_sec) + np.arange(length, dtype=np.float32) * float(dt)).astype(np.float32)
+
+
+
 def split_ac_dc(sequence: np.ndarray, alpha: float) -> tuple[np.ndarray, np.ndarray]:
     low = ema_filter(sequence, alpha=alpha)
     high = sequence - low
     return high.astype(np.float32), low.astype(np.float32)
+
 
 
 def compute_resample_mapping(source_length: int, target_length: int) -> dict[str, np.ndarray]:
@@ -94,6 +111,7 @@ def compute_resample_mapping(source_length: int, target_length: int) -> dict[str
     }
 
 
+
 def resample_tactile_window(sequence: np.ndarray, target_length: int) -> tuple[np.ndarray, np.ndarray]:
     mapping = compute_resample_mapping(sequence.shape[0], target_length)
     if sequence.size == 0:
@@ -109,15 +127,18 @@ def resample_tactile_window(sequence: np.ndarray, target_length: int) -> tuple[n
     return resampled, mapping['valid_mask']
 
 
+
 def standardize_tactile_window(sequence: np.ndarray, mean: np.ndarray, std: np.ndarray) -> np.ndarray:
     safe_std = np.clip(std, a_min=1e-6, a_max=None)
     return ((sequence - mean) / safe_std).astype(np.float32)
+
 
 
 def _reshape_finger_sensor_axis(sequence: np.ndarray) -> np.ndarray:
     if sequence.ndim != 2 or sequence.shape[1] != 36:
         raise ValueError(f'Expected tactile array with shape [T, 36], got {sequence.shape}')
     return sequence.reshape(sequence.shape[0], 3, 4, 3)
+
 
 
 def normalize_normal_sign_table(normal_sign_table: Any) -> np.ndarray:
@@ -133,8 +154,10 @@ def normalize_normal_sign_table(normal_sign_table: Any) -> np.ndarray:
     return np.where(table > 0, 1.0, -1.0).astype(np.float32)
 
 
+
 def extract_normal_axis(sequence: np.ndarray) -> np.ndarray:
     return _reshape_finger_sensor_axis(sequence)[..., 2]
+
 
 
 def compute_signed_normal_force_curve(
@@ -152,6 +175,7 @@ def compute_signed_normal_force_curve(
     return force_sum.astype(np.float32)
 
 
+
 def compute_measured_force_curve(
     tactile_array: np.ndarray,
     *,
@@ -163,6 +187,80 @@ def compute_measured_force_curve(
         normal_sign_table=normal_sign_table,
         alpha=alpha,
     )
+
+
+
+def estimate_force_baseline(
+    force_curve: np.ndarray,
+    time_axis: np.ndarray,
+    *,
+    contact_time: float | None,
+    mode: str,
+    window_sec: float,
+) -> float:
+    baseline_mode = str(mode or 'none').strip().lower()
+    if baseline_mode == 'none' or contact_time is None or np.isnan(contact_time):
+        return 0.0
+
+    mask = (time_axis >= float(contact_time) - float(window_sec)) & (time_axis < float(contact_time))
+    if not mask.any():
+        if len(force_curve) == 0:
+            return 0.0
+        fallback_count = max(1, min(len(force_curve), int(round(float(window_sec) / max(1e-6, float(time_axis[1] - time_axis[0])))) if len(time_axis) > 1 else 8))
+        mask = np.zeros(len(force_curve), dtype=bool)
+        mask[:fallback_count] = True
+
+    selected = force_curve[mask]
+    if selected.size == 0:
+        return 0.0
+    if baseline_mode == 'pre_contact_median':
+        return float(np.median(selected))
+    if baseline_mode == 'pre_contact_mean':
+        return float(np.mean(selected))
+    raise ValueError(f'Unsupported force baseline mode: {mode!r}')
+
+
+
+def smooth_force_curve(force_curve: np.ndarray, *, alpha: float, mode: str) -> np.ndarray:
+    smoothing_mode = str(mode or 'ema').strip().lower()
+    if smoothing_mode == 'none':
+        return force_curve.astype(np.float32)
+    if smoothing_mode == 'ema':
+        return ema_filter(force_curve, alpha=alpha).astype(np.float32)
+    if smoothing_mode == 'zero_phase_ema':
+        return zero_phase_ema_filter(force_curve, alpha=alpha).astype(np.float32)
+    raise ValueError(f'Unsupported force smoothing mode: {mode!r}')
+
+
+
+def compute_clean_force_curve(
+    tactile_array: np.ndarray,
+    *,
+    dt: float,
+    sync_offset_sec: float,
+    contact_time: float | None,
+    alpha: float,
+    normal_sign_table: Any,
+    smoothing_mode: str,
+    baseline_mode: str,
+    baseline_window_sec: float,
+) -> np.ndarray:
+    raw_force = compute_measured_force_curve(
+        tactile_array,
+        normal_sign_table=normal_sign_table,
+        alpha=None,
+    )
+    time_axis = build_tactile_time_axis(raw_force.shape[0], dt=dt, offset_sec=sync_offset_sec)
+    baseline = estimate_force_baseline(
+        raw_force,
+        time_axis,
+        contact_time=contact_time,
+        mode=baseline_mode,
+        window_sec=baseline_window_sec,
+    )
+    centered = raw_force - baseline
+    return smooth_force_curve(centered, alpha=alpha, mode=smoothing_mode)
+
 
 
 def compute_expert_force_curve(

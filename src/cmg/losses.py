@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 from typing import Any
 
@@ -76,6 +76,10 @@ def compute_policy_loss(
     delta_targets: torch.Tensor | None,
     has_expert: torch.Tensor,
     has_reference: torch.Tensor,
+    control_mask: torch.Tensor,
+    reference_supervision_mask: torch.Tensor,
+    delta_supervision_mask: torch.Tensor,
+    quiet_supervision_mask: torch.Tensor,
     phase_targets: torch.Tensor,
     stable_mask: torch.Tensor,
     window_mask: torch.Tensor,
@@ -109,17 +113,16 @@ def compute_policy_loss(
         base_force = outputs['force_base'].reshape(-1)
         interface_delta = outputs['force_interface_delta'].reshape(-1)
         interface_gate = outputs['interface_gate'].reshape(-1) if 'interface_gate' in outputs else None
-        interface_expert = has_expert & (phase_targets == 1)
-        stable_expert = has_expert & stable_mask
-        reference_mask = has_reference & has_expert
-        interface_reference = reference_mask & (phase_targets == 1)
+        interface_expert = delta_supervision_mask
+        stable_expert = control_mask & stable_mask
+        reference_mask = reference_supervision_mask
         stable_reference = reference_mask & stable_mask
-        non_interface_reference = reference_mask & (phase_targets != 1)
+        quiet_mask = quiet_supervision_mask
         zero_target = torch.zeros_like(interface_delta)
 
         total = zero
         if all_weight > 0.0:
-            total = total + all_weight * masked_smooth_l1(force_pred, force_targets, has_expert, beta=beta, zero=zero)
+            total = total + all_weight * masked_smooth_l1(force_pred, force_targets, control_mask, beta=beta, zero=zero)
         if interface_weight > 0.0:
             total = total + interface_weight * masked_smooth_l1(force_pred, force_targets, interface_expert, beta=beta, zero=zero)
         if stable_weight > 0.0:
@@ -129,23 +132,21 @@ def compute_policy_loss(
         if base_stable_weight > 0.0:
             total = total + base_stable_weight * masked_smooth_l1(base_force, reference_targets, stable_reference, beta=beta, zero=zero)
         if residual_interface_weight > 0.0:
-            total = total + residual_interface_weight * masked_smooth_l1(interface_delta, delta_targets, interface_reference, beta=beta, zero=zero)
+            total = total + residual_interface_weight * masked_smooth_l1(interface_delta, delta_targets, interface_expert, beta=beta, zero=zero)
         if residual_stable_zero_weight > 0.0:
             total = total + residual_stable_zero_weight * masked_smooth_l1(interface_delta, zero_target, stable_reference, beta=beta, zero=zero)
         if residual_non_interface_weight > 0.0:
-            total = total + residual_non_interface_weight * masked_smooth_l1(interface_delta, zero_target, non_interface_reference, beta=beta, zero=zero)
+            total = total + residual_non_interface_weight * masked_smooth_l1(interface_delta, zero_target, quiet_mask, beta=beta, zero=zero)
         if gated_residual_interface_weight > 0.0 and interface_gate is not None:
             total = total + gated_residual_interface_weight * masked_smooth_l1(
                 interface_gate * interface_delta,
                 delta_targets,
-                interface_reference,
+                interface_expert,
                 beta=beta,
                 zero=zero,
             )
-        if quiet_weight > 0.0:
-            non_interface_windows = window_mask & (phase_targets != 1)
-            if non_interface_windows.any():
-                total = total + quiet_weight * torch.mean(interface_delta[non_interface_windows] ** 2)
+        if quiet_weight > 0.0 and quiet_mask.any():
+            total = total + quiet_weight * torch.mean(interface_delta[quiet_mask] ** 2)
         if interface_positive_bias_weight > 0.0 and interface_expert.any():
             interface_error = force_pred - force_targets
             positive_bias = torch.clamp(masked_mean(interface_error, interface_expert, zero=zero) - interface_bias_margin, min=0.0)
@@ -174,19 +175,19 @@ def compute_policy_loss(
         base_force = outputs['force_base'].reshape(-1)
         interface_delta = outputs['force_interface_delta'].reshape(-1)
         interface_gate = outputs['interface_gate'].reshape(-1) if 'interface_gate' in outputs else None
-        interface_expert = has_expert & (phase_targets == 1)
-        stable_expert = has_expert & stable_mask
-        non_interface_expert = has_expert & (phase_targets != 1)
+        interface_expert = control_mask & (phase_targets == 1)
+        stable_expert = control_mask & stable_mask
+        quiet_mask = quiet_supervision_mask
 
         total = zero
         if all_weight > 0.0:
-            total = total + all_weight * masked_smooth_l1(force_pred, force_targets, has_expert, beta=beta, zero=zero)
+            total = total + all_weight * masked_smooth_l1(force_pred, force_targets, control_mask, beta=beta, zero=zero)
         if interface_weight > 0.0:
             total = total + interface_weight * masked_smooth_l1(force_pred, force_targets, interface_expert, beta=beta, zero=zero)
         if stable_weight > 0.0:
             total = total + stable_weight * masked_smooth_l1(force_pred, force_targets, stable_expert, beta=beta, zero=zero)
         if base_weight > 0.0:
-            total = total + base_weight * masked_smooth_l1(base_force, force_targets, has_expert, beta=beta, zero=zero)
+            total = total + base_weight * masked_smooth_l1(base_force, force_targets, control_mask, beta=beta, zero=zero)
         if base_stable_weight > 0.0:
             total = total + base_stable_weight * masked_smooth_l1(base_force, force_targets, stable_expert, beta=beta, zero=zero)
 
@@ -198,7 +199,7 @@ def compute_policy_loss(
         if residual_stable_zero_weight > 0.0:
             total = total + residual_stable_zero_weight * masked_smooth_l1(interface_delta, zero_target, stable_expert, beta=beta, zero=zero)
         if residual_non_interface_weight > 0.0:
-            total = total + residual_non_interface_weight * masked_smooth_l1(interface_delta, zero_target, non_interface_expert, beta=beta, zero=zero)
+            total = total + residual_non_interface_weight * masked_smooth_l1(interface_delta, zero_target, quiet_mask, beta=beta, zero=zero)
         if gated_residual_interface_weight > 0.0 and interface_gate is not None:
             total = total + gated_residual_interface_weight * masked_smooth_l1(
                 interface_gate * interface_delta,
@@ -207,10 +208,8 @@ def compute_policy_loss(
                 beta=beta,
                 zero=zero,
             )
-        if quiet_weight > 0.0:
-            non_interface_windows = window_mask & (phase_targets != 1)
-            if non_interface_windows.any():
-                total = total + quiet_weight * torch.mean(interface_delta[non_interface_windows] ** 2)
+        if quiet_weight > 0.0 and quiet_mask.any():
+            total = total + quiet_weight * torch.mean(interface_delta[quiet_mask] ** 2)
         if interface_positive_bias_weight > 0.0 and interface_expert.any():
             interface_error = force_pred - force_targets
             positive_bias = torch.clamp(masked_mean(interface_error, interface_expert, zero=zero) - interface_bias_margin, min=0.0)
@@ -228,27 +227,26 @@ def compute_policy_loss(
 
         total = zero
         if all_weight > 0.0:
-            total = total + masked_smooth_l1(force_pred, force_targets, has_expert, beta=beta, zero=zero)
+            total = total + masked_smooth_l1(force_pred, force_targets, control_mask, beta=beta, zero=zero)
 
-        interface_expert = has_expert & (phase_targets == 1)
+        interface_expert = control_mask & (phase_targets == 1)
         if interface_weight > 0.0:
             total = total + interface_weight * masked_smooth_l1(force_pred, force_targets, interface_expert, beta=beta, zero=zero)
 
-        stable_expert = has_expert & stable_mask
+        stable_expert = control_mask & stable_mask
         if stable_weight > 0.0:
             total = total + stable_weight * masked_smooth_l1(force_pred, force_targets, stable_expert, beta=beta, zero=zero)
 
-        if quiet_weight > 0.0 and 'force_interface_delta' in outputs and 'interface_gate' in outputs:
-            interface_delta = outputs['force_interface_delta'].reshape(-1)[window_mask]
-            interface_gate = outputs['interface_gate'].reshape(-1)[window_mask]
-            total = total + quiet_weight * torch.mean(((1.0 - interface_gate) * interface_delta) ** 2)
+        if quiet_weight > 0.0 and 'force_interface_delta' in outputs and quiet_supervision_mask.any():
+            interface_delta = outputs['force_interface_delta'].reshape(-1)[quiet_supervision_mask]
+            total = total + quiet_weight * torch.mean(interface_delta ** 2)
         if interface_positive_bias_weight > 0.0 and interface_expert.any():
             interface_error = force_pred - force_targets
             positive_bias = torch.clamp(masked_mean(interface_error, interface_expert, zero=zero) - interface_bias_margin, min=0.0)
             total = total + interface_positive_bias_weight * (positive_bias ** 2)
         return total
 
-    return F.mse_loss(force_pred[has_expert], force_targets[has_expert])
+    return F.mse_loss(force_pred[control_mask], force_targets[control_mask])
 
 
 
@@ -316,12 +314,16 @@ def compute_losses(
     else:
         losses['inv'] = zero
 
-    force_targets = batch['expert_forces'].reshape(-1)
+    force_targets = batch['control_force_targets'].reshape(-1) if 'control_force_targets' in batch else batch['expert_forces'].reshape(-1)
     reference_targets = batch['reference_forces'].reshape(-1) if 'reference_forces' in batch else None
     delta_targets = batch['delta_force_targets'].reshape(-1) if 'delta_force_targets' in batch else None
     has_expert = batch['has_expert'].reshape(-1) & window_mask
     has_reference = batch['has_reference'].reshape(-1) & window_mask if 'has_reference' in batch else has_expert.new_zeros(has_expert.shape)
-    if pol_weight > 0.0 and has_expert.any():
+    control_mask = batch['has_control_target'].reshape(-1) & window_mask if 'has_control_target' in batch else has_expert
+    reference_supervision_mask = batch['reference_supervision_masks'].reshape(-1) & window_mask if 'reference_supervision_masks' in batch else has_reference
+    delta_supervision_mask = batch['delta_supervision_masks'].reshape(-1) & window_mask if 'delta_supervision_masks' in batch else (has_reference & (phase_targets == 1))
+    quiet_supervision_mask = batch['quiet_supervision_masks'].reshape(-1) & window_mask if 'quiet_supervision_masks' in batch else (control_mask & (phase_targets != 1))
+    if pol_weight > 0.0 and control_mask.any():
         losses['pol'] = compute_policy_loss(
             outputs,
             force_targets=force_targets,
@@ -329,6 +331,10 @@ def compute_losses(
             delta_targets=delta_targets,
             has_expert=has_expert,
             has_reference=has_reference,
+            control_mask=control_mask,
+            reference_supervision_mask=reference_supervision_mask,
+            delta_supervision_mask=delta_supervision_mask,
+            quiet_supervision_mask=quiet_supervision_mask,
             phase_targets=phase_targets,
             stable_mask=stable_mask,
             window_mask=window_mask,

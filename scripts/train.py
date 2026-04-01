@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import argparse
 import random
@@ -123,6 +123,12 @@ def make_dataset(project_root: Path, split_path: Path, subset: str, data_config:
         allowed_trial_results=allowed_trial_results,
         visual_feature_cache_dir=data_config.get('visual_feature_cache_dir'),
         reference_force_window_count=int(data_config.get('reference_force_window_count', 3)),
+        reference_force_statistic=str(data_config.get('reference_force_statistic', 'mean')),
+        expert_force_mode=str(data_config.get('expert_force_mode', 'measured_force')),
+        expert_force_smoothing=str(data_config.get('expert_force_smoothing', 'ema')),
+        expert_force_baseline_mode=str(data_config.get('expert_force_baseline_mode', 'none')),
+        expert_force_baseline_window_sec=float(data_config.get('expert_force_baseline_window_sec', 0.5)),
+        expert_force_interface_margin_sec=float(data_config.get('expert_force_interface_margin_sec', 0.0)),
     )
 
 
@@ -281,9 +287,3 @@ def main() -> None:
 
 if __name__ == '__main__':
     main()
-
-
-
-
-
-
