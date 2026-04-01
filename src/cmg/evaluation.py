@@ -12,11 +12,13 @@ from .models import CrossMediumSystem
 from .training import build_phase_class_weights, load_checkpoint_context, load_model_weights, run_model_epoch
 
 
+
 def resolve_path(project_root: Path, raw_path: str | Path) -> Path:
     path = Path(raw_path)
     if not path.is_absolute():
         path = project_root / path
     return path
+
 
 
 def apply_archived_run_config(
@@ -49,7 +51,8 @@ def apply_archived_run_config(
     return data_config, model_config, train_config
 
 
-def evaluate_checkpoint(
+
+def prepare_evaluation_context(
     *,
     project_root: str | Path,
     stage: str | Path,
@@ -106,6 +109,7 @@ def evaluate_checkpoint(
         tail_mode=stage_config.get('tail_mode', data_config.get('valid_tail_mode', 'all_valid')),
         allowed_trial_results=allowed_trial_results,
         visual_feature_cache_dir=data_config.get('visual_feature_cache_dir'),
+        reference_force_window_count=int(data_config.get('reference_force_window_count', 3)),
     )
 
     loader_kwargs: dict[str, Any] = {
@@ -123,22 +127,58 @@ def evaluate_checkpoint(
     model = CrossMediumSystem(model_config).to(device)
     load_info = load_model_weights(model, checkpoint_path, strict=True)
     phase_class_weights = build_phase_class_weights(train_config, device)
-    metrics = run_model_epoch(
-        model,
-        loader,
-        device=device,
-        training=False,
-        stage_config=stage_config,
-        model_config=model_config,
-        phase_class_weights=phase_class_weights,
-        amp_enabled=bool(train_config.get('amp_enabled', False)) and device.type == 'cuda',
-    )
     return {
-        'stage_name': stage_config.get('name'),
-        'stage_path': str(stage_path.resolve()),
+        'project_root': project_root,
+        'stage_path': stage_path,
+        'checkpoint_path': checkpoint_path,
         'subset': subset,
         'only_stable': bool(only_stable),
-        'checkpoint_path': str(checkpoint_path.resolve()),
-        'checkpoint_run_config_path': load_info.get('run_config_path'),
+        'stage_config': stage_config,
+        'data_config': data_config,
+        'model_config': model_config,
+        'train_config': train_config,
+        'dataset': dataset,
+        'loader': loader,
+        'device': device,
+        'model': model,
+        'phase_class_weights': phase_class_weights,
+        'checkpoint_context': checkpoint_context,
+        'load_info': load_info,
+    }
+
+
+
+def evaluate_checkpoint(
+    *,
+    project_root: str | Path,
+    stage: str | Path,
+    checkpoint: str | Path,
+    subset: str = 'test',
+    only_stable: bool = False,
+) -> dict[str, Any]:
+    context = prepare_evaluation_context(
+        project_root=project_root,
+        stage=stage,
+        checkpoint=checkpoint,
+        subset=subset,
+        only_stable=only_stable,
+    )
+    metrics = run_model_epoch(
+        context['model'],
+        context['loader'],
+        device=context['device'],
+        training=False,
+        stage_config=context['stage_config'],
+        model_config=context['model_config'],
+        phase_class_weights=context['phase_class_weights'],
+        amp_enabled=bool(context['train_config'].get('amp_enabled', False)) and context['device'].type == 'cuda',
+    )
+    return {
+        'stage_name': context['stage_config'].get('name'),
+        'stage_path': str(context['stage_path'].resolve()),
+        'subset': subset,
+        'only_stable': bool(only_stable),
+        'checkpoint_path': str(context['checkpoint_path'].resolve()),
+        'checkpoint_run_config_path': context['load_info'].get('run_config_path'),
         'metrics': metrics,
     }

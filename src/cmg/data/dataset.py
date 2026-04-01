@@ -49,6 +49,7 @@ class CrossMediumSequenceDataset(Dataset):
         tail_mode: str = 'all_valid',
         allowed_trial_results: Iterable[str] | None = None,
         visual_feature_cache_dir: str | Path | None = None,
+        reference_force_window_count: int = 3,
     ) -> None:
         self.project_root = Path(project_root)
         self.split_path = Path(split_path)
@@ -71,6 +72,7 @@ class CrossMediumSequenceDataset(Dataset):
         self.normalization_trial_results = None if normalization_trial_results is None else {str(value).strip().lower() for value in normalization_trial_results}
         self.tail_mode = tail_mode
         self.visual_feature_cache_dir = resolve_visual_feature_cache_dir(self.project_root, visual_feature_cache_dir)
+        self.reference_force_window_count = max(1, int(reference_force_window_count))
 
         samples_path = self.project_root / 'data' / 'processed' / 'samples.csv'
         windows_path = self.project_root / 'data' / 'processed' / 'windows.csv'
@@ -211,6 +213,39 @@ class CrossMediumSequenceDataset(Dataset):
             json.dump(stats, handle, ensure_ascii=False, indent=2)
         return stats
 
+    def _compute_sample_reference_force(
+        self,
+        windows: list[dict[str, Any]],
+        expert_curve: np.ndarray | None,
+    ) -> tuple[float, bool]:
+        if expert_curve is None:
+            return float('nan'), False
+
+        first_interface_index = len(windows)
+        for window_index, window in enumerate(windows):
+            if str(window['phase_label']) == 'Interface':
+                first_interface_index = window_index
+                break
+
+        stable_water_forces: list[float] = []
+        stable_forces: list[float] = []
+        for window in windows[:first_interface_index]:
+            start_idx = int(window['tactile_start_idx'])
+            end_idx = int(window['tactile_end_idx'])
+            window_force = float(np.mean(expert_curve[start_idx:end_idx]))
+            if bool(window['is_stable_mask']):
+                stable_forces.append(window_force)
+                if str(window['phase_label']) == 'Water':
+                    stable_water_forces.append(window_force)
+
+        if stable_water_forces:
+            tail = stable_water_forces[-self.reference_force_window_count :]
+            return float(np.mean(tail)), True
+        if stable_forces:
+            tail = stable_forces[-self.reference_force_window_count :]
+            return float(np.mean(tail)), True
+        return float('nan'), False
+
     def __getitem__(self, index: int) -> dict[str, Any]:
         sample = self.sample_records[index]
         windows = self.windows_by_sample[sample['sample_id']]
@@ -225,6 +260,7 @@ class CrossMediumSequenceDataset(Dataset):
             alpha=self.expert_alpha,
             normal_sign_table=self.normal_sign_table,
         )
+        sample_reference_force, has_sample_reference = self._compute_sample_reference_force(windows, expert_curve)
 
         visual_feature_windows: list[torch.Tensor] | None = None
         video_windows: list[torch.Tensor] | None = None
@@ -237,7 +273,10 @@ class CrossMediumSequenceDataset(Dataset):
         stable_masks: list[int] = []
         stable_phases: list[int] = []
         expert_forces: list[float] = []
+        reference_forces: list[float] = []
+        delta_force_targets: list[float] = []
         has_expert: list[int] = []
+        has_reference: list[int] = []
 
         cache_path = None
         if self.visual_feature_cache_dir is not None:
@@ -302,10 +341,22 @@ class CrossMediumSequenceDataset(Dataset):
             stable_phases.append(PHASE_TO_INDEX[stable_phase] if stable_phase in PHASE_TO_INDEX else -1)
             if expert_curve is None:
                 expert_forces.append(float('nan'))
+                reference_forces.append(float('nan'))
+                delta_force_targets.append(float('nan'))
                 has_expert.append(0)
+                has_reference.append(0)
             else:
-                expert_forces.append(float(np.mean(expert_curve[start_idx:end_idx])))
+                expert_force = float(np.mean(expert_curve[start_idx:end_idx]))
+                expert_forces.append(expert_force)
                 has_expert.append(1)
+                if has_sample_reference:
+                    reference_forces.append(float(sample_reference_force))
+                    delta_force_targets.append(float(expert_force - sample_reference_force))
+                    has_reference.append(1)
+                else:
+                    reference_forces.append(float('nan'))
+                    delta_force_targets.append(float('nan'))
+                    has_reference.append(0)
 
         return {
             'sample_id': sample['sample_id'],
@@ -323,7 +374,10 @@ class CrossMediumSequenceDataset(Dataset):
             'stable_masks': stable_masks,
             'stable_phases': stable_phases,
             'expert_forces': expert_forces,
+            'reference_forces': reference_forces,
+            'delta_force_targets': delta_force_targets,
             'has_expert': has_expert,
+            'has_reference': has_reference,
             'fragility_label': FRAGILITY_TO_INDEX[str(sample['fragility'])],
             'geometry_label': GEOMETRY_TO_INDEX[str(sample['geometry'])],
             'surface_label': SURFACE_TO_INDEX[str(sample['surface'])],
@@ -358,7 +412,10 @@ def sequence_collate_fn(batch: list[dict[str, Any]]) -> dict[str, Any]:
     stable_masks = torch.zeros(batch_size, max_windows, dtype=torch.bool)
     stable_phases = torch.full((batch_size, max_windows), -1, dtype=torch.long)
     expert_forces = torch.full((batch_size, max_windows), float('nan'), dtype=torch.float32)
+    reference_forces = torch.full((batch_size, max_windows), float('nan'), dtype=torch.float32)
+    delta_force_targets = torch.full((batch_size, max_windows), float('nan'), dtype=torch.float32)
     has_expert = torch.zeros(batch_size, max_windows, dtype=torch.bool)
+    has_reference = torch.zeros(batch_size, max_windows, dtype=torch.bool)
     object_index = torch.zeros(batch_size, dtype=torch.long)
     sample_index = torch.zeros(batch_size, dtype=torch.long)
     fragility_label = torch.zeros(batch_size, dtype=torch.long)
@@ -397,7 +454,10 @@ def sequence_collate_fn(batch: list[dict[str, Any]]) -> dict[str, Any]:
             stable_masks[batch_index, window_index] = bool(item['stable_masks'][window_index])
             stable_phases[batch_index, window_index] = int(item['stable_phases'][window_index])
             expert_forces[batch_index, window_index] = float(item['expert_forces'][window_index])
+            reference_forces[batch_index, window_index] = float(item['reference_forces'][window_index])
+            delta_force_targets[batch_index, window_index] = float(item['delta_force_targets'][window_index])
             has_expert[batch_index, window_index] = bool(item['has_expert'][window_index])
+            has_reference[batch_index, window_index] = bool(item['has_reference'][window_index])
 
     return {
         'sample_ids': sample_ids,
@@ -416,9 +476,11 @@ def sequence_collate_fn(batch: list[dict[str, Any]]) -> dict[str, Any]:
         'stable_masks': stable_masks,
         'stable_phases': stable_phases,
         'expert_forces': expert_forces,
+        'reference_forces': reference_forces,
+        'delta_force_targets': delta_force_targets,
         'has_expert': has_expert,
+        'has_reference': has_reference,
         'fragility_label': fragility_label,
         'geometry_label': geometry_label,
         'surface_label': surface_label,
     }
-

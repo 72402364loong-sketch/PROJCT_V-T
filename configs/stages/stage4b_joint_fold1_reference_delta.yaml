@@ -1,0 +1,71 @@
+﻿name: stage4b_joint_fold1_reference_delta
+stage_index: 4
+checkpoint_prefix: stage4b_reference_delta
+best_checkpoint_name: stage4b_reference_delta_best_hit200.pt
+split: data/splits/split_unseen_fold1_v1.yaml
+tail_mode: all_valid
+freeze_modules:
+  - visual_encoder
+  - content_encoder
+  - attribute_head.shared
+  - attribute_head.fragility
+  - attribute_head.geometry
+  - attribute_head.surface
+loss_weights:
+  clip: 0.0
+  inv: 0.0
+  med: 1.0
+  attr: 0.0
+  pol: 0.2
+policy_loss:
+  type: explicit_reference_delta_weighted_smooth_l1
+  all_weight: 0.25
+  interface_weight: 3.0
+  stable_weight: 0.25
+  base_reference_weight: 0.75
+  base_stable_weight: 1.0
+  residual_interface_weight: 6.0
+  residual_stable_zero_weight: 1.0
+  residual_non_interface_weight: 0.25
+  gated_residual_interface_weight: 2.0
+  quiet_weight: 0.1
+  interface_positive_bias_weight: 1.5
+  interface_bias_margin: 0.0
+  beta: 1.0
+selection_metric: interface_hit_rate_200
+maximize_metric: true
+tie_breakers:
+  - metric: interface_mae
+    mode: min
+  - metric: medium_f1_interface
+    mode: max
+  - metric: overall_mae
+    mode: min
+  - metric: epoch
+    mode: min
+data:
+  num_frames_per_window: 4
+  reference_force_window_count: 3
+model:
+  visual:
+    use_lora: true
+    max_windows_per_encode: 2
+  policy:
+    head_type: state_residual
+train:
+  epochs: 10
+  batch_size: 2
+  num_workers: 0
+  pin_memory: false
+  persistent_workers: false
+  sampling_mode: interface_object_aware
+  interface_sampler_alpha: 1.5
+  interface_sampler_min_expert_windows: 1
+  samples_per_object: 2
+  val_every_n_epochs: 1
+  early_stopping_patience: 4
+  warmup_ratio: 0.05
+  learning_rate: 0.0000075
+  base_learning_rate: 0.0000075
+  lora_learning_rate: 0.00000375
+  amp_enabled: false

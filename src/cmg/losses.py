@@ -61,11 +61,21 @@ def masked_smooth_l1(
 
 
 
+def masked_mean(values: torch.Tensor, mask: torch.Tensor, *, zero: torch.Tensor) -> torch.Tensor:
+    if not mask.any():
+        return zero
+    return values[mask].mean()
+
+
+
 def compute_policy_loss(
     outputs: dict[str, torch.Tensor],
     *,
     force_targets: torch.Tensor,
+    reference_targets: torch.Tensor | None,
+    delta_targets: torch.Tensor | None,
     has_expert: torch.Tensor,
+    has_reference: torch.Tensor,
     phase_targets: torch.Tensor,
     stable_mask: torch.Tensor,
     window_mask: torch.Tensor,
@@ -75,6 +85,72 @@ def compute_policy_loss(
     force_pred = outputs['force_pred'].reshape(-1)
     policy_config = policy_loss_config or {}
     policy_type = str(policy_config.get('type', 'mse'))
+
+    if policy_type == 'explicit_reference_delta_weighted_smooth_l1':
+        all_weight = float(policy_config.get('all_weight', 0.25))
+        interface_weight = float(policy_config.get('interface_weight', 4.0))
+        stable_weight = float(policy_config.get('stable_weight', 0.25))
+        base_reference_weight = float(policy_config.get('base_reference_weight', 1.0))
+        base_stable_weight = float(policy_config.get('base_stable_weight', 1.0))
+        residual_interface_weight = float(policy_config.get('residual_interface_weight', 6.0))
+        residual_stable_zero_weight = float(policy_config.get('residual_stable_zero_weight', 1.0))
+        residual_non_interface_weight = float(policy_config.get('residual_non_interface_weight', 0.25))
+        gated_residual_interface_weight = float(policy_config.get('gated_residual_interface_weight', 0.0))
+        quiet_weight = float(policy_config.get('quiet_weight', 0.0))
+        interface_positive_bias_weight = float(policy_config.get('interface_positive_bias_weight', 0.0))
+        interface_bias_margin = float(policy_config.get('interface_bias_margin', 0.0))
+        beta = float(policy_config.get('beta', 1.0))
+
+        if reference_targets is None or delta_targets is None:
+            raise RuntimeError('Explicit reference-delta policy loss requires reference_targets and delta_targets.')
+        if 'force_base' not in outputs or 'force_interface_delta' not in outputs:
+            raise RuntimeError('Explicit reference-delta policy loss requires force_base and force_interface_delta outputs.')
+
+        base_force = outputs['force_base'].reshape(-1)
+        interface_delta = outputs['force_interface_delta'].reshape(-1)
+        interface_gate = outputs['interface_gate'].reshape(-1) if 'interface_gate' in outputs else None
+        interface_expert = has_expert & (phase_targets == 1)
+        stable_expert = has_expert & stable_mask
+        reference_mask = has_reference & has_expert
+        interface_reference = reference_mask & (phase_targets == 1)
+        stable_reference = reference_mask & stable_mask
+        non_interface_reference = reference_mask & (phase_targets != 1)
+        zero_target = torch.zeros_like(interface_delta)
+
+        total = zero
+        if all_weight > 0.0:
+            total = total + all_weight * masked_smooth_l1(force_pred, force_targets, has_expert, beta=beta, zero=zero)
+        if interface_weight > 0.0:
+            total = total + interface_weight * masked_smooth_l1(force_pred, force_targets, interface_expert, beta=beta, zero=zero)
+        if stable_weight > 0.0:
+            total = total + stable_weight * masked_smooth_l1(force_pred, force_targets, stable_expert, beta=beta, zero=zero)
+        if base_reference_weight > 0.0:
+            total = total + base_reference_weight * masked_smooth_l1(base_force, reference_targets, reference_mask, beta=beta, zero=zero)
+        if base_stable_weight > 0.0:
+            total = total + base_stable_weight * masked_smooth_l1(base_force, reference_targets, stable_reference, beta=beta, zero=zero)
+        if residual_interface_weight > 0.0:
+            total = total + residual_interface_weight * masked_smooth_l1(interface_delta, delta_targets, interface_reference, beta=beta, zero=zero)
+        if residual_stable_zero_weight > 0.0:
+            total = total + residual_stable_zero_weight * masked_smooth_l1(interface_delta, zero_target, stable_reference, beta=beta, zero=zero)
+        if residual_non_interface_weight > 0.0:
+            total = total + residual_non_interface_weight * masked_smooth_l1(interface_delta, zero_target, non_interface_reference, beta=beta, zero=zero)
+        if gated_residual_interface_weight > 0.0 and interface_gate is not None:
+            total = total + gated_residual_interface_weight * masked_smooth_l1(
+                interface_gate * interface_delta,
+                delta_targets,
+                interface_reference,
+                beta=beta,
+                zero=zero,
+            )
+        if quiet_weight > 0.0:
+            non_interface_windows = window_mask & (phase_targets != 1)
+            if non_interface_windows.any():
+                total = total + quiet_weight * torch.mean(interface_delta[non_interface_windows] ** 2)
+        if interface_positive_bias_weight > 0.0 and interface_expert.any():
+            interface_error = force_pred - force_targets
+            positive_bias = torch.clamp(masked_mean(interface_error, interface_expert, zero=zero) - interface_bias_margin, min=0.0)
+            total = total + interface_positive_bias_weight * (positive_bias ** 2)
+        return total
 
     if policy_type == 'decomposed_interface_residual_weighted_smooth_l1':
         all_weight = float(policy_config.get('all_weight', 0.25))
@@ -87,6 +163,8 @@ def compute_policy_loss(
         residual_non_interface_weight = float(policy_config.get('residual_non_interface_weight', 0.25))
         gated_residual_interface_weight = float(policy_config.get('gated_residual_interface_weight', 0.0))
         quiet_weight = float(policy_config.get('quiet_weight', 0.0))
+        interface_positive_bias_weight = float(policy_config.get('interface_positive_bias_weight', 0.0))
+        interface_bias_margin = float(policy_config.get('interface_bias_margin', 0.0))
         beta = float(policy_config.get('beta', 1.0))
         detach_base_target = bool(policy_config.get('detach_base_target', True))
 
@@ -133,6 +211,10 @@ def compute_policy_loss(
             non_interface_windows = window_mask & (phase_targets != 1)
             if non_interface_windows.any():
                 total = total + quiet_weight * torch.mean(interface_delta[non_interface_windows] ** 2)
+        if interface_positive_bias_weight > 0.0 and interface_expert.any():
+            interface_error = force_pred - force_targets
+            positive_bias = torch.clamp(masked_mean(interface_error, interface_expert, zero=zero) - interface_bias_margin, min=0.0)
+            total = total + interface_positive_bias_weight * (positive_bias ** 2)
         return total
 
     if policy_type in {'interface_weighted_smooth_l1', 'interface_residual_weighted_smooth_l1'}:
@@ -140,6 +222,8 @@ def compute_policy_loss(
         interface_weight = float(policy_config.get('interface_weight', 4.0))
         stable_weight = float(policy_config.get('stable_weight', 0.5))
         quiet_weight = float(policy_config.get('quiet_weight', 0.0))
+        interface_positive_bias_weight = float(policy_config.get('interface_positive_bias_weight', 0.0))
+        interface_bias_margin = float(policy_config.get('interface_bias_margin', 0.0))
         beta = float(policy_config.get('beta', 1.0))
 
         total = zero
@@ -158,6 +242,10 @@ def compute_policy_loss(
             interface_delta = outputs['force_interface_delta'].reshape(-1)[window_mask]
             interface_gate = outputs['interface_gate'].reshape(-1)[window_mask]
             total = total + quiet_weight * torch.mean(((1.0 - interface_gate) * interface_delta) ** 2)
+        if interface_positive_bias_weight > 0.0 and interface_expert.any():
+            interface_error = force_pred - force_targets
+            positive_bias = torch.clamp(masked_mean(interface_error, interface_expert, zero=zero) - interface_bias_margin, min=0.0)
+            total = total + interface_positive_bias_weight * (positive_bias ** 2)
         return total
 
     return F.mse_loss(force_pred[has_expert], force_targets[has_expert])
@@ -229,12 +317,18 @@ def compute_losses(
         losses['inv'] = zero
 
     force_targets = batch['expert_forces'].reshape(-1)
+    reference_targets = batch['reference_forces'].reshape(-1) if 'reference_forces' in batch else None
+    delta_targets = batch['delta_force_targets'].reshape(-1) if 'delta_force_targets' in batch else None
     has_expert = batch['has_expert'].reshape(-1) & window_mask
+    has_reference = batch['has_reference'].reshape(-1) & window_mask if 'has_reference' in batch else has_expert.new_zeros(has_expert.shape)
     if pol_weight > 0.0 and has_expert.any():
         losses['pol'] = compute_policy_loss(
             outputs,
             force_targets=force_targets,
+            reference_targets=reference_targets,
+            delta_targets=delta_targets,
             has_expert=has_expert,
+            has_reference=has_reference,
             phase_targets=phase_targets,
             stable_mask=stable_mask,
             window_mask=window_mask,

@@ -320,13 +320,15 @@ def run_model_epoch(
                     phase_class_weights=phase_class_weights,
                 )
             if training:
+                previous_scale = float(scaler.get_scale())
                 scaler.scale(losses['total']).backward()
                 if grad_clip_norm > 0:
                     scaler.unscale_(optimizer)
                     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip_norm)
                 scaler.step(optimizer)
                 scaler.update()
-                scheduler.step()
+                if (not amp_enabled) or float(scaler.get_scale()) >= previous_scale:
+                    scheduler.step()
         for key in loss_sums:
             loss_sums[key] += float(losses[key].item())
 
@@ -700,6 +702,7 @@ class Trainer:
             scaler=self.scaler if training else None,
             grad_clip_norm=self.grad_clip_norm,
         )
+
 
 
 

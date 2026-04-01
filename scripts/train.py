@@ -122,6 +122,7 @@ def make_dataset(project_root: Path, split_path: Path, subset: str, data_config:
         tail_mode=stage_config.get('tail_mode', data_config.get('valid_tail_mode', 'all_valid')),
         allowed_trial_results=allowed_trial_results,
         visual_feature_cache_dir=data_config.get('visual_feature_cache_dir'),
+        reference_force_window_count=int(data_config.get('reference_force_window_count', 3)),
     )
 
 
@@ -280,6 +281,8 @@ def main() -> None:
 
 if __name__ == '__main__':
     main()
+
+
 
 
 
