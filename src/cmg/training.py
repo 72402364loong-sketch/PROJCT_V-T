@@ -217,8 +217,14 @@ def build_optimizer(model: nn.Module, config: dict[str, Any]) -> AdamW:
     base_lr = float(config.get('base_learning_rate', config.get('learning_rate', 1e-4)))
     lora_lr = float(config.get('lora_learning_rate', base_lr))
     weight_decay = float(config['weight_decay'])
+    raw_multipliers = config.get('module_learning_rate_multipliers', {})
+    module_learning_rate_multipliers = {
+        str(prefix): float(multiplier)
+        for prefix, multiplier in raw_multipliers.items()
+    } if isinstance(raw_multipliers, dict) else {}
 
     base_params = []
+    scaled_base_groups: dict[str, dict[str, Any]] = {}
     lora_params = []
     for name, parameter in model.named_parameters():
         if not parameter.requires_grad:
@@ -226,11 +232,30 @@ def build_optimizer(model: nn.Module, config: dict[str, Any]) -> AdamW:
         if 'lora_' in name:
             lora_params.append(parameter)
         else:
-            base_params.append(parameter)
+            matched_prefix = None
+            for prefix in module_learning_rate_multipliers:
+                if name.startswith(prefix) and (matched_prefix is None or len(prefix) > len(matched_prefix)):
+                    matched_prefix = prefix
+            if matched_prefix is None:
+                base_params.append(parameter)
+                continue
+            multiplier = module_learning_rate_multipliers[matched_prefix]
+            group_name = 'base_' + matched_prefix.replace('.', '_')
+            group = scaled_base_groups.setdefault(
+                group_name,
+                {
+                    'params': [],
+                    'lr': base_lr * multiplier,
+                    'name': group_name,
+                },
+            )
+            group['params'].append(parameter)
 
     param_groups: list[dict[str, Any]] = []
     if base_params:
         param_groups.append({'params': base_params, 'lr': base_lr, 'name': 'base'})
+    for group_name in sorted(scaled_base_groups):
+        param_groups.append(scaled_base_groups[group_name])
     if lora_params:
         param_groups.append({'params': lora_params, 'lr': lora_lr, 'name': 'lora'})
     if not param_groups:

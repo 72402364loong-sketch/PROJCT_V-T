@@ -60,6 +60,24 @@ def masked_smooth_l1(
     return F.smooth_l1_loss(prediction[mask], target[mask], beta=beta)
 
 
+def masked_scaled_smooth_l1(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    mask: torch.Tensor,
+    *,
+    beta: float,
+    scale: float,
+    zero: torch.Tensor,
+) -> torch.Tensor:
+    if not mask.any():
+        return zero
+    if scale <= 0.0:
+        raise ValueError(f'delta normalization scale must be positive, got {scale}.')
+    if scale == 1.0:
+        return F.smooth_l1_loss(prediction[mask], target[mask], beta=beta)
+    return F.smooth_l1_loss(prediction[mask] / scale, target[mask] / scale, beta=beta)
+
+
 
 def masked_mean(values: torch.Tensor, mask: torch.Tensor, *, zero: torch.Tensor) -> torch.Tensor:
     if not mask.any():
@@ -96,6 +114,7 @@ def compute_policy_loss(
         stable_weight = float(policy_config.get('stable_weight', 0.25))
         base_reference_weight = float(policy_config.get('base_reference_weight', 1.0))
         base_stable_weight = float(policy_config.get('base_stable_weight', 1.0))
+        base_normalization_scale = float(policy_config.get('base_normalization_scale', 1.0))
         residual_interface_weight = float(policy_config.get('residual_interface_weight', 6.0))
         residual_stable_zero_weight = float(policy_config.get('residual_stable_zero_weight', 1.0))
         residual_non_interface_weight = float(policy_config.get('residual_non_interface_weight', 0.25))
@@ -104,6 +123,7 @@ def compute_policy_loss(
         interface_positive_bias_weight = float(policy_config.get('interface_positive_bias_weight', 0.0))
         interface_bias_margin = float(policy_config.get('interface_bias_margin', 0.0))
         beta = float(policy_config.get('beta', 1.0))
+        delta_normalization_scale = float(policy_config.get('delta_normalization_scale', 1.0))
 
         if reference_targets is None or delta_targets is None:
             raise RuntimeError('Explicit reference-delta policy loss requires reference_targets and delta_targets.')
@@ -128,25 +148,62 @@ def compute_policy_loss(
         if stable_weight > 0.0:
             total = total + stable_weight * masked_smooth_l1(force_pred, force_targets, stable_expert, beta=beta, zero=zero)
         if base_reference_weight > 0.0:
-            total = total + base_reference_weight * masked_smooth_l1(base_force, reference_targets, reference_mask, beta=beta, zero=zero)
+            total = total + base_reference_weight * masked_scaled_smooth_l1(
+                base_force,
+                reference_targets,
+                reference_mask,
+                beta=beta,
+                scale=base_normalization_scale,
+                zero=zero,
+            )
         if base_stable_weight > 0.0:
-            total = total + base_stable_weight * masked_smooth_l1(base_force, reference_targets, stable_reference, beta=beta, zero=zero)
+            total = total + base_stable_weight * masked_scaled_smooth_l1(
+                base_force,
+                reference_targets,
+                stable_reference,
+                beta=beta,
+                scale=base_normalization_scale,
+                zero=zero,
+            )
         if residual_interface_weight > 0.0:
-            total = total + residual_interface_weight * masked_smooth_l1(interface_delta, delta_targets, interface_expert, beta=beta, zero=zero)
+            total = total + residual_interface_weight * masked_scaled_smooth_l1(
+                interface_delta,
+                delta_targets,
+                interface_expert,
+                beta=beta,
+                scale=delta_normalization_scale,
+                zero=zero,
+            )
         if residual_stable_zero_weight > 0.0:
-            total = total + residual_stable_zero_weight * masked_smooth_l1(interface_delta, zero_target, stable_reference, beta=beta, zero=zero)
+            total = total + residual_stable_zero_weight * masked_scaled_smooth_l1(
+                interface_delta,
+                zero_target,
+                stable_reference,
+                beta=beta,
+                scale=delta_normalization_scale,
+                zero=zero,
+            )
         if residual_non_interface_weight > 0.0:
-            total = total + residual_non_interface_weight * masked_smooth_l1(interface_delta, zero_target, quiet_mask, beta=beta, zero=zero)
+            total = total + residual_non_interface_weight * masked_scaled_smooth_l1(
+                interface_delta,
+                zero_target,
+                quiet_mask,
+                beta=beta,
+                scale=delta_normalization_scale,
+                zero=zero,
+            )
         if gated_residual_interface_weight > 0.0 and interface_gate is not None:
-            total = total + gated_residual_interface_weight * masked_smooth_l1(
+            total = total + gated_residual_interface_weight * masked_scaled_smooth_l1(
                 interface_gate * interface_delta,
                 delta_targets,
                 interface_expert,
                 beta=beta,
+                scale=delta_normalization_scale,
                 zero=zero,
             )
         if quiet_weight > 0.0 and quiet_mask.any():
-            total = total + quiet_weight * torch.mean(interface_delta[quiet_mask] ** 2)
+            quiet_delta = interface_delta[quiet_mask] / delta_normalization_scale
+            total = total + quiet_weight * torch.mean(quiet_delta ** 2)
         if interface_positive_bias_weight > 0.0 and interface_expert.any():
             interface_error = force_pred - force_targets
             positive_bias = torch.clamp(masked_mean(interface_error, interface_expert, zero=zero) - interface_bias_margin, min=0.0)
@@ -159,6 +216,7 @@ def compute_policy_loss(
         stable_weight = float(policy_config.get('stable_weight', 0.25))
         base_weight = float(policy_config.get('base_weight', 0.5))
         base_stable_weight = float(policy_config.get('base_stable_weight', 1.0))
+        base_normalization_scale = float(policy_config.get('base_normalization_scale', 1.0))
         residual_interface_weight = float(policy_config.get('residual_interface_weight', 6.0))
         residual_stable_zero_weight = float(policy_config.get('residual_stable_zero_weight', 1.0))
         residual_non_interface_weight = float(policy_config.get('residual_non_interface_weight', 0.25))
@@ -168,6 +226,7 @@ def compute_policy_loss(
         interface_bias_margin = float(policy_config.get('interface_bias_margin', 0.0))
         beta = float(policy_config.get('beta', 1.0))
         detach_base_target = bool(policy_config.get('detach_base_target', True))
+        delta_normalization_scale = float(policy_config.get('delta_normalization_scale', 1.0))
 
         if 'force_base' not in outputs or 'force_interface_delta' not in outputs:
             raise RuntimeError('Decomposed residual policy loss requires force_base and force_interface_delta outputs.')
@@ -187,29 +246,66 @@ def compute_policy_loss(
         if stable_weight > 0.0:
             total = total + stable_weight * masked_smooth_l1(force_pred, force_targets, stable_expert, beta=beta, zero=zero)
         if base_weight > 0.0:
-            total = total + base_weight * masked_smooth_l1(base_force, force_targets, control_mask, beta=beta, zero=zero)
+            total = total + base_weight * masked_scaled_smooth_l1(
+                base_force,
+                force_targets,
+                control_mask,
+                beta=beta,
+                scale=base_normalization_scale,
+                zero=zero,
+            )
         if base_stable_weight > 0.0:
-            total = total + base_stable_weight * masked_smooth_l1(base_force, force_targets, stable_expert, beta=beta, zero=zero)
+            total = total + base_stable_weight * masked_scaled_smooth_l1(
+                base_force,
+                force_targets,
+                stable_expert,
+                beta=beta,
+                scale=base_normalization_scale,
+                zero=zero,
+            )
 
         base_reference = base_force.detach() if detach_base_target else base_force
         delta_target = force_targets - base_reference
         zero_target = torch.zeros_like(interface_delta)
         if residual_interface_weight > 0.0:
-            total = total + residual_interface_weight * masked_smooth_l1(interface_delta, delta_target, interface_expert, beta=beta, zero=zero)
+            total = total + residual_interface_weight * masked_scaled_smooth_l1(
+                interface_delta,
+                delta_target,
+                interface_expert,
+                beta=beta,
+                scale=delta_normalization_scale,
+                zero=zero,
+            )
         if residual_stable_zero_weight > 0.0:
-            total = total + residual_stable_zero_weight * masked_smooth_l1(interface_delta, zero_target, stable_expert, beta=beta, zero=zero)
+            total = total + residual_stable_zero_weight * masked_scaled_smooth_l1(
+                interface_delta,
+                zero_target,
+                stable_expert,
+                beta=beta,
+                scale=delta_normalization_scale,
+                zero=zero,
+            )
         if residual_non_interface_weight > 0.0:
-            total = total + residual_non_interface_weight * masked_smooth_l1(interface_delta, zero_target, quiet_mask, beta=beta, zero=zero)
+            total = total + residual_non_interface_weight * masked_scaled_smooth_l1(
+                interface_delta,
+                zero_target,
+                quiet_mask,
+                beta=beta,
+                scale=delta_normalization_scale,
+                zero=zero,
+            )
         if gated_residual_interface_weight > 0.0 and interface_gate is not None:
-            total = total + gated_residual_interface_weight * masked_smooth_l1(
+            total = total + gated_residual_interface_weight * masked_scaled_smooth_l1(
                 interface_gate * interface_delta,
                 delta_target,
                 interface_expert,
                 beta=beta,
+                scale=delta_normalization_scale,
                 zero=zero,
             )
         if quiet_weight > 0.0 and quiet_mask.any():
-            total = total + quiet_weight * torch.mean(interface_delta[quiet_mask] ** 2)
+            quiet_delta = interface_delta[quiet_mask] / delta_normalization_scale
+            total = total + quiet_weight * torch.mean(quiet_delta ** 2)
         if interface_positive_bias_weight > 0.0 and interface_expert.any():
             interface_error = force_pred - force_targets
             positive_bias = torch.clamp(masked_mean(interface_error, interface_expert, zero=zero) - interface_bias_margin, min=0.0)

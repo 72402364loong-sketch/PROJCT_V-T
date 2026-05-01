@@ -1,0 +1,5 @@
+﻿sample_id,object_id,object_name,object_pool,fragility,geometry,surface,water_condition,lift_speed,placement_variant,trial_result,interface_window_count,interface_expert_count,reference_window_count_used,reference_window_indices,reference_force,has_reference_sample
+S0181,OBJ012,Dark-colored wine glass,main,fragile,constricted-opening,smooth,clear,normal,normal,stable,13,13,3,"32,33,34",-763.6954345703125,1
+S0182,OBJ012,Dark-colored wine glass,main,fragile,constricted-opening,smooth,clear,normal,normal,stable,13,13,3,"34,35,36",-1025.250732421875,1
+S0192,OBJ012,Dark-colored wine glass,main,fragile,constricted-opening,smooth,turbid,normal,normal,stable,11,11,3,"40,41,42",-953.511962890625,1
+S0193,OBJ012,Dark-colored wine glass,main,fragile,constricted-opening,smooth,turbid,normal,normal,stable,12,12,3,"37,38,39",-864.076416015625,1

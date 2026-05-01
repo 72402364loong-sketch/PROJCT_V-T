@@ -48,6 +48,7 @@ policy:
   hidden_dim: 256
   film_hidden_dim: 128
   head_type: legacy
+  base_source: learned
 
 losses:
   temperature_clip: 0.07

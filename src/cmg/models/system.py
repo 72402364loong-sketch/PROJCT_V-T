@@ -25,6 +25,11 @@ class CrossMediumSystem(nn.Module):
         self.visual_proj_dim = proj_dim
         visual_hidden_dim = int(visual_config.get('hidden_dim', visual_config.get('token_dim', proj_dim)))
         self.stop_gradient = bool(attribute_config.get('stop_gradient', True))
+        self.policy_base_source = str(policy_config.get('base_source', 'learned')).strip().lower()
+        if self.policy_base_source not in {'learned', 'reference_force'}:
+            raise RuntimeError(
+                f"Unsupported policy.base_source={self.policy_base_source!r}. Expected 'learned' or 'reference_force'."
+            )
 
         self.visual_encoder = VisualEncoder(visual_config)
         self.content_encoder = TactileContentEncoder(tactile_config, proj_dim=proj_dim)
@@ -52,6 +57,27 @@ class CrossMediumSystem(nn.Module):
             head_type=str(policy_config.get('head_type', 'legacy')),
             state_input_dim=policy_state_dim,
         )
+
+    @staticmethod
+    def _apply_reference_force_base_override(
+        policy_outputs: dict[str, torch.Tensor],
+        batch: dict[str, torch.Tensor],
+    ) -> dict[str, torch.Tensor]:
+        if 'reference_forces' not in batch:
+            return policy_outputs
+
+        learned_base = policy_outputs['force_base']
+        reference_force = batch['reference_forces'].reshape(-1).to(device=learned_base.device, dtype=learned_base.dtype)
+        finite_reference = torch.isfinite(reference_force)
+        if not finite_reference.any():
+            return policy_outputs
+
+        oracle_base = torch.where(finite_reference, reference_force, learned_base)
+        updated = dict(policy_outputs)
+        updated['force_base_learned'] = learned_base
+        updated['force_base'] = oracle_base
+        updated['force_pred'] = oracle_base + updated['interface_gate'] * updated['force_interface_delta']
+        return updated
 
     def _build_task_context(
         self,
@@ -88,8 +114,10 @@ class CrossMediumSystem(nn.Module):
 
         attribute_outputs, g_obj, task_context = self._build_task_context(h_v, z_content)
         policy_outputs = self.policy_head(task_context, flat_medium, state_context=state_context)
+        if self.policy_base_source == 'reference_force':
+            policy_outputs = self._apply_reference_force_base_override(policy_outputs, batch)
 
-        return {
+        outputs = {
             'h_v': h_v,
             'z_v': z_v,
             'z_t': z_t,
@@ -111,6 +139,9 @@ class CrossMediumSystem(nn.Module):
             'force_interface_delta': policy_outputs['force_interface_delta'],
             'interface_gate': policy_outputs['interface_gate'],
         }
+        if 'force_base_learned' in policy_outputs:
+            outputs['force_base_learned'] = policy_outputs['force_base_learned']
+        return outputs
 
     def forward_online_step(
         self,
@@ -125,7 +156,9 @@ class CrossMediumSystem(nn.Module):
         state_context = torch.cat([z_med_window, medium_step_features, p_medium], dim=-1)
         attribute_outputs, g_obj, task_context = self._build_task_context(h_v, z_content)
         policy_outputs = self.policy_head(task_context, p_medium, state_context=state_context)
-        return {
+        if self.policy_base_source == 'reference_force':
+            policy_outputs = self._apply_reference_force_base_override(policy_outputs, batch)
+        outputs = {
             'h_v': h_v,
             'z_v': z_v,
             'z_t': z_t,
@@ -147,3 +180,6 @@ class CrossMediumSystem(nn.Module):
             'force_interface_delta': policy_outputs['force_interface_delta'],
             'interface_gate': policy_outputs['interface_gate'],
         }
+        if 'force_base_learned' in policy_outputs:
+            outputs['force_base_learned'] = policy_outputs['force_base_learned']
+        return outputs

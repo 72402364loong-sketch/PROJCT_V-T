@@ -1,0 +1,80 @@
+name: stage36b_policy_fold1_reference_anchor_delta_balanced_from_stronger
+stage_index: 36
+checkpoint_prefix: stage36b_fold1_reference_anchor_delta_balanced_from_stronger
+best_checkpoint_name: stage36b_fold1_reference_anchor_delta_balanced_from_stronger_best_control_interface_mae.pt
+split: data/splits/split_unseen_fold1_v1.yaml
+tail_mode: all_valid
+freeze_modules:
+  - visual_encoder
+  - content_encoder
+  - evidence_encoder
+  - medium_head
+  - attribute_head.shared
+  - attribute_head.fragility
+  - attribute_head.geometry
+  - attribute_head.surface
+  - policy_head.base_state_input_layer
+  - policy_head.base_hidden_layer
+  - policy_head.base_output_layer
+loss_weights:
+  clip: 0.0
+  inv: 0.0
+  med: 0.0
+  attr: 0.0
+  pol: 1.0
+policy_loss:
+  type: explicit_reference_delta_weighted_smooth_l1
+  all_weight: 0.0
+  interface_weight: 0.0
+  stable_weight: 0.0
+  base_reference_weight: 0.0
+  base_stable_weight: 0.0
+  residual_interface_weight: 1.5
+  residual_stable_zero_weight: 0.75
+  residual_non_interface_weight: 0.1
+  gated_residual_interface_weight: 0.0
+  quiet_weight: 0.0
+  interface_positive_bias_weight: 0.0
+  interface_bias_margin: 0.0
+  beta: 1.0
+  delta_normalization_scale: 150.0
+selection_metric: control_interface_mae
+maximize_metric: false
+tie_breakers:
+  - metric: control_overall_mae
+    mode: min
+  - metric: epoch
+    mode: min
+data:
+  num_frames_per_window: 4
+  reference_force_window_count: 3
+  reference_force_statistic: median
+  expert_force_mode: local_reference_delta
+  expert_force_smoothing: zero_phase_ema
+  expert_force_baseline_mode: pre_contact_median
+  expert_force_baseline_window_sec: 0.5
+  expert_force_interface_margin_sec: 0.1
+model:
+  visual:
+    use_lora: true
+    max_windows_per_encode: 2
+  policy:
+    head_type: state_residual
+    base_source: reference_force
+train:
+  epochs: 12
+  batch_size: 2
+  num_workers: 0
+  pin_memory: false
+  persistent_workers: false
+  sampling_mode: interface_object_aware
+  interface_sampler_alpha: 1.75
+  interface_sampler_min_expert_windows: 1
+  samples_per_object: 1
+  val_every_n_epochs: 1
+  early_stopping_patience: 4
+  warmup_ratio: 0.05
+  learning_rate: 0.00002
+  base_learning_rate: 0.00002
+  lora_learning_rate: 0.00001
+  amp_enabled: false

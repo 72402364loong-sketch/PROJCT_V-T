@@ -1,0 +1,16 @@
+{
+  "stage_name": "stage36b_policy_obj012_tiny_light_joint_norm",
+  "subset": "train",
+  "only_stable": false,
+  "sample_count": 4,
+  "reference_sample_count": 4,
+  "group_by": [
+    "object_id",
+    "water_condition",
+    "lift_speed",
+    "placement_variant"
+  ],
+  "sample_path": "C:\\Users\\11657\\PROJCT_V-T\\.codex_tmp\\reference_force_smoke\\reference_force_samples.csv",
+  "group_path": "C:\\Users\\11657\\PROJCT_V-T\\.codex_tmp\\reference_force_smoke\\reference_force_group_summary.csv",
+  "object_path": "C:\\Users\\11657\\PROJCT_V-T\\.codex_tmp\\reference_force_smoke\\reference_force_object_summary.csv"
+}
