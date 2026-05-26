@@ -14,7 +14,7 @@ SRC = ROOT / 'src'
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from cmg.config import deep_update, load_yaml
+from cmg.config import deep_update, load_yaml, sync_tactile_model_config
 from cmg.data import (
     CrossMediumSequenceDataset,
     InterfaceAwareObjectBatchSampler,
@@ -114,6 +114,7 @@ def make_dataset(project_root: Path, split_path: Path, subset: str, data_config:
         clip_mean=data_config.get('clip_mean'),
         clip_std=data_config.get('clip_std'),
         tactile_points_per_window=int(data_config.get('tactile_points_per_window')) if data_config.get('tactile_points_per_window') is not None else None,
+        tactile_input_axes=data_config.get('tactile_input_axes'),
         standardize_tactile=bool(data_config.get('standardize_tactile', False)),
         min_valid_ratio_video=float(data_config.get('min_valid_ratio_video', 0.0)),
         min_valid_ratio_tactile=float(data_config.get('min_valid_ratio_tactile', 0.0)),
@@ -129,6 +130,13 @@ def make_dataset(project_root: Path, split_path: Path, subset: str, data_config:
         expert_force_baseline_mode=str(data_config.get('expert_force_baseline_mode', 'none')),
         expert_force_baseline_window_sec=float(data_config.get('expert_force_baseline_window_sec', 0.5)),
         expert_force_interface_margin_sec=float(data_config.get('expert_force_interface_margin_sec', 0.0)),
+        soft_gate_pre_sec=float(data_config.get('soft_gate_pre_sec', 0.0)),
+        soft_gate_post_sec=float(data_config.get('soft_gate_post_sec', 0.0)),
+        soft_gate_ramp=str(data_config.get('soft_gate_ramp', 'linear')),
+        interface_context_manifest=data_config.get('interface_context_manifest'),
+        attribute_taxonomy=str(data_config.get('attribute_taxonomy', 'legacy')),
+        physical_attribute_table=data_config.get('physical_attribute_table'),
+        physical_attribute_norm_stats_path=data_config.get('physical_attribute_norm_stats_path'),
     )
 
 
@@ -234,6 +242,7 @@ def main() -> None:
             current_data_config,
             current_train_config,
         )
+    model_config = sync_tactile_model_config(data_config, model_config)
 
     if data_config.get('visual_feature_cache_dir') and (
         float(stage_config.get('loss_weights', {}).get('clip', 0.0)) > 0.0

@@ -32,11 +32,14 @@ normal_sign_table:
   finger2: [1.0, 1.0, 1.0, 1.0]
 
 tactile_points_per_window: 26
+tactile_input_axes: [x, y, z]
 standardize_tactile: true
 min_valid_ratio_video: 0.8
 min_valid_ratio_tactile: 0.8
 write_sidecar_cache: true
 visual_feature_cache_dir: null
+physical_attribute_table: data/annotations/object_physical_attributes.csv
+physical_attribute_norm_stats_path: data/processed/stats/physical_attribute_norm_stats.json
 
 ema_alpha_acdc: 0.1
 ema_alpha_expert: 0.1

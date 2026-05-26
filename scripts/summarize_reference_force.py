@@ -47,6 +47,7 @@ def load_dataset_from_stage(
         clip_mean=data_config.get('clip_mean'),
         clip_std=data_config.get('clip_std'),
         tactile_points_per_window=int(data_config.get('tactile_points_per_window')) if data_config.get('tactile_points_per_window') is not None else None,
+        tactile_input_axes=data_config.get('tactile_input_axes'),
         standardize_tactile=bool(data_config.get('standardize_tactile', False)),
         min_valid_ratio_video=float(data_config.get('min_valid_ratio_video', 0.0)),
         min_valid_ratio_tactile=float(data_config.get('min_valid_ratio_tactile', 0.0)),

@@ -9,7 +9,18 @@ import pandas as pd
 import torch
 from torch.utils.data import Dataset
 
-from cmg.constants import FRAGILITY_TO_INDEX, GEOMETRY_TO_INDEX, PHASE_TO_INDEX, SURFACE_TO_INDEX
+from cmg.constants import (
+    FRAGILITY_TO_INDEX,
+    FRAGILITY_TO_V2,
+    FRAGILITY_V2_TO_INDEX,
+    GEOMETRY_TO_INDEX,
+    GEOMETRY_TO_SHAPE_PROFILE_V2,
+    PHASE_TO_INDEX,
+    SHAPE_PROFILE_V2_TO_INDEX,
+    SURFACE_TEXTURE_V2_TO_INDEX,
+    SURFACE_TO_INDEX,
+    SURFACE_TO_TEXTURE_V2,
+)
 
 from .splits import resolve_sample_ids
 from .tactile import (
@@ -18,12 +29,34 @@ from .tactile import (
     compute_expert_force_curve,
     load_tactile_array,
     normalize_normal_sign_table,
+    normalize_tactile_input_axes,
     resample_tactile_window,
+    select_tactile_channels,
     split_ac_dc,
     standardize_tactile_window,
+    tactile_channel_indices_for_axes,
 )
 from .video import load_frames_by_indices, sample_frame_indices
 from .visual_cache import load_sample_visual_feature_cache, resolve_sample_visual_feature_cache_path, resolve_visual_feature_cache_dir
+
+
+PHYSICAL_CONTINUOUS_ATTRIBUTES = ('dry_mass_g', 'water_capacity_g', 'capacity_ratio')
+PHYSICAL_CATEGORICAL_ATTRIBUTES = (
+    'load_transition_class',
+    'shape_profile_ctrl',
+    'material_safety_class',
+    'surface_texture',
+)
+PHYSICAL_REQUIRED_COLUMNS = (
+    'object_id',
+    'dry_mass_g',
+    'is_open_container',
+    'full_water_mass_g',
+    'water_capacity_g',
+    'capacity_valid_mask',
+    'capacity_ratio',
+    *PHYSICAL_CATEGORICAL_ATTRIBUTES,
+)
 
 
 class CrossMediumSequenceDataset(Dataset):
@@ -43,6 +76,7 @@ class CrossMediumSequenceDataset(Dataset):
         clip_mean: list[float] | None = None,
         clip_std: list[float] | None = None,
         tactile_points_per_window: int | None = None,
+        tactile_input_axes: Any = None,
         standardize_tactile: bool = False,
         min_valid_ratio_video: float = 0.0,
         min_valid_ratio_tactile: float = 0.0,
@@ -58,6 +92,13 @@ class CrossMediumSequenceDataset(Dataset):
         expert_force_baseline_mode: str = 'none',
         expert_force_baseline_window_sec: float = 0.5,
         expert_force_interface_margin_sec: float = 0.0,
+        soft_gate_pre_sec: float = 0.0,
+        soft_gate_post_sec: float = 0.0,
+        soft_gate_ramp: str = 'linear',
+        interface_context_manifest: str | Path | None = None,
+        attribute_taxonomy: str = 'legacy',
+        physical_attribute_table: str | Path | None = 'data/annotations/object_physical_attributes.csv',
+        physical_attribute_norm_stats_path: str | Path | None = 'data/processed/stats/physical_attribute_norm_stats.json',
     ) -> None:
         self.project_root = Path(project_root)
         self.split_path = Path(split_path)
@@ -72,6 +113,9 @@ class CrossMediumSequenceDataset(Dataset):
         self.clip_mean = None if clip_mean is None else torch.tensor(clip_mean, dtype=torch.float32).view(1, 3, 1, 1)
         self.clip_std = None if clip_std is None else torch.tensor(clip_std, dtype=torch.float32).view(1, 3, 1, 1)
         self.tactile_points_per_window = tactile_points_per_window
+        self.tactile_input_axes = normalize_tactile_input_axes(tactile_input_axes)
+        self.tactile_channel_indices = tactile_channel_indices_for_axes(self.tactile_input_axes)
+        self.tactile_input_dim = int(self.tactile_channel_indices.shape[0])
         self.standardize_tactile = standardize_tactile
         self.min_valid_ratio_video = float(min_valid_ratio_video)
         self.min_valid_ratio_tactile = float(min_valid_ratio_tactile)
@@ -87,6 +131,23 @@ class CrossMediumSequenceDataset(Dataset):
         self.expert_force_baseline_mode = str(expert_force_baseline_mode or 'none').strip().lower()
         self.expert_force_baseline_window_sec = float(expert_force_baseline_window_sec)
         self.expert_force_interface_margin_sec = float(expert_force_interface_margin_sec)
+        self.soft_gate_pre_sec = max(0.0, float(soft_gate_pre_sec))
+        self.soft_gate_post_sec = max(0.0, float(soft_gate_post_sec))
+        self.soft_gate_ramp = str(soft_gate_ramp or 'linear').strip().lower()
+        self.interface_context_manifest = self._resolve_optional_project_path(interface_context_manifest)
+        self.attribute_taxonomy = str(attribute_taxonomy or 'legacy').strip().lower()
+        if self.attribute_taxonomy not in {'legacy', 'coarse_v2'}:
+            raise RuntimeError(
+                f"Unsupported attribute_taxonomy={self.attribute_taxonomy!r}. Expected 'legacy' or 'coarse_v2'."
+            )
+        self.physical_attribute_table_path = self._resolve_optional_project_path(physical_attribute_table)
+        self.physical_attribute_norm_stats_path = self._resolve_optional_project_path(physical_attribute_norm_stats_path)
+        self.physical_attributes = self._load_physical_attribute_table()
+        self.physical_attribute_by_object = {
+            str(row['object_id']): row
+            for row in self.physical_attributes.to_dict('records')
+        }
+        self.physical_class_to_index = self._build_physical_class_index()
 
         samples_path = self.project_root / 'data' / 'processed' / 'samples.csv'
         windows_path = self.project_root / 'data' / 'processed' / 'windows.csv'
@@ -115,11 +176,14 @@ class CrossMediumSequenceDataset(Dataset):
 
         valid_sample_ids = set(self.windows['sample_id'].unique().tolist())
         self.samples = self.samples.loc[self.samples['sample_id'].isin(valid_sample_ids)].copy()
+        self._validate_physical_attribute_coverage()
+        self.physical_attribute_stats = self._load_or_compute_physical_attribute_stats()
         self.sample_records = self.samples.sort_values('sample_id').to_dict('records')
         self.windows_by_sample = {
             sample_id: group.sort_values('window_start').to_dict('records')
             for sample_id, group in self.windows.groupby('sample_id')
         }
+        self.interface_context_by_sample = self._load_interface_context_manifest()
         self._annotate_sample_records_with_interface_stats()
         self.object_index = {
             object_id: index
@@ -157,6 +221,11 @@ class CrossMediumSequenceDataset(Dataset):
             sample['interface_window_count'] = int(interface_window_count)
             sample['interface_expert_count'] = int(interface_window_count if has_expert_supervision else 0)
             sample['interface_window_ratio'] = float(interface_window_count / max(1, total_windows))
+            context_meta = self.interface_context_by_sample.get(sample_id, {})
+            sample['has_interface_context'] = int(bool(context_meta.get('has_context', False)))
+            sample['stable_context_count'] = int(context_meta.get('stable_context_count', 0))
+            sample['selected_context_count'] = int(context_meta.get('selected_context_count', 0))
+            sample['used_fallback_context'] = int(bool(context_meta.get('used_fallback_context', False)))
 
     def __len__(self) -> int:
         return len(self.sample_records)
@@ -169,10 +238,214 @@ class CrossMediumSequenceDataset(Dataset):
             return self.project_root / relative
         return self.project_root / 'data' / relative
 
+    def _resolve_optional_project_path(self, raw_path: str | Path | None) -> Path | None:
+        if raw_path is None:
+            return None
+        path = Path(raw_path)
+        if path.is_absolute():
+            return path
+        return self.project_root / path
+
+    def _load_physical_attribute_table(self) -> pd.DataFrame:
+        if self.physical_attribute_table_path is None:
+            raise RuntimeError('physical_attribute_table must be provided for physical attribute supervision.')
+        if not self.physical_attribute_table_path.exists():
+            raise FileNotFoundError(f'Physical attribute table not found: {self.physical_attribute_table_path}')
+
+        table = pd.read_csv(self.physical_attribute_table_path)
+        missing = [column for column in PHYSICAL_REQUIRED_COLUMNS if column not in table.columns]
+        if missing:
+            raise RuntimeError(f'Physical attribute table is missing required columns: {missing}')
+        if table['object_id'].duplicated().any():
+            duplicated = sorted(table.loc[table['object_id'].duplicated(), 'object_id'].astype(str).unique().tolist())
+            raise RuntimeError(f'Physical attribute table contains duplicated object_id values: {duplicated}')
+
+        table = table.copy()
+        table['object_id'] = table['object_id'].astype(str)
+        for column in ('dry_mass_g', 'full_water_mass_g', 'water_capacity_g', 'capacity_ratio'):
+            table[column] = pd.to_numeric(table[column], errors='coerce')
+        table['is_open_container'] = pd.to_numeric(table['is_open_container'], errors='coerce').fillna(0).astype(int)
+        table['capacity_valid_mask'] = pd.to_numeric(table['capacity_valid_mask'], errors='coerce').fillna(0).astype(int)
+        for column in PHYSICAL_CATEGORICAL_ATTRIBUTES:
+            table[column] = table[column].fillna('unknown').astype(str).str.strip()
+        return table
+
+    def _build_physical_class_index(self) -> dict[str, dict[str, int]]:
+        return {
+            column: {
+                value: index
+                for index, value in enumerate(sorted(self.physical_attributes[column].dropna().astype(str).unique().tolist()))
+            }
+            for column in PHYSICAL_CATEGORICAL_ATTRIBUTES
+        }
+
+    def _validate_physical_attribute_coverage(self) -> None:
+        object_ids = set(self.samples['object_id'].astype(str).unique().tolist())
+        missing = sorted(object_ids - set(self.physical_attribute_by_object))
+        if missing:
+            raise RuntimeError(
+                'Physical attribute table does not cover all objects in this dataset subset: '
+                + ', '.join(missing)
+            )
+
+    def _physical_stats_cache_payload_is_compatible(self, payload: dict[str, Any]) -> bool:
+        if payload.get('version') != 1:
+            return False
+        if payload.get('split_path') != str(self.split_path):
+            return False
+        if payload.get('normalization_subset') != str(self.normalization_subset):
+            return False
+        continuous = payload.get('continuous')
+        return isinstance(continuous, dict) and all(attribute in continuous for attribute in PHYSICAL_CONTINUOUS_ATTRIBUTES)
+
+    def _load_or_compute_physical_attribute_stats(self) -> dict[str, Any]:
+        if self.physical_attribute_norm_stats_path is None:
+            return self._compute_physical_attribute_stats()
+        if self.physical_attribute_norm_stats_path.exists():
+            with self.physical_attribute_norm_stats_path.open('r', encoding='utf-8') as handle:
+                payload = json.load(handle)
+            if self._physical_stats_cache_payload_is_compatible(payload):
+                return payload
+
+        payload = self._compute_physical_attribute_stats()
+        self.physical_attribute_norm_stats_path.parent.mkdir(parents=True, exist_ok=True)
+        with self.physical_attribute_norm_stats_path.open('w', encoding='utf-8') as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+        return payload
+
+    def _compute_physical_attribute_stats(self) -> dict[str, Any]:
+        normalization_sample_ids = set(resolve_sample_ids(self.all_samples, self.split_path, subset=self.normalization_subset))
+        samples = self.all_samples.loc[self.all_samples['sample_id'].isin(normalization_sample_ids)].copy()
+        if self.normalization_trial_results is not None:
+            trial_mask = samples['trial_result'].astype(str).str.strip().str.lower().isin(self.normalization_trial_results)
+            samples = samples.loc[trial_mask].copy()
+        object_ids = sorted(samples['object_id'].astype(str).unique().tolist())
+        table = self.physical_attributes.loc[self.physical_attributes['object_id'].isin(object_ids)].copy()
+
+        continuous: dict[str, dict[str, Any]] = {}
+        for attribute in PHYSICAL_CONTINUOUS_ATTRIBUTES:
+            values = pd.to_numeric(table[attribute], errors='coerce')
+            valid = values.notna()
+            if attribute in {'water_capacity_g', 'capacity_ratio'}:
+                valid &= table['capacity_valid_mask'].astype(int) == 1
+            selected = values.loc[valid].astype(float)
+            if selected.empty:
+                mean = 0.0
+                std = 1.0
+            else:
+                mean = float(selected.mean())
+                std = float(selected.std(ddof=0))
+                if not np.isfinite(std) or std < 1e-6:
+                    std = 1.0
+            continuous[attribute] = {
+                'mean': mean,
+                'std': std,
+                'count': int(selected.shape[0]),
+            }
+
+        return {
+            'version': 1,
+            'split_path': str(self.split_path),
+            'normalization_subset': str(self.normalization_subset),
+            'normalization_trial_results': None if self.normalization_trial_results is None else sorted(self.normalization_trial_results),
+            'object_ids': object_ids,
+            'continuous': continuous,
+        }
+
+    def _normalize_physical_value(self, attribute: str, value: float) -> float:
+        stats = self.physical_attribute_stats['continuous'][attribute]
+        if not np.isfinite(value):
+            return 0.0
+        return float((float(value) - float(stats['mean'])) / max(float(stats['std']), 1e-6))
+
+    def _physical_attributes_for_sample(self, sample: dict[str, Any]) -> dict[str, Any]:
+        object_id = str(sample['object_id'])
+        row = self.physical_attribute_by_object[object_id]
+        dry_mass = float(row['dry_mass_g'])
+        is_open_container = int(row['is_open_container'])
+        capacity_valid = int(row['capacity_valid_mask'])
+        full_water_mass = float(row['full_water_mass_g']) if np.isfinite(float(row['full_water_mass_g'])) else float('nan')
+        water_capacity = float(row['water_capacity_g']) if capacity_valid else 0.0
+        capacity_ratio = float(row['capacity_ratio']) if capacity_valid else 0.0
+
+        physical = {
+            'dry_mass_g': dry_mass,
+            'dry_mass_g_normalized': self._normalize_physical_value('dry_mass_g', dry_mass),
+            'is_open_container': is_open_container,
+            'full_water_mass_g': full_water_mass,
+            'water_capacity_g': water_capacity,
+            'water_capacity_g_normalized': self._normalize_physical_value('water_capacity_g', water_capacity) if capacity_valid else 0.0,
+            'capacity_valid_mask': capacity_valid,
+            'capacity_ratio': capacity_ratio,
+            'capacity_ratio_normalized': self._normalize_physical_value('capacity_ratio', capacity_ratio) if capacity_valid else 0.0,
+        }
+        for column in PHYSICAL_CATEGORICAL_ATTRIBUTES:
+            value = str(row[column])
+            physical[column] = value
+            physical[f'{column}_label'] = int(self.physical_class_to_index[column][value])
+        return physical
+
+    def _attribute_labels_for_sample(self, sample: dict[str, Any]) -> tuple[int, int, int]:
+        fragility = str(sample['fragility'])
+        geometry = str(sample['geometry'])
+        surface = str(sample['surface'])
+        if self.attribute_taxonomy == 'coarse_v2':
+            fragility_v2 = FRAGILITY_TO_V2[fragility]
+            shape_profile_v2 = GEOMETRY_TO_SHAPE_PROFILE_V2[geometry]
+            surface_texture_v2 = SURFACE_TO_TEXTURE_V2[surface]
+            return (
+                FRAGILITY_V2_TO_INDEX[fragility_v2],
+                SHAPE_PROFILE_V2_TO_INDEX[shape_profile_v2],
+                SURFACE_TEXTURE_V2_TO_INDEX[surface_texture_v2],
+            )
+        return (
+            FRAGILITY_TO_INDEX[fragility],
+            GEOMETRY_TO_INDEX[geometry],
+            SURFACE_TO_INDEX[surface],
+        )
+
+    @staticmethod
+    def _parse_json_indices(value: Any) -> list[int]:
+        if value is None:
+            return []
+        if isinstance(value, float) and np.isnan(value):
+            return []
+        if isinstance(value, str):
+            value = value.strip()
+            if not value:
+                return []
+            parsed = json.loads(value)
+        else:
+            parsed = value
+        return [int(item) for item in parsed]
+
+    def _load_interface_context_manifest(self) -> dict[str, dict[str, Any]]:
+        if self.interface_context_manifest is None or not self.interface_context_manifest.exists():
+            return {}
+        manifest = pd.read_csv(self.interface_context_manifest)
+        if 'subset' in manifest.columns:
+            manifest = manifest.loc[manifest['subset'].astype(str) == self.subset].copy()
+
+        records: dict[str, dict[str, Any]] = {}
+        for row in manifest.to_dict('records'):
+            sample_id = str(row['sample_id'])
+            records[sample_id] = {
+                'context_indices': self._parse_json_indices(row.get('selected_context_window_indices_json')),
+                'stable_context_indices': self._parse_json_indices(row.get('stable_context_window_indices_json')),
+                'interface_indices': self._parse_json_indices(row.get('interface_window_indices_json')),
+                'has_context': bool(int(row.get('has_context', 0))),
+                'used_fallback_context': bool(int(row.get('used_fallback_context', 0))),
+                'stable_context_count': int(row.get('stable_context_count', 0) or 0),
+                'selected_context_count': int(row.get('selected_context_count', 0) or 0),
+            }
+        return records
+
     def _stats_cache_path(self) -> Path:
         cache_root = self.project_root / 'data' / 'processed' / 'cache'
         cache_root.mkdir(parents=True, exist_ok=True)
         suffix_parts = [self.split_path.stem, self.normalization_subset, f"alpha_{str(self.acdc_alpha).replace('.', 'p')}"]
+        if self.tactile_input_axes != ('x', 'y', 'z'):
+            suffix_parts.append('axes_' + ''.join(self.tactile_input_axes))
         if self.normalization_trial_results:
             suffix_parts.append('trials_' + '_'.join(sorted(self.normalization_trial_results)))
         return cache_root / ('tactile_stats_' + '__'.join(suffix_parts) + '.json')
@@ -189,15 +462,17 @@ class CrossMediumSequenceDataset(Dataset):
             mask = stat_samples['trial_result'].astype(str).str.strip().str.lower().isin(self.normalization_trial_results)
             stat_samples = stat_samples.loc[mask].copy()
 
-        high_sum = np.zeros(36, dtype=np.float64)
-        high_sq_sum = np.zeros(36, dtype=np.float64)
-        low_sum = np.zeros(36, dtype=np.float64)
-        low_sq_sum = np.zeros(36, dtype=np.float64)
+        high_sum = np.zeros(self.tactile_input_dim, dtype=np.float64)
+        high_sq_sum = np.zeros(self.tactile_input_dim, dtype=np.float64)
+        low_sum = np.zeros(self.tactile_input_dim, dtype=np.float64)
+        low_sq_sum = np.zeros(self.tactile_input_dim, dtype=np.float64)
         count = 0
         for sample in stat_samples.to_dict('records'):
             tactile_path = self._resolve_data_path(sample['tactile_path'])
             tactile_array = load_tactile_array(tactile_path)
             tactile_high, tactile_low = split_ac_dc(tactile_array, alpha=self.acdc_alpha)
+            tactile_high = select_tactile_channels(tactile_high, self.tactile_channel_indices)
+            tactile_low = select_tactile_channels(tactile_low, self.tactile_channel_indices)
             high_sum += tactile_high.sum(axis=0)
             high_sq_sum += np.square(tactile_high, dtype=np.float64).sum(axis=0)
             low_sum += tactile_low.sum(axis=0)
@@ -206,10 +481,10 @@ class CrossMediumSequenceDataset(Dataset):
 
         if count == 0:
             stats = {
-                'high_mean': [0.0] * 36,
-                'high_std': [1.0] * 36,
-                'low_mean': [0.0] * 36,
-                'low_std': [1.0] * 36,
+                'high_mean': [0.0] * self.tactile_input_dim,
+                'high_std': [1.0] * self.tactile_input_dim,
+                'low_mean': [0.0] * self.tactile_input_dim,
+                'low_std': [1.0] * self.tactile_input_dim,
             }
         else:
             high_mean = high_sum / count
@@ -324,6 +599,42 @@ class CrossMediumSequenceDataset(Dataset):
             return np.zeros(0, dtype=bool)
         return (window_times >= float(interval_start)) & (window_times < float(interval_end))
 
+    def _smooth_ramp_value(self, progress: float) -> float:
+        progress = min(max(float(progress), 0.0), 1.0)
+        if self.soft_gate_ramp in {'cosine', 'cos'}:
+            return float(0.5 - 0.5 * np.cos(np.pi * progress))
+        return progress
+
+    def _compute_soft_gate_target(self, window: dict[str, Any], sample: dict[str, Any]) -> float:
+        t_if_enter = self._parse_optional_float(sample.get('t_if_enter'))
+        t_if_exit = self._parse_optional_float(sample.get('t_if_exit'))
+        if t_if_enter is None or t_if_exit is None or t_if_exit <= t_if_enter:
+            return 1.0 if str(window.get('phase_label')) == 'Interface' else 0.0
+
+        center = self._parse_optional_float(window.get('window_center'))
+        if center is None:
+            start = self._parse_optional_float(window.get('window_start'))
+            end = self._parse_optional_float(window.get('window_end'))
+            if start is None or end is None:
+                return 1.0 if str(window.get('phase_label')) == 'Interface' else 0.0
+            center = 0.5 * (start + end)
+
+        rise_start = float(t_if_enter) - self.soft_gate_pre_sec
+        decay_end = float(t_if_exit) + self.soft_gate_post_sec
+        if center < rise_start:
+            return 0.0
+        if center < float(t_if_enter):
+            if self.soft_gate_pre_sec <= 0.0:
+                return 1.0
+            return self._smooth_ramp_value((center - rise_start) / self.soft_gate_pre_sec)
+        if center <= float(t_if_exit):
+            return 1.0
+        if center <= decay_end:
+            if self.soft_gate_post_sec <= 0.0:
+                return 0.0
+            return 1.0 - self._smooth_ramp_value((center - float(t_if_exit)) / self.soft_gate_post_sec)
+        return 0.0
+
     def __getitem__(self, index: int) -> dict[str, Any]:
         sample = self.sample_records[index]
         sample_id = str(sample['sample_id'])
@@ -331,6 +642,8 @@ class CrossMediumSequenceDataset(Dataset):
         tactile_path = self._resolve_data_path(sample['tactile_path'])
         tactile_array = load_tactile_array(tactile_path)
         tactile_high, tactile_low = split_ac_dc(tactile_array, alpha=self.acdc_alpha)
+        tactile_high = select_tactile_channels(tactile_high, self.tactile_channel_indices)
+        tactile_low = select_tactile_channels(tactile_low, self.tactile_channel_indices)
 
         expert_curve = compute_expert_force_curve(
             tactile_array=tactile_array,
@@ -404,6 +717,15 @@ class CrossMediumSequenceDataset(Dataset):
         reference_supervision_masks: list[int] = []
         delta_supervision_masks: list[int] = []
         quiet_supervision_masks: list[int] = []
+        soft_gate_targets: list[float] = []
+        context_window_mask: list[int] = []
+
+        context_meta = self.interface_context_by_sample.get(sample_id, {})
+        selected_context_indices = set(int(index) for index in context_meta.get('context_indices', []))
+        has_interface_context = bool(context_meta.get('has_context', False))
+        context_source_type = 'none'
+        if has_interface_context:
+            context_source_type = 'fallback' if bool(context_meta.get('used_fallback_context', False)) else 'stable'
 
         cache_path = None
         if self.visual_feature_cache_dir is not None:
@@ -480,6 +802,7 @@ class CrossMediumSequenceDataset(Dataset):
             reference_supervision_flag = 0
             delta_supervision_flag = 0
             quiet_supervision_flag = 0
+            soft_gate_target = self._compute_soft_gate_target(window, sample)
 
             if expert_curve is not None:
                 expert_force = self._compute_window_force_value(expert_curve, start_idx, end_idx)
@@ -541,6 +864,11 @@ class CrossMediumSequenceDataset(Dataset):
             reference_supervision_masks.append(reference_supervision_flag)
             delta_supervision_masks.append(delta_supervision_flag)
             quiet_supervision_masks.append(quiet_supervision_flag)
+            soft_gate_targets.append(soft_gate_target)
+            context_window_mask.append(int(window_index in selected_context_indices))
+
+        fragility_label, geometry_label, surface_label = self._attribute_labels_for_sample(sample)
+        physical_attributes = self._physical_attributes_for_sample(sample)
 
         return {
             'sample_id': sample_id,
@@ -567,15 +895,21 @@ class CrossMediumSequenceDataset(Dataset):
             'reference_supervision_masks': reference_supervision_masks,
             'delta_supervision_masks': delta_supervision_masks,
             'quiet_supervision_masks': quiet_supervision_masks,
-            'fragility_label': FRAGILITY_TO_INDEX[str(sample['fragility'])],
-            'geometry_label': GEOMETRY_TO_INDEX[str(sample['geometry'])],
-            'surface_label': SURFACE_TO_INDEX[str(sample['surface'])],
+            'soft_gate_targets': soft_gate_targets,
+            'context_window_mask': context_window_mask,
+            'has_interface_context': int(has_interface_context),
+            'context_source_type': context_source_type,
+            'fragility_label': fragility_label,
+            'geometry_label': geometry_label,
+            'surface_label': surface_label,
+            **physical_attributes,
         }
 
 def sequence_collate_fn(batch: list[dict[str, Any]]) -> dict[str, Any]:
     batch_size = len(batch)
     max_windows = max(len(item['tactile_high_windows']) for item in batch)
     max_tactile = max(max(item['tactile_high_windows'][window_index].shape[0] for window_index in range(len(item['tactile_high_windows']))) for item in batch)
+    tactile_dim = int(batch[0]['tactile_high_windows'][0].shape[-1])
     use_visual_features = batch[0].get('visual_feature_windows') is not None
 
     visual_features = None
@@ -592,8 +926,8 @@ def sequence_collate_fn(batch: list[dict[str, Any]]) -> dict[str, Any]:
         video = torch.zeros(batch_size, max_windows, num_frames, channels, height, width, dtype=torch.float32)
         frame_mask = torch.zeros(batch_size, max_windows, num_frames, dtype=torch.bool)
 
-    tactile_high = torch.zeros(batch_size, max_windows, max_tactile, 36, dtype=torch.float32)
-    tactile_low = torch.zeros(batch_size, max_windows, max_tactile, 36, dtype=torch.float32)
+    tactile_high = torch.zeros(batch_size, max_windows, max_tactile, tactile_dim, dtype=torch.float32)
+    tactile_low = torch.zeros(batch_size, max_windows, max_tactile, tactile_dim, dtype=torch.float32)
     tactile_mask = torch.zeros(batch_size, max_windows, max_tactile, dtype=torch.bool)
     window_mask = torch.zeros(batch_size, max_windows, dtype=torch.bool)
     phase_labels = torch.full((batch_size, max_windows), -100, dtype=torch.long)
@@ -609,23 +943,63 @@ def sequence_collate_fn(batch: list[dict[str, Any]]) -> dict[str, Any]:
     reference_supervision_masks = torch.zeros(batch_size, max_windows, dtype=torch.bool)
     delta_supervision_masks = torch.zeros(batch_size, max_windows, dtype=torch.bool)
     quiet_supervision_masks = torch.zeros(batch_size, max_windows, dtype=torch.bool)
+    soft_gate_targets = torch.zeros(batch_size, max_windows, dtype=torch.float32)
+    context_window_mask = torch.zeros(batch_size, max_windows, dtype=torch.bool)
+    has_interface_context = torch.zeros(batch_size, dtype=torch.bool)
     object_index = torch.zeros(batch_size, dtype=torch.long)
     sample_index = torch.zeros(batch_size, dtype=torch.long)
     fragility_label = torch.zeros(batch_size, dtype=torch.long)
     geometry_label = torch.zeros(batch_size, dtype=torch.long)
     surface_label = torch.zeros(batch_size, dtype=torch.long)
+    dry_mass_g = torch.zeros(batch_size, dtype=torch.float32)
+    dry_mass_g_normalized = torch.zeros(batch_size, dtype=torch.float32)
+    is_open_container = torch.zeros(batch_size, dtype=torch.long)
+    full_water_mass_g = torch.full((batch_size,), float('nan'), dtype=torch.float32)
+    water_capacity_g = torch.zeros(batch_size, dtype=torch.float32)
+    water_capacity_g_normalized = torch.zeros(batch_size, dtype=torch.float32)
+    capacity_valid_mask = torch.zeros(batch_size, dtype=torch.bool)
+    capacity_ratio = torch.zeros(batch_size, dtype=torch.float32)
+    capacity_ratio_normalized = torch.zeros(batch_size, dtype=torch.float32)
+    load_transition_class_label = torch.zeros(batch_size, dtype=torch.long)
+    shape_profile_ctrl_label = torch.zeros(batch_size, dtype=torch.long)
+    material_safety_class_label = torch.zeros(batch_size, dtype=torch.long)
+    surface_texture_label = torch.zeros(batch_size, dtype=torch.long)
     window_lengths = torch.zeros(batch_size, dtype=torch.long)
     sample_ids: list[str] = []
     object_ids: list[str] = []
+    context_source_types: list[str] = []
+    load_transition_classes: list[str] = []
+    shape_profile_ctrls: list[str] = []
+    material_safety_classes: list[str] = []
+    surface_textures: list[str] = []
 
     for batch_index, item in enumerate(batch):
         sample_ids.append(item['sample_id'])
         object_ids.append(item['object_id'])
+        context_source_types.append(str(item.get('context_source_type', 'none')))
         object_index[batch_index] = int(item['object_index'])
         sample_index[batch_index] = int(item['sample_index'])
         fragility_label[batch_index] = int(item['fragility_label'])
         geometry_label[batch_index] = int(item['geometry_label'])
         surface_label[batch_index] = int(item['surface_label'])
+        dry_mass_g[batch_index] = float(item['dry_mass_g'])
+        dry_mass_g_normalized[batch_index] = float(item['dry_mass_g_normalized'])
+        is_open_container[batch_index] = int(item['is_open_container'])
+        full_water_mass_g[batch_index] = float(item['full_water_mass_g'])
+        water_capacity_g[batch_index] = float(item['water_capacity_g'])
+        water_capacity_g_normalized[batch_index] = float(item['water_capacity_g_normalized'])
+        capacity_valid_mask[batch_index] = bool(item['capacity_valid_mask'])
+        capacity_ratio[batch_index] = float(item['capacity_ratio'])
+        capacity_ratio_normalized[batch_index] = float(item['capacity_ratio_normalized'])
+        load_transition_class_label[batch_index] = int(item['load_transition_class_label'])
+        shape_profile_ctrl_label[batch_index] = int(item['shape_profile_ctrl_label'])
+        material_safety_class_label[batch_index] = int(item['material_safety_class_label'])
+        surface_texture_label[batch_index] = int(item['surface_texture_label'])
+        load_transition_classes.append(str(item['load_transition_class']))
+        shape_profile_ctrls.append(str(item['shape_profile_ctrl']))
+        material_safety_classes.append(str(item['material_safety_class']))
+        surface_textures.append(str(item['surface_texture']))
+        has_interface_context[batch_index] = bool(item.get('has_interface_context', 0))
         num_windows_item = len(item['tactile_high_windows'])
         window_lengths[batch_index] = num_windows_item
         for window_index in range(num_windows_item):
@@ -638,6 +1012,11 @@ def sequence_collate_fn(batch: list[dict[str, Any]]) -> dict[str, Any]:
                 frame_mask[batch_index, window_index, :frames_valid.shape[0]] = frames_valid
             high = item['tactile_high_windows'][window_index]
             low = item['tactile_low_windows'][window_index]
+            if high.shape[-1] != tactile_dim or low.shape[-1] != tactile_dim:
+                raise RuntimeError(
+                    f'Inconsistent tactile feature dimensions in batch: expected {tactile_dim}, '
+                    f'got high={tuple(high.shape)} low={tuple(low.shape)}.'
+                )
             tactile_valid = item['tactile_window_masks'][window_index]
             tactile_high[batch_index, window_index, :high.shape[0]] = high
             tactile_low[batch_index, window_index, :low.shape[0]] = low
@@ -656,10 +1035,13 @@ def sequence_collate_fn(batch: list[dict[str, Any]]) -> dict[str, Any]:
             reference_supervision_masks[batch_index, window_index] = bool(item['reference_supervision_masks'][window_index])
             delta_supervision_masks[batch_index, window_index] = bool(item['delta_supervision_masks'][window_index])
             quiet_supervision_masks[batch_index, window_index] = bool(item['quiet_supervision_masks'][window_index])
+            soft_gate_targets[batch_index, window_index] = float(item.get('soft_gate_targets', [0.0] * num_windows_item)[window_index])
+            context_window_mask[batch_index, window_index] = bool(item.get('context_window_mask', [0] * num_windows_item)[window_index])
 
     return {
         'sample_ids': sample_ids,
         'object_ids': object_ids,
+        'context_source_types': context_source_types,
         'object_index': object_index,
         'sample_index': sample_index,
         'visual_features': visual_features,
@@ -683,7 +1065,27 @@ def sequence_collate_fn(batch: list[dict[str, Any]]) -> dict[str, Any]:
         'reference_supervision_masks': reference_supervision_masks,
         'delta_supervision_masks': delta_supervision_masks,
         'quiet_supervision_masks': quiet_supervision_masks,
+        'soft_gate_targets': soft_gate_targets,
+        'context_window_mask': context_window_mask,
+        'has_interface_context': has_interface_context,
         'fragility_label': fragility_label,
         'geometry_label': geometry_label,
         'surface_label': surface_label,
+        'dry_mass_g': dry_mass_g,
+        'dry_mass_g_normalized': dry_mass_g_normalized,
+        'is_open_container': is_open_container,
+        'full_water_mass_g': full_water_mass_g,
+        'water_capacity_g': water_capacity_g,
+        'water_capacity_g_normalized': water_capacity_g_normalized,
+        'capacity_valid_mask': capacity_valid_mask,
+        'capacity_ratio': capacity_ratio,
+        'capacity_ratio_normalized': capacity_ratio_normalized,
+        'load_transition_class_label': load_transition_class_label,
+        'shape_profile_ctrl_label': shape_profile_ctrl_label,
+        'material_safety_class_label': material_safety_class_label,
+        'surface_texture_label': surface_texture_label,
+        'load_transition_classes': load_transition_classes,
+        'shape_profile_ctrls': shape_profile_ctrls,
+        'material_safety_classes': material_safety_classes,
+        'surface_textures': surface_textures,
     }

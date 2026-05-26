@@ -518,14 +518,93 @@ class MediumBeliefHead(nn.Module):
         return logits, probabilities, next_hidden, current_features
 
 
-class MultiAttributeHead(nn.Module):
-    def __init__(self, input_dim: int, hidden_dim: int, object_feature_dim: int) -> None:
+class PhaseAwareGateStabilizer(nn.Module):
+    def __init__(
+        self,
+        *,
+        on_threshold: float = 0.25,
+        off_threshold: float = 0.10,
+        min_on_windows: int = 1,
+        min_off_windows: int = 1,
+        output_mode: str = 'masked_raw',
+    ) -> None:
         super().__init__()
+        self.on_threshold = float(on_threshold)
+        self.off_threshold = float(off_threshold)
+        self.min_on_windows = max(1, int(min_on_windows))
+        self.min_off_windows = max(1, int(min_off_windows))
+        self.output_mode = str(output_mode or 'masked_raw').strip().lower()
+
+    def _stabilize_one(self, raw_gate: torch.Tensor, valid_mask: torch.Tensor) -> torch.Tensor:
+        length = int(valid_mask.sum().item())
+        if length <= 0:
+            return torch.zeros_like(raw_gate)
+
+        raw_values = raw_gate[:length]
+        states: list[bool] = []
+        active = False
+        pending_on = 0
+        pending_off = 0
+        for value in raw_values.detach().cpu().tolist():
+            if active:
+                if value <= self.off_threshold:
+                    pending_off += 1
+                    if pending_off >= self.min_off_windows:
+                        active = False
+                        pending_on = 0
+                else:
+                    pending_off = 0
+            else:
+                if value >= self.on_threshold:
+                    pending_on += 1
+                    if pending_on >= self.min_on_windows:
+                        active = True
+                        pending_off = 0
+                else:
+                    pending_on = 0
+            states.append(active)
+
+        active_mask = torch.tensor(states, device=raw_gate.device, dtype=raw_gate.dtype)
+        stabilized = torch.zeros_like(raw_gate)
+        if self.output_mode == 'binary':
+            stabilized[:length] = active_mask
+        else:
+            stabilized[:length] = raw_values * active_mask
+        return stabilized
+
+    def forward(self, raw_gate: torch.Tensor, valid_mask: torch.Tensor) -> torch.Tensor:
+        if raw_gate.ndim != 2 or valid_mask.ndim != 2:
+            raise RuntimeError(f'Gate stabilizer expects [B, W] tensors, got {tuple(raw_gate.shape)} and {tuple(valid_mask.shape)}.')
+        stabilized = [
+            self._stabilize_one(raw_gate[index], valid_mask[index].bool())
+            for index in range(raw_gate.shape[0])
+        ]
+        return torch.stack(stabilized, dim=0)
+
+
+class MultiAttributeHead(nn.Module):
+    def __init__(
+        self,
+        input_dim: int,
+        hidden_dim: int,
+        object_feature_dim: int,
+        *,
+        fragility_classes: int = 3,
+        geometry_classes: int = 4,
+        surface_classes: int = 2,
+    ) -> None:
+        super().__init__()
+        self.fragility_classes = int(fragility_classes)
+        self.geometry_classes = int(geometry_classes)
+        self.surface_classes = int(surface_classes)
         self.shared = MLP(input_dim, hidden_dim, hidden_dim)
-        self.fragility = nn.Linear(hidden_dim, 3)
-        self.geometry = nn.Linear(hidden_dim, 4)
-        self.surface = nn.Linear(hidden_dim, 2)
-        self.object_projection = nn.Linear(3 + 4 + 2 + 3, object_feature_dim)
+        self.fragility = nn.Linear(hidden_dim, self.fragility_classes)
+        self.geometry = nn.Linear(hidden_dim, self.geometry_classes)
+        self.surface = nn.Linear(hidden_dim, self.surface_classes)
+        self.object_projection = nn.Linear(
+            self.fragility_classes + self.geometry_classes + self.surface_classes + 3,
+            object_feature_dim,
+        )
 
     def forward(self, features: torch.Tensor) -> dict[str, torch.Tensor]:
         shared = self.shared(features)
@@ -569,10 +648,14 @@ class PolicyHead(nn.Module):
         *,
         head_type: str = 'legacy',
         state_input_dim: int | None = None,
+        context_input_dim: int = 0,
+        context_scale_init: float = 0.0,
     ) -> None:
         super().__init__()
         self.head_type = str(head_type)
         self.state_input_dim = input_dim if state_input_dim is None else int(state_input_dim)
+        self.context_input_dim = int(context_input_dim)
+        self.context_scale_init = float(context_scale_init)
         self.film = nn.Sequential(
             nn.Linear(3, film_hidden_dim),
             nn.GELU(),
@@ -589,6 +672,12 @@ class PolicyHead(nn.Module):
             self.base_output_layer = nn.Linear(hidden_dim, 1)
             self.residual_task_input_layer = nn.Linear(input_dim, hidden_dim)
             self.residual_state_input_layer = nn.Linear(self.state_input_dim, hidden_dim)
+            self.residual_context_input_layer = nn.Linear(self.context_input_dim, hidden_dim) if self.context_input_dim > 0 else None
+            self.residual_context_scale = (
+                nn.Parameter(torch.full((1,), self.context_scale_init, dtype=torch.float32))
+                if self.context_input_dim > 0
+                else None
+            )
             self.residual_hidden_layer = nn.Linear(hidden_dim, hidden_dim)
             self.residual_output_layer = nn.Linear(hidden_dim, 1)
         else:
@@ -601,6 +690,8 @@ class PolicyHead(nn.Module):
             self.base_output_layer = None
             self.residual_task_input_layer = None
             self.residual_state_input_layer = None
+            self.residual_context_input_layer = None
+            self.residual_context_scale = None
             self.residual_hidden_layer = None
             self.residual_output_layer = None
 
@@ -610,8 +701,15 @@ class PolicyHead(nn.Module):
         p_medium: torch.Tensor,
         *,
         state_context: torch.Tensor | None = None,
+        residual_context: torch.Tensor | None = None,
+        interface_gate_override: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
-        interface_gate = p_medium[..., 1] if p_medium.shape[-1] > 1 else torch.zeros(task_context.shape[0], device=task_context.device)
+        if interface_gate_override is not None:
+            interface_gate = interface_gate_override.to(device=task_context.device, dtype=task_context.dtype).reshape(-1)
+        elif p_medium.shape[-1] > 1:
+            interface_gate = p_medium[..., 1]
+        else:
+            interface_gate = torch.zeros(task_context.shape[0], device=task_context.device)
 
         if self.head_type == 'state_residual':
             if state_context is None:
@@ -623,6 +721,15 @@ class PolicyHead(nn.Module):
             residual_hidden = F.gelu(
                 self.residual_task_input_layer(task_context) + self.residual_state_input_layer(state_context)
             )
+            if self.residual_context_input_layer is not None:
+                if residual_context is None:
+                    residual_context = torch.zeros(
+                        task_context.shape[0],
+                        self.context_input_dim,
+                        device=task_context.device,
+                        dtype=task_context.dtype,
+                    )
+                residual_hidden = residual_hidden + self.residual_context_scale * self.residual_context_input_layer(residual_context)
             gamma, beta = self.film(p_medium).chunk(2, dim=-1)
             residual_hidden = (1.0 + gamma) * residual_hidden + beta
             residual_hidden = F.gelu(self.residual_hidden_layer(residual_hidden))

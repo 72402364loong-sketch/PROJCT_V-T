@@ -223,6 +223,8 @@ def main() -> None:
     )
 
     stage_name = str(context['stage_config'].get('name'))
+    policy_config = context['model_config'].get('policy', {})
+    diagnostic_gate_source = str(policy_config.get('gate_source', 'medium_prob')).strip().lower()
     checkpoint_path = resolve_path(project_root, args.checkpoint)
     if args.output_dir:
         output_dir = resolve_path(project_root, args.output_dir)
@@ -267,11 +269,15 @@ def main() -> None:
             expert_force = batch['expert_forces']
             reference_force = batch['reference_forces'] if 'reference_forces' in batch else torch.full_like(expert_force, float('nan'))
             delta_target = batch['delta_force_targets'] if 'delta_force_targets' in batch else torch.full_like(expert_force, float('nan'))
+            soft_gate_target = batch['soft_gate_targets'] if 'soft_gate_targets' in batch else None
             force_pred = outputs['force_pred'].reshape_as(expert_force)
             force_base = outputs.get('force_base', outputs['force_pred']).reshape_as(expert_force)
             force_delta = outputs.get('force_interface_delta', torch.zeros_like(outputs['force_pred'])).reshape_as(expert_force)
             interface_gate = outputs.get('interface_gate', torch.zeros_like(outputs['force_pred'])).reshape_as(expert_force)
-            oracle_gate = (phase_labels == int(PHASE_TO_INDEX['Interface'])).to(force_pred.dtype) * window_mask.to(force_pred.dtype)
+            if diagnostic_gate_source == 'soft_target' and soft_gate_target is not None:
+                oracle_gate = soft_gate_target.to(force_pred.dtype) * window_mask.to(force_pred.dtype)
+            else:
+                oracle_gate = (phase_labels == int(PHASE_TO_INDEX['Interface'])).to(force_pred.dtype) * window_mask.to(force_pred.dtype)
             force_pred_oracle = force_base + oracle_gate * force_delta
 
             force_pred_all.append(force_pred.detach().cpu())
@@ -296,6 +302,7 @@ def main() -> None:
             force_delta_cpu = force_delta.detach().cpu()
             interface_gate_cpu = interface_gate.detach().cpu()
             oracle_gate_cpu = oracle_gate.detach().cpu()
+            soft_gate_target_cpu = soft_gate_target.detach().cpu() if soft_gate_target is not None else None
             expert_force_cpu = expert_force.detach().cpu()
             reference_force_cpu = reference_force.detach().cpu()
             delta_target_cpu = delta_target.detach().cpu()
@@ -332,6 +339,7 @@ def main() -> None:
                         'force_base': float(force_base_cpu[batch_index, window_index].item()),
                         'force_interface_delta': float(force_delta_cpu[batch_index, window_index].item()),
                         'interface_gate': float(interface_gate_cpu[batch_index, window_index].item()),
+                        'soft_gate_target': float(soft_gate_target_cpu[batch_index, window_index].item()) if soft_gate_target_cpu is not None else float('nan'),
                         'oracle_interface_gate': float(oracle_gate_cpu[batch_index, window_index].item()),
                         'abs_error': float(abs(force_pred_cpu[batch_index, window_index].item() - expert_force_cpu[batch_index, window_index].item())) if bool(expert_mask_cpu[batch_index, window_index]) else float('nan'),
                         'abs_error_oracle': float(abs(force_pred_oracle_cpu[batch_index, window_index].item() - expert_force_cpu[batch_index, window_index].item())) if bool(expert_mask_cpu[batch_index, window_index]) else float('nan'),

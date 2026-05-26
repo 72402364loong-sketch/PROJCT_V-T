@@ -14,6 +14,13 @@ from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
+from cmg.attribute_metrics import (
+    AttributeAggregationAccumulator,
+    AttributeWindowMetricAccumulator,
+    attribute_class_counts,
+    flatten_aggregation_metrics,
+    flatten_window_metrics,
+)
 from cmg.losses import compute_losses
 
 try:
@@ -50,6 +57,21 @@ def class_f1_from_confusion(confusion: torch.Tensor, index: int) -> float:
 def macro_f1_from_confusion(confusion: torch.Tensor) -> float:
     scores = [class_f1_from_confusion(confusion, index) for index in range(confusion.shape[0])]
     return float(sum(scores) / len(scores))
+
+
+def resolve_attr_metric_tasks(model_config: dict[str, Any]) -> list[str]:
+    attributes_config = model_config.get('attributes', {}) if isinstance(model_config.get('attributes', {}), dict) else {}
+    raw_tasks = attributes_config.get('metric_tasks', ['fragility', 'geometry', 'surface'])
+    if isinstance(raw_tasks, str):
+        raw_tasks = [raw_tasks]
+    tasks = [str(task).strip().lower() for task in raw_tasks if str(task).strip()]
+    valid_tasks = [task for task in tasks if task in {'fragility', 'geometry', 'surface'}]
+    return valid_tasks or ['fragility', 'geometry', 'surface']
+
+
+def average_selected_attr_f1(scores: dict[str, float], selected_tasks: list[str]) -> float:
+    selected = [float(scores[task]) for task in selected_tasks if task in scores]
+    return float(sum(selected) / max(1, len(selected)))
 
 
 def build_scheduler(
@@ -150,6 +172,7 @@ def is_allowed_lora_injection_mismatch(key: str) -> bool:
         or key.startswith('policy_head.interface_output_layer.')
         or key.startswith('policy_head.base_')
         or key.startswith('policy_head.residual_')
+        or key.startswith('content_encoder.conv.')
     )
 
 
@@ -306,11 +329,21 @@ def run_model_epoch(
 
     mode = 'train' if training else 'eval'
     model.train(training)
-    loss_sums = {'total': 0.0, 'clip': 0.0, 'inv': 0.0, 'med': 0.0, 'attr': 0.0, 'pol': 0.0}
+    loss_sums = {
+        'total': 0.0,
+        'clip': 0.0,
+        'inv': 0.0,
+        'med': 0.0,
+        'attr': 0.0,
+        'attr_sample': 0.0,
+        'attr_window': 0.0,
+        'pol': 0.0,
+    }
     phase_confusion = torch.zeros(3, 3, dtype=torch.long)
-    frag_confusion = torch.zeros(3, 3, dtype=torch.long)
-    geom_confusion = torch.zeros(4, 4, dtype=torch.long)
-    surf_confusion = torch.zeros(2, 2, dtype=torch.long)
+    attr_metric_tasks = resolve_attr_metric_tasks(model_config)
+    attr_classes = attribute_class_counts(model_config)
+    attr_window_metrics = AttributeWindowMetricAccumulator(attr_classes, attr_metric_tasks)
+    attr_aggregation_metrics = AttributeAggregationAccumulator(attr_classes, attr_metric_tasks)
     overall_abs = 0.0
     overall_sq = 0.0
     overall_count = 0
@@ -337,9 +370,15 @@ def run_model_epoch(
     control_interface_hits_100 = 0
     control_interface_hits_200 = 0
     control_interface_hits_300 = 0
-    combined_attr_correct = 0
-    combined_attr_count = 0
-
+    stable_leakage_values: list[torch.Tensor] = []
+    gate_abs_sum = 0.0
+    gate_count = 0
+    gate_stable_sum = 0.0
+    gate_stable_count = 0
+    gate_interface_miss_sum = 0.0
+    gate_interface_count = 0
+    gate_smoothness_sum = 0.0
+    gate_smoothness_count = 0
     iterator = tqdm(loader, desc=mode, leave=False)
     for batch in iterator:
         batch = move_to_device(batch, device)
@@ -352,6 +391,7 @@ def run_model_epoch(
                     outputs,
                     batch,
                     loss_weights=stage_config.get('loss_weights', {}),
+                    attribute_loss_config=stage_config.get('attribute_loss'),
                     policy_loss_config=stage_config.get('policy_loss'),
                     temperature_clip=float(model_config['losses']['temperature_clip']),
                     temperature_inv=float(model_config['losses']['temperature_inv']),
@@ -377,22 +417,37 @@ def run_model_epoch(
         for pred, target in zip(phase_preds, phase_targets):
             phase_confusion[int(target), int(pred)] += 1
 
-        repeated_frag = batch['fragility_label'][:, None].expand(-1, window_mask.shape[1]).reshape(-1)[flat_valid].detach().cpu()
-        repeated_geom = batch['geometry_label'][:, None].expand(-1, window_mask.shape[1]).reshape(-1)[flat_valid].detach().cpu()
-        repeated_surf = batch['surface_label'][:, None].expand(-1, window_mask.shape[1]).reshape(-1)[flat_valid].detach().cpu()
-        frag_preds = outputs['fragility_logits'][flat_valid].argmax(dim=-1).detach().cpu()
-        geom_preds = outputs['geometry_logits'][flat_valid].argmax(dim=-1).detach().cpu()
-        surf_preds = outputs['surface_logits'][flat_valid].argmax(dim=-1).detach().cpu()
-        for pred, target in zip(frag_preds, repeated_frag):
-            frag_confusion[int(target), int(pred)] += 1
-        for pred, target in zip(geom_preds, repeated_geom):
-            geom_confusion[int(target), int(pred)] += 1
-        for pred, target in zip(surf_preds, repeated_surf):
-            surf_confusion[int(target), int(pred)] += 1
-        combined_attr_correct += int(((frag_preds == repeated_frag) & (geom_preds == repeated_geom) & (surf_preds == repeated_surf)).sum().item())
-        combined_attr_count += int(frag_preds.numel())
+        attr_window_metrics.update(outputs, batch)
+        attr_aggregation_metrics.update(outputs, batch)
 
         force_pred = outputs['force_pred'].reshape_as(batch['expert_forces'])
+        force_delta = outputs.get('force_interface_delta')
+        interface_gate = outputs.get('interface_gate')
+        if force_delta is not None and interface_gate is not None:
+            force_delta = force_delta.reshape_as(batch['expert_forces'])
+            interface_gate = interface_gate.reshape_as(batch['expert_forces'])
+            gated_residual = interface_gate * force_delta
+            stable_valid_mask = batch['stable_masks'] & window_mask
+            if stable_valid_mask.any():
+                stable_leakage_values.append(gated_residual[stable_valid_mask].abs().detach().cpu())
+            if 'soft_gate_targets' in batch:
+                gate_target = batch['soft_gate_targets']
+                valid_gate = window_mask
+                gate_abs_sum += float((interface_gate[valid_gate] - gate_target[valid_gate]).abs().sum().item())
+                gate_count += int(valid_gate.sum().item())
+            stable_gate_mask = batch['stable_masks'] & window_mask
+            if stable_gate_mask.any():
+                gate_stable_sum += float(interface_gate[stable_gate_mask].sum().item())
+                gate_stable_count += int(stable_gate_mask.sum().item())
+            interface_gate_mask = (batch['phase_labels'] == 1) & window_mask
+            if interface_gate_mask.any():
+                gate_interface_miss_sum += float((1.0 - interface_gate[interface_gate_mask]).abs().sum().item())
+                gate_interface_count += int(interface_gate_mask.sum().item())
+            if interface_gate.shape[1] > 1:
+                pair_mask = window_mask[:, 1:] & window_mask[:, :-1]
+                if pair_mask.any():
+                    gate_smoothness_sum += float((interface_gate[:, 1:] - interface_gate[:, :-1]).abs()[pair_mask].sum().item())
+                    gate_smoothness_count += int(pair_mask.sum().item())
         expert_mask = batch['has_expert'] & window_mask
         if expert_mask.any():
             pred = force_pred[expert_mask]
@@ -456,30 +511,67 @@ def run_model_epoch(
                 control_interface_hits_300 += int((abs_control_interface_error <= 300.0).sum().item())
 
     denom = max(1, len(loader))
-    frag_macro_f1 = macro_f1_from_confusion(frag_confusion)
-    geom_macro_f1 = macro_f1_from_confusion(geom_confusion)
-    surf_macro_f1 = macro_f1_from_confusion(surf_confusion)
+    if stable_leakage_values:
+        stable_leakage = torch.cat(stable_leakage_values)
+        stable_leakage_mean = float(stable_leakage.mean().item())
+        stable_leakage_p95 = float(torch.quantile(stable_leakage, 0.95).item())
+    else:
+        stable_leakage_mean = 0.0
+        stable_leakage_p95 = 0.0
+    attribute_window_diagnostics = attr_window_metrics.finalize()
+    attribute_aggregation = attr_aggregation_metrics.finalize()
+    all_window_attr = attribute_window_diagnostics['all_windows']
+    stable_water_air_sample_attr = attribute_aggregation['sample_aggregation']['stable_water_air']['mean_logits']
+    model_pool_sample_attr = attribute_aggregation['sample_model_pool']
+    if int(model_pool_sample_attr.get('count', 0)) > 0:
+        primary_attr = model_pool_sample_attr
+        primary_attr_source = 'sample_model_pool'
+    elif int(stable_water_air_sample_attr.get('count', 0)) > 0:
+        primary_attr = stable_water_air_sample_attr
+        primary_attr_source = 'sample_stable_water_air_mean_logits'
+    else:
+        primary_attr = all_window_attr
+        primary_attr_source = 'window_all'
+
+    frag_macro_f1 = float(all_window_attr['fragility_macro_f1'])
+    geom_macro_f1 = float(all_window_attr['geometry_macro_f1'])
+    surf_macro_f1 = float(all_window_attr['surface_macro_f1'])
+    attr_f1_scores = {
+        'fragility': frag_macro_f1,
+        'geometry': geom_macro_f1,
+        'surface': surf_macro_f1,
+    }
+    attr_macro_f1_avg = average_selected_attr_f1(attr_f1_scores, attr_metric_tasks)
+    attr_all_macro_f1_avg = (frag_macro_f1 + geom_macro_f1 + surf_macro_f1) / 3.0
+    medium_macro_f1 = macro_f1_from_confusion(phase_confusion)
+    attr_primary_macro_f1 = float(primary_attr['attr_macro_f1_avg'])
     metrics: dict[str, Any] = {
         'loss_total': loss_sums['total'] / denom,
         'loss_clip': loss_sums['clip'] / denom,
         'loss_inv': loss_sums['inv'] / denom,
         'loss_med': loss_sums['med'] / denom,
         'loss_attr': loss_sums['attr'] / denom,
+        'loss_attr_sample': loss_sums['attr_sample'] / denom,
+        'loss_attr_window': loss_sums['attr_window'] / denom,
         'loss_pol': loss_sums['pol'] / denom,
         'contrastive_loss_sum': (loss_sums['clip'] + loss_sums['inv']) / denom,
         'medium_accuracy': accuracy_from_confusion(phase_confusion),
-        'medium_macro_f1': macro_f1_from_confusion(phase_confusion),
+        'medium_macro_f1': medium_macro_f1,
         'medium_f1_water': class_f1_from_confusion(phase_confusion, 0),
         'medium_f1_interface': class_f1_from_confusion(phase_confusion, 1),
         'medium_f1_air': class_f1_from_confusion(phase_confusion, 2),
-        'fragility_accuracy': accuracy_from_confusion(frag_confusion),
-        'geometry_accuracy': accuracy_from_confusion(geom_confusion),
-        'surface_accuracy': accuracy_from_confusion(surf_confusion),
+        'fragility_accuracy': all_window_attr['fragility_accuracy'],
+        'geometry_accuracy': all_window_attr['geometry_accuracy'],
+        'surface_accuracy': all_window_attr['surface_accuracy'],
         'fragility_macro_f1': frag_macro_f1,
         'geometry_macro_f1': geom_macro_f1,
         'surface_macro_f1': surf_macro_f1,
-        'attr_macro_f1_avg': (frag_macro_f1 + geom_macro_f1 + surf_macro_f1) / 3.0,
-        'combined_attr_accuracy': combined_attr_correct / max(1, combined_attr_count),
+        'attr_macro_f1_avg': attr_macro_f1_avg,
+        'attr_all_macro_f1_avg': attr_all_macro_f1_avg,
+        'attr_primary_macro_f1': attr_primary_macro_f1,
+        'attr_primary_source': primary_attr_source,
+        'attr_metric_tasks': attr_metric_tasks,
+        'combined_attr_accuracy': all_window_attr['combined_attr_accuracy'],
         'overall_mae': overall_abs / max(1, overall_count),
         'overall_mse': overall_sq / max(1, overall_count),
         'stable_mae': stable_abs / max(1, stable_count),
@@ -500,12 +592,25 @@ def run_model_epoch(
         'control_interface_hit_rate_100': control_interface_hits_100 / max(1, control_interface_count),
         'control_interface_hit_rate_200': control_interface_hits_200 / max(1, control_interface_count),
         'control_interface_hit_rate_300': control_interface_hits_300 / max(1, control_interface_count),
-        'joint_score': 0.6 * macro_f1_from_confusion(phase_confusion) + 0.4 * ((frag_macro_f1 + geom_macro_f1 + surf_macro_f1) / 3.0),
+        'stable_leakage_mean': stable_leakage_mean,
+        'stable_leakage_p95': stable_leakage_p95,
+        'gate_mae': gate_abs_sum / max(1, gate_count),
+        'gate_false_positive_stable': gate_stable_sum / max(1, gate_stable_count),
+        'gate_false_negative_interface': gate_interface_miss_sum / max(1, gate_interface_count),
+        'gate_smoothness': gate_smoothness_sum / max(1, gate_smoothness_count),
+        'joint_score': 0.6 * medium_macro_f1 + 0.4 * attr_primary_macro_f1,
         'medium_confusion': phase_confusion.tolist(),
-        'fragility_confusion': frag_confusion.tolist(),
-        'geometry_confusion': geom_confusion.tolist(),
-        'surface_confusion': surf_confusion.tolist(),
+        'fragility_confusion': attr_window_metrics.confusions['all_windows']['fragility'].tolist(),
+        'geometry_confusion': attr_window_metrics.confusions['all_windows']['geometry'].tolist(),
+        'surface_confusion': attr_window_metrics.confusions['all_windows']['surface'].tolist(),
+        'attribute_window_diagnostics': attribute_window_diagnostics,
+        'attribute_sample_aggregation': attribute_aggregation['sample_aggregation'],
+        'attribute_object_aggregation': attribute_aggregation['object_aggregation'],
+        'attribute_sample_model_pool': attribute_aggregation['sample_model_pool'],
+        'attribute_object_model_pool': attribute_aggregation['object_model_pool'],
     }
+    metrics.update(flatten_window_metrics(attribute_window_diagnostics))
+    metrics.update(flatten_aggregation_metrics(attribute_aggregation))
     return metrics
 
 
@@ -589,7 +694,7 @@ class Trainer:
 
     def _selection_value(self, metrics: dict[str, Any]) -> float:
         if self.selection_metric == 'joint_score':
-            return float(0.6 * metrics['medium_macro_f1'] + 0.4 * metrics['attr_macro_f1_avg'])
+            return float(metrics['joint_score'])
         return float(metrics[self.selection_metric])
 
     def _should_run_validation(self, epoch: int) -> bool:

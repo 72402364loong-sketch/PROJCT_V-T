@@ -6,7 +6,7 @@ from typing import Any
 import torch
 from torch.utils.data import DataLoader
 
-from .config import deep_update, load_yaml
+from .config import deep_update, load_yaml, sync_tactile_model_config
 from .data import CrossMediumSequenceDataset, sequence_collate_fn
 from .models import CrossMediumSystem
 from .training import build_phase_class_weights, load_checkpoint_context, load_model_weights, run_model_epoch
@@ -59,6 +59,7 @@ def prepare_evaluation_context(
     checkpoint: str | Path,
     subset: str = 'test',
     only_stable: bool = False,
+    num_workers: int | None = None,
 ) -> dict[str, Any]:
     project_root = Path(project_root).resolve()
     stage_path = resolve_path(project_root, stage)
@@ -79,6 +80,7 @@ def prepare_evaluation_context(
         stage_config,
         checkpoint_context,
     )
+    model_config = sync_tactile_model_config(data_config, model_config)
     if data_config.get('visual_feature_cache_dir') and (
         float(stage_config.get('loss_weights', {}).get('clip', 0.0)) > 0.0
         or float(stage_config.get('loss_weights', {}).get('inv', 0.0)) > 0.0
@@ -101,6 +103,7 @@ def prepare_evaluation_context(
         clip_mean=data_config.get('clip_mean'),
         clip_std=data_config.get('clip_std'),
         tactile_points_per_window=int(data_config.get('tactile_points_per_window')) if data_config.get('tactile_points_per_window') is not None else None,
+        tactile_input_axes=data_config.get('tactile_input_axes'),
         standardize_tactile=bool(data_config.get('standardize_tactile', False)),
         min_valid_ratio_video=float(data_config.get('min_valid_ratio_video', 0.0)),
         min_valid_ratio_tactile=float(data_config.get('min_valid_ratio_tactile', 0.0)),
@@ -116,16 +119,23 @@ def prepare_evaluation_context(
         expert_force_baseline_mode=str(data_config.get('expert_force_baseline_mode', 'none')),
         expert_force_baseline_window_sec=float(data_config.get('expert_force_baseline_window_sec', 0.5)),
         expert_force_interface_margin_sec=float(data_config.get('expert_force_interface_margin_sec', 0.0)),
+        soft_gate_pre_sec=float(data_config.get('soft_gate_pre_sec', 0.0)),
+        soft_gate_post_sec=float(data_config.get('soft_gate_post_sec', 0.0)),
+        soft_gate_ramp=str(data_config.get('soft_gate_ramp', 'linear')),
+        interface_context_manifest=data_config.get('interface_context_manifest'),
+        attribute_taxonomy=str(data_config.get('attribute_taxonomy', 'legacy')),
+        physical_attribute_table=data_config.get('physical_attribute_table'),
+        physical_attribute_norm_stats_path=data_config.get('physical_attribute_norm_stats_path'),
     )
 
     loader_kwargs: dict[str, Any] = {
         'batch_size': int(train_config['batch_size']),
         'shuffle': False,
-        'num_workers': int(train_config['num_workers']),
+        'num_workers': int(train_config['num_workers'] if num_workers is None else num_workers),
         'pin_memory': bool(train_config.get('pin_memory', False)),
         'collate_fn': sequence_collate_fn,
     }
-    if int(train_config['num_workers']) > 0 and bool(train_config.get('persistent_workers', False)):
+    if int(loader_kwargs['num_workers']) > 0 and bool(train_config.get('persistent_workers', False)):
         loader_kwargs['persistent_workers'] = True
     loader = DataLoader(dataset, **loader_kwargs)
 
@@ -161,6 +171,7 @@ def evaluate_checkpoint(
     checkpoint: str | Path,
     subset: str = 'test',
     only_stable: bool = False,
+    num_workers: int | None = None,
 ) -> dict[str, Any]:
     context = prepare_evaluation_context(
         project_root=project_root,
@@ -168,6 +179,7 @@ def evaluate_checkpoint(
         checkpoint=checkpoint,
         subset=subset,
         only_stable=only_stable,
+        num_workers=num_workers,
     )
     metrics = run_model_epoch(
         context['model'],

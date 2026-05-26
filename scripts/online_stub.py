@@ -15,10 +15,10 @@ SRC = ROOT / 'src'
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from cmg.config import deep_update, load_yaml
+from cmg.config import deep_update, load_yaml, sync_tactile_model_config
 from cmg.data import CrossMediumSequenceDataset
 from cmg.data.sidecar import load_window_sidecar
-from cmg.data.tactile import compute_measured_force_curve, load_tactile_array, resample_tactile_window, split_ac_dc, standardize_tactile_window
+from cmg.data.tactile import compute_measured_force_curve, load_tactile_array, resample_tactile_window, select_tactile_channels, split_ac_dc, standardize_tactile_window
 from cmg.data.video import load_window_frames, sample_frame_indices
 from cmg.models import CrossMediumSystem
 from cmg.online import OnlineInferenceStub, OnlineJSONLLogger
@@ -67,6 +67,7 @@ def load_configs(project_root: Path, stage_path: Path, checkpoint_context: dict)
             model_config = archived['model']
         if isinstance(archived.get('train'), dict):
             train_config = archived['train']
+    model_config = sync_tactile_model_config(data_config, model_config)
     return data_config, model_config, train_config, stage_config
 
 
@@ -85,6 +86,7 @@ def make_stats_dataset(project_root: Path, split_path: Path, data_config: dict, 
         clip_mean=data_config.get('clip_mean'),
         clip_std=data_config.get('clip_std'),
         tactile_points_per_window=int(data_config.get('tactile_points_per_window')) if data_config.get('tactile_points_per_window') is not None else None,
+        tactile_input_axes=data_config.get('tactile_input_axes'),
         standardize_tactile=bool(data_config.get('standardize_tactile', False)),
         min_valid_ratio_video=float(data_config.get('min_valid_ratio_video', 0.0)),
         min_valid_ratio_tactile=float(data_config.get('min_valid_ratio_tactile', 0.0)),
@@ -138,6 +140,8 @@ def main() -> None:
     tactile_path = resolve_data_path(project_root, str(sample['tactile_path']))
     tactile_array = load_tactile_array(tactile_path)
     tactile_high_full, tactile_low_full = split_ac_dc(tactile_array, alpha=float(data_config['ema_alpha_acdc']))
+    tactile_high_full = select_tactile_channels(tactile_high_full, stats_dataset.tactile_channel_indices)
+    tactile_low_full = select_tactile_channels(tactile_low_full, stats_dataset.tactile_channel_indices)
     measured_force_curve = compute_measured_force_curve(tactile_array, normal_sign_table=data_config['normal_sign_table'])
 
     clip_mean = None if data_config.get('clip_mean') is None else torch.tensor(data_config['clip_mean'], dtype=torch.float32).view(1, 3, 1, 1)

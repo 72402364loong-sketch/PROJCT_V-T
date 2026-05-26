@@ -5,6 +5,13 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
+from cmg.attribute_metrics import (
+    ATTRIBUTE_LABEL_KEYS,
+    ATTRIBUTE_LOGIT_KEYS,
+    ATTRIBUTE_SAMPLE_LOGIT_KEYS,
+    ATTRIBUTE_TASKS,
+    build_attribute_window_masks,
+)
 
 
 def info_nce_loss(view_a: torch.Tensor, view_b: torch.Tensor, temperature: float) -> torch.Tensor:
@@ -119,6 +126,7 @@ def compute_policy_loss(
         residual_stable_zero_weight = float(policy_config.get('residual_stable_zero_weight', 1.0))
         residual_non_interface_weight = float(policy_config.get('residual_non_interface_weight', 0.25))
         gated_residual_interface_weight = float(policy_config.get('gated_residual_interface_weight', 0.0))
+        gated_residual_min_gate = float(policy_config.get('gated_residual_min_gate', 0.0))
         quiet_weight = float(policy_config.get('quiet_weight', 0.0))
         interface_positive_bias_weight = float(policy_config.get('interface_positive_bias_weight', 0.0))
         interface_bias_margin = float(policy_config.get('interface_bias_margin', 0.0))
@@ -193,10 +201,11 @@ def compute_policy_loss(
                 zero=zero,
             )
         if gated_residual_interface_weight > 0.0 and interface_gate is not None:
+            gated_interface_mask = interface_expert & (interface_gate >= gated_residual_min_gate)
             total = total + gated_residual_interface_weight * masked_scaled_smooth_l1(
                 interface_gate * interface_delta,
                 delta_targets,
-                interface_expert,
+                gated_interface_mask,
                 beta=beta,
                 scale=delta_normalization_scale,
                 zero=zero,
@@ -221,6 +230,7 @@ def compute_policy_loss(
         residual_stable_zero_weight = float(policy_config.get('residual_stable_zero_weight', 1.0))
         residual_non_interface_weight = float(policy_config.get('residual_non_interface_weight', 0.25))
         gated_residual_interface_weight = float(policy_config.get('gated_residual_interface_weight', 0.0))
+        gated_residual_min_gate = float(policy_config.get('gated_residual_min_gate', 0.0))
         quiet_weight = float(policy_config.get('quiet_weight', 0.0))
         interface_positive_bias_weight = float(policy_config.get('interface_positive_bias_weight', 0.0))
         interface_bias_margin = float(policy_config.get('interface_bias_margin', 0.0))
@@ -295,10 +305,11 @@ def compute_policy_loss(
                 zero=zero,
             )
         if gated_residual_interface_weight > 0.0 and interface_gate is not None:
+            gated_interface_mask = interface_expert & (interface_gate >= gated_residual_min_gate)
             total = total + gated_residual_interface_weight * masked_scaled_smooth_l1(
                 interface_gate * interface_delta,
                 delta_target,
-                interface_expert,
+                gated_interface_mask,
                 beta=beta,
                 scale=delta_normalization_scale,
                 zero=zero,
@@ -351,6 +362,7 @@ def compute_losses(
     batch: dict[str, torch.Tensor],
     *,
     loss_weights: dict[str, float],
+    attribute_loss_config: dict[str, Any] | None = None,
     policy_loss_config: dict[str, Any] | None,
     temperature_clip: float,
     temperature_inv: float,
@@ -360,13 +372,17 @@ def compute_losses(
     stable_mask = batch['stable_masks'].reshape(-1) & window_mask
     phase_targets = batch['phase_labels'].reshape(-1)
     medium_logits = outputs['medium_logits'].reshape(-1, outputs['medium_logits'].shape[-1])
-    fragility_logits = outputs['fragility_logits']
-    geometry_logits = outputs['geometry_logits']
-    surface_logits = outputs['surface_logits']
+    attr_logits = {task: outputs[ATTRIBUTE_LOGIT_KEYS[task]] for task in ATTRIBUTE_TASKS}
+    sample_attr_logits = {
+        task: outputs[ATTRIBUTE_SAMPLE_LOGIT_KEYS[task]]
+        for task in ATTRIBUTE_TASKS
+        if ATTRIBUTE_SAMPLE_LOGIT_KEYS[task] in outputs
+    }
 
-    repeated_fragility = batch['fragility_label'][:, None].expand(-1, batch['window_mask'].shape[1]).reshape(-1)
-    repeated_geometry = batch['geometry_label'][:, None].expand(-1, batch['window_mask'].shape[1]).reshape(-1)
-    repeated_surface = batch['surface_label'][:, None].expand(-1, batch['window_mask'].shape[1]).reshape(-1)
+    repeated_attr_targets = {
+        task: batch[ATTRIBUTE_LABEL_KEYS[task]][:, None].expand(-1, batch['window_mask'].shape[1]).reshape(-1)
+        for task in ATTRIBUTE_TASKS
+    }
     repeated_object = batch['object_index'][:, None].expand(-1, batch['window_mask'].shape[1]).reshape(-1)
     repeated_sample = batch['sample_index'][:, None].expand(-1, batch['window_mask'].shape[1]).reshape(-1)
     stable_phases = batch['stable_phases'].reshape(-1)
@@ -378,17 +394,111 @@ def compute_losses(
     clip_weight = float(loss_weights.get('clip', 0.0))
     inv_weight = float(loss_weights.get('inv', 0.0))
     pol_weight = float(loss_weights.get('pol', 0.0))
+    attribute_loss_config = attribute_loss_config if isinstance(attribute_loss_config, dict) else {}
+    attr_class_weights = attribute_loss_config.get('class_weights', {})
+    attr_task_weights = attribute_loss_config.get('task_weights', {})
+    attr_mode = str(
+        attribute_loss_config.get(
+            'mode',
+            'sample_primary' if len(sample_attr_logits) == len(ATTRIBUTE_TASKS) else 'window',
+        )
+    ).strip().lower()
+    if attr_mode in {'legacy', 'legacy_window', 'window', 'window_all'}:
+        default_sample_weight = 0.0
+        default_window_weight = 1.0
+        default_window_selection = 'all_windows'
+    else:
+        default_sample_weight = 1.0
+        default_window_weight = 0.2
+        default_window_selection = 'stable_water_air'
+    attr_sample_weight = float(attribute_loss_config.get('sample_weight', default_sample_weight))
+    attr_window_weight = float(attribute_loss_config.get('window_weight', default_window_weight))
+    attr_window_selection = str(attribute_loss_config.get('window_selection', default_window_selection)).strip().lower()
+
+    def _optional_class_weight(task_name: str, logits: torch.Tensor) -> torch.Tensor | None:
+        raw_weights = attr_class_weights.get(task_name) if isinstance(attr_class_weights, dict) else None
+        if raw_weights is None:
+            return None
+        weights = torch.tensor(raw_weights, dtype=logits.dtype, device=logits.device)
+        if weights.numel() != logits.shape[-1]:
+            raise RuntimeError(
+                f'attribute_loss.class_weights.{task_name} has {weights.numel()} values, '
+                f'but logits have {logits.shape[-1]} classes.'
+            )
+        return weights
+
+    def _task_weight(task_name: str) -> float:
+        if not isinstance(attr_task_weights, dict):
+            return 1.0
+        return float(attr_task_weights.get(task_name, 1.0))
+
+    def _attribute_window_loss_mask() -> torch.Tensor:
+        masks = build_attribute_window_masks(batch)
+        aliases = {
+            'all': 'all_windows',
+            'all_valid': 'all_windows',
+            'stable': 'stable_windows',
+            'stable_water': 'stable_water_only',
+            'stable_air': 'stable_air_only',
+            'stable_water_and_air': 'stable_water_air',
+            'water': 'water_only',
+            'air': 'air_only',
+            'interface': 'interface_only',
+        }
+        mask_name = aliases.get(attr_window_selection, attr_window_selection)
+        if mask_name not in masks:
+            raise RuntimeError(
+                f"Unsupported attribute_loss.window_selection={attr_window_selection!r}. "
+                f"Expected one of {sorted(set(masks) | set(aliases))}."
+            )
+        return masks[mask_name].reshape(-1)
 
     losses['med'] = F.cross_entropy(medium_logits[window_mask], phase_targets[window_mask], weight=phase_class_weights) if med_weight > 0.0 else zero
     if attr_weight > 0.0:
-        losses['frag'] = F.cross_entropy(fragility_logits[window_mask], repeated_fragility[window_mask])
-        losses['geom'] = F.cross_entropy(geometry_logits[window_mask], repeated_geometry[window_mask])
-        losses['surf'] = F.cross_entropy(surface_logits[window_mask], repeated_surface[window_mask])
-        losses['attr'] = losses['frag'] + losses['geom'] + losses['surf']
+        window_loss_mask = _attribute_window_loss_mask()
+        sample_task_losses: dict[str, torch.Tensor] = {}
+        window_task_losses: dict[str, torch.Tensor] = {}
+        for task in ATTRIBUTE_TASKS:
+            logits = attr_logits[task]
+            if attr_window_weight > 0.0 and window_loss_mask.any():
+                window_task_losses[task] = F.cross_entropy(
+                    logits[window_loss_mask],
+                    repeated_attr_targets[task][window_loss_mask],
+                    weight=_optional_class_weight(task, logits),
+                )
+            else:
+                window_task_losses[task] = zero
+
+            sample_logits = sample_attr_logits.get(task)
+            if attr_sample_weight > 0.0 and sample_logits is not None:
+                sample_task_losses[task] = F.cross_entropy(
+                    sample_logits,
+                    batch[ATTRIBUTE_LABEL_KEYS[task]],
+                    weight=_optional_class_weight(task, sample_logits),
+                )
+            else:
+                sample_task_losses[task] = zero
+
+        losses['frag'] = attr_sample_weight * sample_task_losses['fragility'] + attr_window_weight * window_task_losses['fragility']
+        losses['geom'] = attr_sample_weight * sample_task_losses['geometry'] + attr_window_weight * window_task_losses['geometry']
+        losses['surf'] = attr_sample_weight * sample_task_losses['surface'] + attr_window_weight * window_task_losses['surface']
+        losses['attr_sample'] = (
+            _task_weight('fragility') * sample_task_losses['fragility']
+            + _task_weight('geometry') * sample_task_losses['geometry']
+            + _task_weight('surface') * sample_task_losses['surface']
+        )
+        losses['attr_window'] = (
+            _task_weight('fragility') * window_task_losses['fragility']
+            + _task_weight('geometry') * window_task_losses['geometry']
+            + _task_weight('surface') * window_task_losses['surface']
+        )
+        losses['attr'] = attr_sample_weight * losses['attr_sample'] + attr_window_weight * losses['attr_window']
     else:
         losses['frag'] = zero
         losses['geom'] = zero
         losses['surf'] = zero
+        losses['attr_sample'] = zero
+        losses['attr_window'] = zero
         losses['attr'] = zero
 
     if clip_weight > 0.0:

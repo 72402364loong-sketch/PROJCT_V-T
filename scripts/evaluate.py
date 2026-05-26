@@ -20,6 +20,7 @@ def main() -> None:
     parser.add_argument('--checkpoint', required=True)
     parser.add_argument('--subset', default='test', choices=['train', 'val', 'test'])
     parser.add_argument('--only-stable', action='store_true')
+    parser.add_argument('--num-workers', type=int, default=None)
     parser.add_argument('--output', default=None)
     args = parser.parse_args()
 
@@ -30,6 +31,7 @@ def main() -> None:
         checkpoint=args.checkpoint,
         subset=args.subset,
         only_stable=bool(args.only_stable),
+        num_workers=args.num_workers,
     )
 
     checkpoint_path = resolve_path(project_root, args.checkpoint)

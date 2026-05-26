@@ -6,6 +6,9 @@ from typing import Any
 
 import numpy as np
 
+TACTILE_AXIS_NAMES = ('x', 'y', 'z')
+TACTILE_FULL_INPUT_AXES = TACTILE_AXIS_NAMES
+
 
 @lru_cache(maxsize=512)
 def load_tactile_array(path: str | Path) -> np.ndarray:
@@ -27,6 +30,52 @@ def load_tactile_array(path: str | Path) -> np.ndarray:
     if array.ndim != 2 or array.shape[1] != 36:
         raise ValueError(f'Unexpected tactile shape for {path}: {array.shape}')
     return array
+
+
+def normalize_tactile_input_axes(input_axes: Any) -> tuple[str, ...]:
+    if input_axes is None:
+        return TACTILE_FULL_INPUT_AXES
+
+    if isinstance(input_axes, str):
+        normalized = input_axes.strip().lower()
+        if not normalized or normalized == 'all':
+            return TACTILE_FULL_INPUT_AXES
+        if ',' in normalized:
+            values = [part.strip() for part in normalized.split(',') if part.strip()]
+        else:
+            values = list(normalized) if set(normalized).issubset(set(TACTILE_AXIS_NAMES)) else [normalized]
+    else:
+        values = [str(value).strip().lower() for value in input_axes]
+
+    axes: list[str] = []
+    for axis in values:
+        if axis not in TACTILE_AXIS_NAMES:
+            raise ValueError(f"Unsupported tactile input axis {axis!r}; expected one of {TACTILE_AXIS_NAMES}.")
+        if axis in axes:
+            raise ValueError(f'Duplicate tactile input axis: {axis!r}')
+        axes.append(axis)
+    if not axes:
+        raise ValueError('tactile_input_axes must select at least one axis.')
+    return tuple(axes)
+
+
+def tactile_channel_indices_for_axes(input_axes: Any) -> np.ndarray:
+    axes = normalize_tactile_input_axes(input_axes)
+    axis_positions = [TACTILE_AXIS_NAMES.index(axis) for axis in axes]
+    layout = np.arange(36, dtype=np.int64).reshape(3, 4, 3)
+    return layout[..., axis_positions].reshape(-1)
+
+
+def tactile_input_dim_for_axes(input_axes: Any) -> int:
+    return int(tactile_channel_indices_for_axes(input_axes).shape[0])
+
+
+def select_tactile_channels(sequence: np.ndarray, channel_indices: np.ndarray) -> np.ndarray:
+    if sequence.ndim != 2 or sequence.shape[1] != 36:
+        raise ValueError(f'Expected tactile array with shape [T, 36], got {sequence.shape}')
+    if channel_indices.shape[0] == 36 and np.array_equal(channel_indices, np.arange(36)):
+        return sequence.astype(np.float32, copy=False)
+    return sequence[:, channel_indices].astype(np.float32, copy=False)
 
 
 
@@ -114,8 +163,9 @@ def compute_resample_mapping(source_length: int, target_length: int) -> dict[str
 
 def resample_tactile_window(sequence: np.ndarray, target_length: int) -> tuple[np.ndarray, np.ndarray]:
     mapping = compute_resample_mapping(sequence.shape[0], target_length)
+    feature_dim = int(sequence.shape[1]) if sequence.ndim == 2 else 36
     if sequence.size == 0:
-        return np.zeros((target_length, 36), dtype=np.float32), mapping['valid_mask']
+        return np.zeros((target_length, feature_dim), dtype=np.float32), mapping['valid_mask']
     if sequence.shape[0] == 1:
         repeated = np.repeat(sequence.astype(np.float32), target_length, axis=0)
         return repeated, mapping['valid_mask']

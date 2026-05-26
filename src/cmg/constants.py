@@ -10,6 +10,26 @@ GEOMETRY_TO_INDEX = {
 }
 SURFACE_TO_INDEX = {"smooth": 0, "matte": 1}
 
+FRAGILITY_V2_TO_INDEX = {"fragile": 0, "non_fragile": 1}
+SHAPE_PROFILE_V2_TO_INDEX = {"open_vessel": 0, "slender_or_narrow": 1}
+SURFACE_TEXTURE_V2_TO_INDEX = {"smooth": 0, "textured_or_matte": 1}
+
+FRAGILITY_TO_V2 = {
+    "fragile": "fragile",
+    "robust": "non_fragile",
+    "compliant": "non_fragile",
+}
+GEOMETRY_TO_SHAPE_PROFILE_V2 = {
+    "bowl-like": "open_vessel",
+    "cup-like": "open_vessel",
+    "cylindrical": "slender_or_narrow",
+    "constricted-opening": "slender_or_narrow",
+}
+SURFACE_TO_TEXTURE_V2 = {
+    "smooth": "smooth",
+    "matte": "textured_or_matte",
+}
+
 MAIN_OBJECT_IDS = [f"OBJ{i:03d}" for i in range(1, 13)]
 MECHANISM_OBJECT_IDS = [f"OBJ{i:03d}" for i in range(13, 19)]
 
