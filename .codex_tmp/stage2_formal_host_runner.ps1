@@ -1,0 +1,5 @@
+﻿$env:PYTHONUNBUFFERED = '1'
+$env:PYTORCH_ALLOC_CONF = 'expandable_segments:True'
+Set-Location 'D:\PROJCT_V-T'
+$ErrorActionPreference = 'Continue'
+& 'D:\PROJCT_V-T\.venv310\Scripts\python.exe' scripts/train.py --project-root . --stage 'configs/stages/stage2_alignment_physical_balanced.yaml' --init-from 'D:\PROJCT_V-T\runs\stage1_perception_physical_balanced\checkpoints\best.pt' 1>>'D:\PROJCT_V-T\runs\stage2_alignment_physical_balanced\hosted_stage2.stdout.log' 2>>'D:\PROJCT_V-T\runs\stage2_alignment_physical_balanced\hosted_stage2.stderr.log'

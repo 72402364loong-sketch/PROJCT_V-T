@@ -85,11 +85,328 @@ def masked_scaled_smooth_l1(
     return F.smooth_l1_loss(prediction[mask] / scale, target[mask] / scale, beta=beta)
 
 
+def masked_weighted_scaled_smooth_l1(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    mask: torch.Tensor,
+    *,
+    beta: float,
+    scale: float,
+    weight_alpha: float,
+    weight_cap: float,
+    zero: torch.Tensor,
+) -> torch.Tensor:
+    if not mask.any():
+        return zero
+    if scale <= 0.0:
+        raise ValueError(f'delta normalization scale must be positive, got {scale}.')
+    pred = prediction[mask] / scale
+    tgt = target[mask] / scale
+    loss = F.smooth_l1_loss(pred, tgt, beta=beta, reduction='none')
+    weights = 1.0 + float(weight_alpha) * torch.clamp(torch.abs(tgt), min=0.0, max=float(weight_cap))
+    return (loss * weights).mean()
+
+
+def masked_large_delta_sign_loss(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    mask: torch.Tensor,
+    *,
+    scale: float,
+    margin: float,
+    zero: torch.Tensor,
+) -> torch.Tensor:
+    if not mask.any():
+        return zero
+    if scale <= 0.0:
+        raise ValueError(f'delta normalization scale must be positive, got {scale}.')
+    pred = prediction[mask] / scale
+    tgt = target[mask]
+    signs = torch.sign(tgt)
+    valid = signs != 0
+    if not valid.any():
+        return zero
+    signed_pred = signs[valid] * pred[valid]
+    return torch.relu(float(margin) - signed_pred).mean()
+
+
+def sign_balanced_large_delta_loss(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    mask: torch.Tensor,
+    *,
+    beta: float,
+    scale: float,
+    weight_alpha: float,
+    weight_cap: float,
+    positive_weight: float = 1.0,
+    negative_weight: float = 1.0,
+    zero: torch.Tensor,
+) -> torch.Tensor:
+    positive_mask = mask & (target > 0)
+    negative_mask = mask & (target < 0)
+    parts = []
+    weights = []
+    positive_weight = float(positive_weight)
+    negative_weight = float(negative_weight)
+    if positive_weight > 0.0 and positive_mask.any():
+        parts.append(
+            positive_weight
+            * masked_weighted_scaled_smooth_l1(
+                prediction,
+                target,
+                positive_mask,
+                beta=beta,
+                scale=scale,
+                weight_alpha=weight_alpha,
+                weight_cap=weight_cap,
+                zero=zero,
+            )
+        )
+        weights.append(positive_weight)
+    if negative_weight > 0.0 and negative_mask.any():
+        parts.append(
+            negative_weight
+            * masked_weighted_scaled_smooth_l1(
+                prediction,
+                target,
+                negative_mask,
+                beta=beta,
+                scale=scale,
+                weight_alpha=weight_alpha,
+                weight_cap=weight_cap,
+                zero=zero,
+            )
+        )
+        weights.append(negative_weight)
+    if not parts:
+        return zero
+    return torch.stack(parts).sum() / prediction.new_tensor(sum(weights))
+
+
+def sign_balanced_large_delta_sign_loss(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    mask: torch.Tensor,
+    *,
+    scale: float,
+    margin: float,
+    positive_weight: float = 1.0,
+    negative_weight: float = 1.0,
+    zero: torch.Tensor,
+) -> torch.Tensor:
+    positive_mask = mask & (target > 0)
+    negative_mask = mask & (target < 0)
+    parts = []
+    weights = []
+    positive_weight = float(positive_weight)
+    negative_weight = float(negative_weight)
+    if positive_weight > 0.0 and positive_mask.any():
+        parts.append(
+            positive_weight
+            * masked_large_delta_sign_loss(
+                prediction,
+                target,
+                positive_mask,
+                scale=scale,
+                margin=margin,
+                zero=zero,
+            )
+        )
+        weights.append(positive_weight)
+    if negative_weight > 0.0 and negative_mask.any():
+        parts.append(
+            negative_weight
+            * masked_large_delta_sign_loss(
+                prediction,
+                target,
+                negative_mask,
+                scale=scale,
+                margin=margin,
+                zero=zero,
+            )
+        )
+        weights.append(negative_weight)
+    if not parts:
+        return zero
+    return torch.stack(parts).sum() / prediction.new_tensor(sum(weights))
+
+
+def sign_balanced_direction_gate_cross_entropy(
+    direction_logits: torch.Tensor,
+    target_delta: torch.Tensor,
+    mask: torch.Tensor,
+    *,
+    positive_weight: float = 1.0,
+    negative_weight: float = 1.0,
+    zero: torch.Tensor,
+) -> torch.Tensor:
+    valid_mask = mask & (target_delta != 0)
+    if not valid_mask.any():
+        return zero
+    logits = direction_logits.reshape(-1, 2)
+    targets = (target_delta.reshape(-1) > 0).long()
+    valid = valid_mask.reshape(-1)
+    positive_mask = valid & (targets == 1)
+    negative_mask = valid & (targets == 0)
+    parts = []
+    weights = []
+    positive_weight = float(positive_weight)
+    negative_weight = float(negative_weight)
+    if positive_weight > 0.0 and positive_mask.any():
+        parts.append(positive_weight * F.cross_entropy(logits[positive_mask], targets[positive_mask]))
+        weights.append(positive_weight)
+    if negative_weight > 0.0 and negative_mask.any():
+        parts.append(negative_weight * F.cross_entropy(logits[negative_mask], targets[negative_mask]))
+        weights.append(negative_weight)
+    if not parts:
+        return zero
+    return torch.stack(parts).sum() / direction_logits.new_tensor(sum(weights))
+
+
+def sign_specific_magnitude_loss(
+    outputs: dict[str, torch.Tensor],
+    target_delta: torch.Tensor,
+    mask: torch.Tensor,
+    *,
+    beta: float,
+    scale: float,
+    opposite_weight: float = 0.0,
+    positive_weight: float = 1.0,
+    negative_weight: float = 1.0,
+    zero: torch.Tensor,
+) -> torch.Tensor:
+    pos_magnitude = outputs.get('force_interface_delta_pos_magnitude')
+    neg_magnitude = outputs.get('force_interface_delta_neg_magnitude')
+    if pos_magnitude is None or neg_magnitude is None:
+        raise RuntimeError(
+            'Sign-specific magnitude loss requires force_interface_delta_pos_magnitude and '
+            'force_interface_delta_neg_magnitude outputs. Use policy.head_type=state_residual_sign_specific.'
+        )
+    if scale <= 0.0:
+        raise ValueError(f'direction magnitude scale must be positive, got {scale}.')
+
+    pos_magnitude = pos_magnitude.reshape(-1)
+    neg_magnitude = neg_magnitude.reshape(-1)
+    flat_delta = target_delta.reshape(-1)
+    flat_mask = mask.reshape(-1)
+    target_magnitude = torch.abs(flat_delta) / float(scale)
+    zero_magnitude = torch.zeros_like(target_magnitude)
+
+    positive_mask = flat_mask & (flat_delta > 0)
+    negative_mask = flat_mask & (flat_delta < 0)
+    parts = []
+    weights = []
+    positive_weight = float(positive_weight)
+    negative_weight = float(negative_weight)
+    opposite_weight = float(opposite_weight)
+
+    if positive_weight > 0.0 and positive_mask.any():
+        active_loss = F.smooth_l1_loss(
+            pos_magnitude[positive_mask],
+            target_magnitude[positive_mask],
+            beta=beta,
+        )
+        opposite_loss = (
+            F.smooth_l1_loss(
+                neg_magnitude[positive_mask],
+                zero_magnitude[positive_mask],
+                beta=beta,
+            )
+            if opposite_weight > 0.0
+            else zero
+        )
+        parts.append(positive_weight * (active_loss + opposite_weight * opposite_loss))
+        weights.append(positive_weight)
+
+    if negative_weight > 0.0 and negative_mask.any():
+        active_loss = F.smooth_l1_loss(
+            neg_magnitude[negative_mask],
+            target_magnitude[negative_mask],
+            beta=beta,
+        )
+        opposite_loss = (
+            F.smooth_l1_loss(
+                pos_magnitude[negative_mask],
+                zero_magnitude[negative_mask],
+                beta=beta,
+            )
+            if opposite_weight > 0.0
+            else zero
+        )
+        parts.append(negative_weight * (active_loss + opposite_weight * opposite_loss))
+        weights.append(negative_weight)
+
+    if not parts:
+        return zero
+    return torch.stack(parts).sum() / pos_magnitude.new_tensor(sum(weights))
+
+
+def residual_direction_logits(outputs: dict[str, torch.Tensor]) -> torch.Tensor | None:
+    neg = outputs.get('residual_direction_logit_neg')
+    pos = outputs.get('residual_direction_logit_pos')
+    if neg is None or pos is None:
+        return None
+    return torch.stack([neg.reshape(-1), pos.reshape(-1)], dim=-1)
+
+
 
 def masked_mean(values: torch.Tensor, mask: torch.Tensor, *, zero: torch.Tensor) -> torch.Tensor:
     if not mask.any():
         return zero
     return values[mask].mean()
+
+
+def compute_physical_attribute_loss(
+    outputs: dict[str, torch.Tensor],
+    batch: dict[str, torch.Tensor],
+    *,
+    config: dict[str, Any] | None,
+    zero: torch.Tensor,
+) -> dict[str, torch.Tensor]:
+    config = config if isinstance(config, dict) else {}
+    required_outputs = (
+        'sample_dry_mass_g_normalized_pred',
+        'sample_capacity_ratio_normalized_pred',
+        'sample_is_open_container_logit',
+    )
+    missing = [key for key in required_outputs if key not in outputs]
+    if missing:
+        raise RuntimeError(
+            'Physical attribute loss is enabled, but model outputs are missing: '
+            + ', '.join(missing)
+            + ". Set model.physical_attributes.enabled=true for this stage."
+        )
+
+    beta = float(config.get('huber_beta', 1.0))
+    weights = config.get('weights', {}) if isinstance(config.get('weights', {}), dict) else {}
+    dry_weight = float(weights.get('dry_mass', config.get('dry_mass_weight', 0.2)))
+    capacity_weight = float(weights.get('capacity_ratio', config.get('capacity_ratio_weight', 0.2)))
+    open_weight = float(weights.get('is_open_container', config.get('is_open_container_weight', 0.2)))
+
+    dry_pred = outputs['sample_dry_mass_g_normalized_pred'].reshape(-1)
+    dry_target = batch['dry_mass_g_normalized'].to(device=dry_pred.device, dtype=dry_pred.dtype).reshape(-1)
+    dry_loss = F.smooth_l1_loss(dry_pred, dry_target, beta=beta) if dry_weight > 0.0 else zero
+
+    capacity_pred = outputs['sample_capacity_ratio_normalized_pred'].reshape(-1)
+    capacity_target = batch['capacity_ratio_normalized'].to(device=capacity_pred.device, dtype=capacity_pred.dtype).reshape(-1)
+    capacity_mask = batch['capacity_valid_mask'].to(device=capacity_pred.device).reshape(-1).bool()
+    capacity_loss = (
+        masked_smooth_l1(capacity_pred, capacity_target, capacity_mask, beta=beta, zero=zero)
+        if capacity_weight > 0.0
+        else zero
+    )
+
+    open_logits = outputs['sample_is_open_container_logit'].reshape(-1)
+    open_target = batch['is_open_container'].to(device=open_logits.device, dtype=open_logits.dtype).reshape(-1)
+    open_loss = F.binary_cross_entropy_with_logits(open_logits, open_target) if open_weight > 0.0 else zero
+
+    return {
+        'physical_dry_mass': dry_loss,
+        'physical_capacity_ratio': capacity_loss,
+        'physical_is_open_container': open_loss,
+        'physical': dry_weight * dry_loss + capacity_weight * capacity_loss + open_weight * open_loss,
+    }
 
 
 
@@ -132,6 +449,57 @@ def compute_policy_loss(
         interface_bias_margin = float(policy_config.get('interface_bias_margin', 0.0))
         beta = float(policy_config.get('beta', 1.0))
         delta_normalization_scale = float(policy_config.get('delta_normalization_scale', 1.0))
+        residual_large_delta_weight = float(policy_config.get('residual_large_delta_weight', 0.0))
+        large_delta_threshold = float(policy_config.get('large_delta_threshold', 0.0))
+        large_delta_weight_alpha = float(policy_config.get('large_delta_weight_alpha', 0.0))
+        large_delta_weight_cap = float(policy_config.get('large_delta_weight_cap', 4.0))
+        residual_large_delta_sign_weight = float(policy_config.get('residual_large_delta_sign_weight', 0.0))
+        large_delta_sign_margin = float(policy_config.get('large_delta_sign_margin', 0.0))
+        sign_balanced_large_delta = bool(policy_config.get('sign_balanced_large_delta', False))
+        large_delta_pos_loss_weight = float(policy_config.get('large_delta_pos_loss_weight', 1.0))
+        large_delta_neg_loss_weight = float(policy_config.get('large_delta_neg_loss_weight', 1.0))
+        residual_direction_large_delta_sign_weight = float(
+            policy_config.get(
+                'residual_direction_large_delta_sign_weight',
+                policy_config.get('direction_gate_large_delta_sign_weight', 0.0),
+            )
+        )
+        direction_gate_pos_loss_weight = float(
+            policy_config.get('direction_gate_pos_loss_weight', large_delta_pos_loss_weight)
+        )
+        direction_gate_neg_loss_weight = float(
+            policy_config.get('direction_gate_neg_loss_weight', large_delta_neg_loss_weight)
+        )
+        residual_sign_magnitude_weight = float(
+            policy_config.get(
+                'residual_sign_magnitude_weight',
+                policy_config.get('residual_direction_magnitude_weight', 0.0),
+            )
+        )
+        sign_magnitude_opposite_weight = float(
+            policy_config.get(
+                'sign_magnitude_opposite_weight',
+                policy_config.get('direction_magnitude_opposite_weight', 0.0),
+            )
+        )
+        sign_magnitude_scale = float(
+            policy_config.get(
+                'sign_magnitude_scale',
+                policy_config.get('direction_magnitude_scale', delta_normalization_scale),
+            )
+        )
+        sign_magnitude_beta = float(
+            policy_config.get(
+                'sign_magnitude_beta',
+                policy_config.get('direction_magnitude_beta', beta),
+            )
+        )
+        sign_magnitude_pos_loss_weight = float(
+            policy_config.get('sign_magnitude_pos_loss_weight', large_delta_pos_loss_weight)
+        )
+        sign_magnitude_neg_loss_weight = float(
+            policy_config.get('sign_magnitude_neg_loss_weight', large_delta_neg_loss_weight)
+        )
 
         if reference_targets is None or delta_targets is None:
             raise RuntimeError('Explicit reference-delta policy loss requires reference_targets and delta_targets.')
@@ -180,6 +548,84 @@ def compute_policy_loss(
                 interface_expert,
                 beta=beta,
                 scale=delta_normalization_scale,
+                zero=zero,
+            )
+        large_delta_mask = interface_expert & (torch.abs(delta_targets) >= large_delta_threshold)
+        if residual_large_delta_weight > 0.0:
+            large_delta_loss = (
+                sign_balanced_large_delta_loss(
+                    interface_delta,
+                    delta_targets,
+                    large_delta_mask,
+                    beta=beta,
+                    scale=delta_normalization_scale,
+                    weight_alpha=large_delta_weight_alpha,
+                    weight_cap=large_delta_weight_cap,
+                    positive_weight=large_delta_pos_loss_weight,
+                    negative_weight=large_delta_neg_loss_weight,
+                    zero=zero,
+                )
+                if sign_balanced_large_delta
+                else masked_weighted_scaled_smooth_l1(
+                    interface_delta,
+                    delta_targets,
+                    large_delta_mask,
+                    beta=beta,
+                    scale=delta_normalization_scale,
+                    weight_alpha=large_delta_weight_alpha,
+                    weight_cap=large_delta_weight_cap,
+                    zero=zero,
+                )
+            )
+            total = total + residual_large_delta_weight * large_delta_loss
+        if residual_large_delta_sign_weight > 0.0:
+            large_delta_sign_loss = (
+                sign_balanced_large_delta_sign_loss(
+                    interface_delta,
+                    delta_targets,
+                    large_delta_mask,
+                    scale=delta_normalization_scale,
+                    margin=large_delta_sign_margin,
+                    positive_weight=large_delta_pos_loss_weight,
+                    negative_weight=large_delta_neg_loss_weight,
+                    zero=zero,
+                )
+                if sign_balanced_large_delta
+                else masked_large_delta_sign_loss(
+                    interface_delta,
+                    delta_targets,
+                    large_delta_mask,
+                    scale=delta_normalization_scale,
+                    margin=large_delta_sign_margin,
+                    zero=zero,
+                )
+            )
+            total = total + residual_large_delta_sign_weight * large_delta_sign_loss
+        if residual_direction_large_delta_sign_weight > 0.0:
+            direction_logits = residual_direction_logits(outputs)
+            if direction_logits is None:
+                raise RuntimeError(
+                    'Direction-gate sign loss requires residual_direction_logit_neg and '
+                    'residual_direction_logit_pos outputs. Use policy.head_type=state_residual_sign_specific.'
+                )
+            total = total + residual_direction_large_delta_sign_weight * sign_balanced_direction_gate_cross_entropy(
+                direction_logits,
+                delta_targets,
+                large_delta_mask,
+                positive_weight=direction_gate_pos_loss_weight,
+                negative_weight=direction_gate_neg_loss_weight,
+                zero=zero,
+            )
+        if residual_sign_magnitude_weight > 0.0:
+            total = total + residual_sign_magnitude_weight * sign_specific_magnitude_loss(
+                outputs,
+                delta_targets,
+                large_delta_mask,
+                beta=sign_magnitude_beta,
+                scale=sign_magnitude_scale,
+                opposite_weight=sign_magnitude_opposite_weight,
+                positive_weight=sign_magnitude_pos_loss_weight,
+                negative_weight=sign_magnitude_neg_loss_weight,
                 zero=zero,
             )
         if residual_stable_zero_weight > 0.0:
@@ -237,6 +683,57 @@ def compute_policy_loss(
         beta = float(policy_config.get('beta', 1.0))
         detach_base_target = bool(policy_config.get('detach_base_target', True))
         delta_normalization_scale = float(policy_config.get('delta_normalization_scale', 1.0))
+        residual_large_delta_weight = float(policy_config.get('residual_large_delta_weight', 0.0))
+        large_delta_threshold = float(policy_config.get('large_delta_threshold', 0.0))
+        large_delta_weight_alpha = float(policy_config.get('large_delta_weight_alpha', 0.0))
+        large_delta_weight_cap = float(policy_config.get('large_delta_weight_cap', 4.0))
+        residual_large_delta_sign_weight = float(policy_config.get('residual_large_delta_sign_weight', 0.0))
+        large_delta_sign_margin = float(policy_config.get('large_delta_sign_margin', 0.0))
+        sign_balanced_large_delta = bool(policy_config.get('sign_balanced_large_delta', False))
+        large_delta_pos_loss_weight = float(policy_config.get('large_delta_pos_loss_weight', 1.0))
+        large_delta_neg_loss_weight = float(policy_config.get('large_delta_neg_loss_weight', 1.0))
+        residual_direction_large_delta_sign_weight = float(
+            policy_config.get(
+                'residual_direction_large_delta_sign_weight',
+                policy_config.get('direction_gate_large_delta_sign_weight', 0.0),
+            )
+        )
+        direction_gate_pos_loss_weight = float(
+            policy_config.get('direction_gate_pos_loss_weight', large_delta_pos_loss_weight)
+        )
+        direction_gate_neg_loss_weight = float(
+            policy_config.get('direction_gate_neg_loss_weight', large_delta_neg_loss_weight)
+        )
+        residual_sign_magnitude_weight = float(
+            policy_config.get(
+                'residual_sign_magnitude_weight',
+                policy_config.get('residual_direction_magnitude_weight', 0.0),
+            )
+        )
+        sign_magnitude_opposite_weight = float(
+            policy_config.get(
+                'sign_magnitude_opposite_weight',
+                policy_config.get('direction_magnitude_opposite_weight', 0.0),
+            )
+        )
+        sign_magnitude_scale = float(
+            policy_config.get(
+                'sign_magnitude_scale',
+                policy_config.get('direction_magnitude_scale', delta_normalization_scale),
+            )
+        )
+        sign_magnitude_beta = float(
+            policy_config.get(
+                'sign_magnitude_beta',
+                policy_config.get('direction_magnitude_beta', beta),
+            )
+        )
+        sign_magnitude_pos_loss_weight = float(
+            policy_config.get('sign_magnitude_pos_loss_weight', large_delta_pos_loss_weight)
+        )
+        sign_magnitude_neg_loss_weight = float(
+            policy_config.get('sign_magnitude_neg_loss_weight', large_delta_neg_loss_weight)
+        )
 
         if 'force_base' not in outputs or 'force_interface_delta' not in outputs:
             raise RuntimeError('Decomposed residual policy loss requires force_base and force_interface_delta outputs.')
@@ -284,6 +781,84 @@ def compute_policy_loss(
                 interface_expert,
                 beta=beta,
                 scale=delta_normalization_scale,
+                zero=zero,
+            )
+        large_delta_mask = interface_expert & (torch.abs(delta_target) >= large_delta_threshold)
+        if residual_large_delta_weight > 0.0:
+            large_delta_loss = (
+                sign_balanced_large_delta_loss(
+                    interface_delta,
+                    delta_target,
+                    large_delta_mask,
+                    beta=beta,
+                    scale=delta_normalization_scale,
+                    weight_alpha=large_delta_weight_alpha,
+                    weight_cap=large_delta_weight_cap,
+                    positive_weight=large_delta_pos_loss_weight,
+                    negative_weight=large_delta_neg_loss_weight,
+                    zero=zero,
+                )
+                if sign_balanced_large_delta
+                else masked_weighted_scaled_smooth_l1(
+                    interface_delta,
+                    delta_target,
+                    large_delta_mask,
+                    beta=beta,
+                    scale=delta_normalization_scale,
+                    weight_alpha=large_delta_weight_alpha,
+                    weight_cap=large_delta_weight_cap,
+                    zero=zero,
+                )
+            )
+            total = total + residual_large_delta_weight * large_delta_loss
+        if residual_large_delta_sign_weight > 0.0:
+            large_delta_sign_loss = (
+                sign_balanced_large_delta_sign_loss(
+                    interface_delta,
+                    delta_target,
+                    large_delta_mask,
+                    scale=delta_normalization_scale,
+                    margin=large_delta_sign_margin,
+                    positive_weight=large_delta_pos_loss_weight,
+                    negative_weight=large_delta_neg_loss_weight,
+                    zero=zero,
+                )
+                if sign_balanced_large_delta
+                else masked_large_delta_sign_loss(
+                    interface_delta,
+                    delta_target,
+                    large_delta_mask,
+                    scale=delta_normalization_scale,
+                    margin=large_delta_sign_margin,
+                    zero=zero,
+                )
+            )
+            total = total + residual_large_delta_sign_weight * large_delta_sign_loss
+        if residual_direction_large_delta_sign_weight > 0.0:
+            direction_logits = residual_direction_logits(outputs)
+            if direction_logits is None:
+                raise RuntimeError(
+                    'Direction-gate sign loss requires residual_direction_logit_neg and '
+                    'residual_direction_logit_pos outputs. Use policy.head_type=state_residual_sign_specific.'
+                )
+            total = total + residual_direction_large_delta_sign_weight * sign_balanced_direction_gate_cross_entropy(
+                direction_logits,
+                delta_target,
+                large_delta_mask,
+                positive_weight=direction_gate_pos_loss_weight,
+                negative_weight=direction_gate_neg_loss_weight,
+                zero=zero,
+            )
+        if residual_sign_magnitude_weight > 0.0:
+            total = total + residual_sign_magnitude_weight * sign_specific_magnitude_loss(
+                outputs,
+                delta_target,
+                large_delta_mask,
+                beta=sign_magnitude_beta,
+                scale=sign_magnitude_scale,
+                opposite_weight=sign_magnitude_opposite_weight,
+                positive_weight=sign_magnitude_pos_loss_weight,
+                negative_weight=sign_magnitude_neg_loss_weight,
                 zero=zero,
             )
         if residual_stable_zero_weight > 0.0:
@@ -363,6 +938,7 @@ def compute_losses(
     *,
     loss_weights: dict[str, float],
     attribute_loss_config: dict[str, Any] | None = None,
+    physical_loss_config: dict[str, Any] | None = None,
     policy_loss_config: dict[str, Any] | None,
     temperature_clip: float,
     temperature_inv: float,
@@ -391,6 +967,7 @@ def compute_losses(
     zero = medium_logits.new_tensor(0.0)
     med_weight = float(loss_weights.get('med', 0.0))
     attr_weight = float(loss_weights.get('attr', 0.0))
+    physical_weight = float(loss_weights.get('physical', 0.0))
     clip_weight = float(loss_weights.get('clip', 0.0))
     inv_weight = float(loss_weights.get('inv', 0.0))
     pol_weight = float(loss_weights.get('pol', 0.0))
@@ -501,6 +1078,21 @@ def compute_losses(
         losses['attr_window'] = zero
         losses['attr'] = zero
 
+    if physical_weight > 0.0:
+        losses.update(
+            compute_physical_attribute_loss(
+                outputs,
+                batch,
+                config=physical_loss_config,
+                zero=zero,
+            )
+        )
+    else:
+        losses['physical_dry_mass'] = zero
+        losses['physical_capacity_ratio'] = zero
+        losses['physical_is_open_container'] = zero
+        losses['physical'] = zero
+
     if clip_weight > 0.0:
         stable_valid = stable_mask.nonzero(as_tuple=False).flatten()
         losses['clip'] = info_nce_loss(outputs['z_v'][stable_valid], outputs['z_t'][stable_valid], temperature=temperature_clip)
@@ -555,6 +1147,7 @@ def compute_losses(
         + loss_weights.get('inv', 0.0) * losses['inv']
         + loss_weights.get('med', 0.0) * losses['med']
         + loss_weights.get('attr', 0.0) * losses['attr']
+        + loss_weights.get('physical', 0.0) * losses['physical']
         + loss_weights.get('pol', 0.0) * losses['pol']
     )
     losses['total'] = total

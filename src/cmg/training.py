@@ -22,6 +22,7 @@ from cmg.attribute_metrics import (
     flatten_window_metrics,
 )
 from cmg.losses import compute_losses
+from cmg.physical_metrics import PhysicalAttributeMetricAccumulator, flatten_physical_metrics
 
 try:
     from torch.utils.tensorboard import SummaryWriter
@@ -337,6 +338,10 @@ def run_model_epoch(
         'attr': 0.0,
         'attr_sample': 0.0,
         'attr_window': 0.0,
+        'physical': 0.0,
+        'physical_dry_mass': 0.0,
+        'physical_capacity_ratio': 0.0,
+        'physical_is_open_container': 0.0,
         'pol': 0.0,
     }
     phase_confusion = torch.zeros(3, 3, dtype=torch.long)
@@ -344,6 +349,8 @@ def run_model_epoch(
     attr_classes = attribute_class_counts(model_config)
     attr_window_metrics = AttributeWindowMetricAccumulator(attr_classes, attr_metric_tasks)
     attr_aggregation_metrics = AttributeAggregationAccumulator(attr_classes, attr_metric_tasks)
+    physical_stats = getattr(loader.dataset, 'physical_attribute_stats', None)
+    physical_metrics = PhysicalAttributeMetricAccumulator(physical_stats)
     overall_abs = 0.0
     overall_sq = 0.0
     overall_count = 0
@@ -370,6 +377,55 @@ def run_model_epoch(
     control_interface_hits_100 = 0
     control_interface_hits_200 = 0
     control_interface_hits_300 = 0
+    delta_interface_abs = 0.0
+    delta_interface_sq = 0.0
+    delta_interface_count = 0
+    delta_interface_signed_sum = 0.0
+    large_delta_interface_abs = 0.0
+    large_delta_interface_sq = 0.0
+    large_delta_interface_count = 0
+    large_delta_interface_signed_sum = 0.0
+    large_delta_interface_hits_100 = 0
+    large_delta_interface_hits_200 = 0
+    large_delta_interface_hits_300 = 0
+    large_delta_interface_wrong_sign = 0
+    large_delta_interface_pred_sum = 0.0
+    large_delta_interface_target_sum = 0.0
+    large_delta_pos_abs = 0.0
+    large_delta_pos_sq = 0.0
+    large_delta_pos_count = 0
+    large_delta_pos_signed_sum = 0.0
+    large_delta_pos_wrong_sign = 0
+    large_delta_pos_pred_sum = 0.0
+    large_delta_pos_target_sum = 0.0
+    large_delta_neg_abs = 0.0
+    large_delta_neg_sq = 0.0
+    large_delta_neg_count = 0
+    large_delta_neg_signed_sum = 0.0
+    large_delta_neg_wrong_sign = 0
+    large_delta_neg_pred_sum = 0.0
+    large_delta_neg_target_sum = 0.0
+    direction_gate_large_delta_correct = 0
+    direction_gate_large_delta_count = 0
+    direction_gate_large_delta_margin_sum = 0.0
+    direction_gate_pos_correct = 0
+    direction_gate_pos_count = 0
+    direction_gate_pos_margin_sum = 0.0
+    direction_gate_pos_prob_sum = 0.0
+    direction_gate_neg_correct = 0
+    direction_gate_neg_count = 0
+    direction_gate_neg_margin_sum = 0.0
+    direction_gate_neg_prob_sum = 0.0
+    direction_magnitude_pos_abs = 0.0
+    direction_magnitude_pos_count = 0
+    direction_magnitude_pos_active_sum = 0.0
+    direction_magnitude_pos_target_sum = 0.0
+    direction_magnitude_pos_opposite_sum = 0.0
+    direction_magnitude_neg_abs = 0.0
+    direction_magnitude_neg_count = 0
+    direction_magnitude_neg_active_sum = 0.0
+    direction_magnitude_neg_target_sum = 0.0
+    direction_magnitude_neg_opposite_sum = 0.0
     stable_leakage_values: list[torch.Tensor] = []
     gate_abs_sum = 0.0
     gate_count = 0
@@ -379,6 +435,16 @@ def run_model_epoch(
     gate_interface_count = 0
     gate_smoothness_sum = 0.0
     gate_smoothness_count = 0
+    policy_loss_config = stage_config.get('policy_loss', {})
+    policy_loss_config = policy_loss_config if isinstance(policy_loss_config, dict) else {}
+    large_delta_threshold = float(policy_loss_config.get('large_delta_threshold', 100.0))
+    delta_normalization_scale = float(policy_loss_config.get('delta_normalization_scale', 100.0))
+    direction_magnitude_scale = float(
+        policy_loss_config.get(
+            'sign_magnitude_scale',
+            policy_loss_config.get('direction_magnitude_scale', delta_normalization_scale),
+        )
+    )
     iterator = tqdm(loader, desc=mode, leave=False)
     for batch in iterator:
         batch = move_to_device(batch, device)
@@ -392,6 +458,7 @@ def run_model_epoch(
                     batch,
                     loss_weights=stage_config.get('loss_weights', {}),
                     attribute_loss_config=stage_config.get('attribute_loss'),
+                    physical_loss_config=stage_config.get('physical_loss'),
                     policy_loss_config=stage_config.get('policy_loss'),
                     temperature_clip=float(model_config['losses']['temperature_clip']),
                     temperature_inv=float(model_config['losses']['temperature_inv']),
@@ -419,10 +486,21 @@ def run_model_epoch(
 
         attr_window_metrics.update(outputs, batch)
         attr_aggregation_metrics.update(outputs, batch)
+        physical_metrics.update(outputs, batch)
 
         force_pred = outputs['force_pred'].reshape_as(batch['expert_forces'])
         force_delta = outputs.get('force_interface_delta')
         interface_gate = outputs.get('interface_gate')
+        direction_prob_pos = outputs.get('residual_direction_prob_pos')
+        direction_prob_neg = outputs.get('residual_direction_prob_neg')
+        if direction_prob_pos is not None and direction_prob_neg is not None:
+            direction_prob_pos = direction_prob_pos.reshape_as(batch['expert_forces'])
+            direction_prob_neg = direction_prob_neg.reshape_as(batch['expert_forces'])
+        direction_pos_magnitude = outputs.get('force_interface_delta_pos_magnitude')
+        direction_neg_magnitude = outputs.get('force_interface_delta_neg_magnitude')
+        if direction_pos_magnitude is not None and direction_neg_magnitude is not None:
+            direction_pos_magnitude = direction_pos_magnitude.reshape_as(batch['expert_forces'])
+            direction_neg_magnitude = direction_neg_magnitude.reshape_as(batch['expert_forces'])
         if force_delta is not None and interface_gate is not None:
             force_delta = force_delta.reshape_as(batch['expert_forces'])
             interface_gate = interface_gate.reshape_as(batch['expert_forces'])
@@ -509,6 +587,127 @@ def run_model_epoch(
                 control_interface_hits_100 += int((abs_control_interface_error <= 100.0).sum().item())
                 control_interface_hits_200 += int((abs_control_interface_error <= 200.0).sum().item())
                 control_interface_hits_300 += int((abs_control_interface_error <= 300.0).sum().item())
+                if force_delta is not None and 'delta_force_targets' in batch:
+                    pred_delta_interface = force_delta[interface_control_mask]
+                    target_delta_interface = batch['delta_force_targets'][interface_control_mask]
+                    delta_error = pred_delta_interface - target_delta_interface
+                    abs_delta_error = torch.abs(delta_error)
+                    delta_interface_abs += float(abs_delta_error.sum().item())
+                    delta_interface_sq += float((delta_error ** 2).sum().item())
+                    delta_interface_count += int(delta_error.numel())
+                    delta_interface_signed_sum += float(delta_error.sum().item())
+
+                    large_delta_mask = torch.abs(target_delta_interface) >= large_delta_threshold
+                    if large_delta_mask.any():
+                        large_delta_pred = pred_delta_interface[large_delta_mask]
+                        large_delta_target = target_delta_interface[large_delta_mask]
+                        large_delta_error = delta_error[large_delta_mask]
+                        abs_large_delta_error = torch.abs(large_delta_error)
+                        large_delta_interface_abs += float(abs_large_delta_error.sum().item())
+                        large_delta_interface_sq += float((large_delta_error ** 2).sum().item())
+                        large_delta_interface_count += int(large_delta_error.numel())
+                        large_delta_interface_signed_sum += float(large_delta_error.sum().item())
+                        large_delta_interface_hits_100 += int((abs_large_delta_error <= 100.0).sum().item())
+                        large_delta_interface_hits_200 += int((abs_large_delta_error <= 200.0).sum().item())
+                        large_delta_interface_hits_300 += int((abs_large_delta_error <= 300.0).sum().item())
+                        large_delta_interface_wrong_sign += int((large_delta_pred * large_delta_target < 0.0).sum().item())
+                        large_delta_interface_pred_sum += float(large_delta_pred.sum().item())
+                        large_delta_interface_target_sum += float(large_delta_target.sum().item())
+                        if direction_prob_pos is not None and direction_prob_neg is not None:
+                            direction_pos_interface = direction_prob_pos[interface_control_mask]
+                            direction_neg_interface = direction_prob_neg[interface_control_mask]
+                            large_delta_direction_pos = direction_pos_interface[large_delta_mask]
+                            large_delta_direction_neg = direction_neg_interface[large_delta_mask]
+                            direction_target_pos = large_delta_target > 0.0
+                            direction_pred_pos = large_delta_direction_pos >= large_delta_direction_neg
+                            direction_gate_large_delta_correct += int((direction_pred_pos == direction_target_pos).sum().item())
+                            direction_gate_large_delta_count += int(large_delta_target.numel())
+                            direction_margin = torch.where(
+                                direction_target_pos,
+                                large_delta_direction_pos - large_delta_direction_neg,
+                                large_delta_direction_neg - large_delta_direction_pos,
+                            )
+                            direction_gate_large_delta_margin_sum += float(direction_margin.sum().item())
+
+                            if direction_target_pos.any():
+                                pos_direction_pred = direction_pred_pos[direction_target_pos]
+                                pos_direction_margin = direction_margin[direction_target_pos]
+                                pos_direction_prob = large_delta_direction_pos[direction_target_pos]
+                                direction_gate_pos_correct += int(pos_direction_pred.sum().item())
+                                direction_gate_pos_count += int(direction_target_pos.sum().item())
+                                direction_gate_pos_margin_sum += float(pos_direction_margin.sum().item())
+                                direction_gate_pos_prob_sum += float(pos_direction_prob.sum().item())
+
+                            direction_target_neg = large_delta_target < 0.0
+                            if direction_target_neg.any():
+                                neg_direction_pred_is_neg = ~direction_pred_pos[direction_target_neg]
+                                neg_direction_margin = direction_margin[direction_target_neg]
+                                neg_direction_prob = large_delta_direction_neg[direction_target_neg]
+                                direction_gate_neg_correct += int(neg_direction_pred_is_neg.sum().item())
+                                direction_gate_neg_count += int(direction_target_neg.sum().item())
+                                direction_gate_neg_margin_sum += float(neg_direction_margin.sum().item())
+                                direction_gate_neg_prob_sum += float(neg_direction_prob.sum().item())
+
+                        if direction_pos_magnitude is not None and direction_neg_magnitude is not None:
+                            magnitude_pos_interface = direction_pos_magnitude[interface_control_mask]
+                            magnitude_neg_interface = direction_neg_magnitude[interface_control_mask]
+                            large_delta_magnitude_pos = magnitude_pos_interface[large_delta_mask]
+                            large_delta_magnitude_neg = magnitude_neg_interface[large_delta_mask]
+                            target_magnitude = torch.abs(large_delta_target) / direction_magnitude_scale
+
+                            magnitude_target_pos = large_delta_target > 0.0
+                            if magnitude_target_pos.any():
+                                pos_active = large_delta_magnitude_pos[magnitude_target_pos]
+                                pos_target_magnitude = target_magnitude[magnitude_target_pos]
+                                pos_opposite = large_delta_magnitude_neg[magnitude_target_pos]
+                                direction_magnitude_pos_abs += float(
+                                    torch.abs(pos_active - pos_target_magnitude).sum().item()
+                                )
+                                direction_magnitude_pos_count += int(magnitude_target_pos.sum().item())
+                                direction_magnitude_pos_active_sum += float(pos_active.sum().item())
+                                direction_magnitude_pos_target_sum += float(pos_target_magnitude.sum().item())
+                                direction_magnitude_pos_opposite_sum += float(pos_opposite.sum().item())
+
+                            magnitude_target_neg = large_delta_target < 0.0
+                            if magnitude_target_neg.any():
+                                neg_active = large_delta_magnitude_neg[magnitude_target_neg]
+                                neg_target_magnitude = target_magnitude[magnitude_target_neg]
+                                neg_opposite = large_delta_magnitude_pos[magnitude_target_neg]
+                                direction_magnitude_neg_abs += float(
+                                    torch.abs(neg_active - neg_target_magnitude).sum().item()
+                                )
+                                direction_magnitude_neg_count += int(magnitude_target_neg.sum().item())
+                                direction_magnitude_neg_active_sum += float(neg_active.sum().item())
+                                direction_magnitude_neg_target_sum += float(neg_target_magnitude.sum().item())
+                                direction_magnitude_neg_opposite_sum += float(neg_opposite.sum().item())
+
+                        pos_large_delta_mask = large_delta_mask & (target_delta_interface > 0.0)
+                        if pos_large_delta_mask.any():
+                            pos_pred = pred_delta_interface[pos_large_delta_mask]
+                            pos_target = target_delta_interface[pos_large_delta_mask]
+                            pos_error = delta_error[pos_large_delta_mask]
+                            abs_pos_error = torch.abs(pos_error)
+                            large_delta_pos_abs += float(abs_pos_error.sum().item())
+                            large_delta_pos_sq += float((pos_error ** 2).sum().item())
+                            large_delta_pos_count += int(pos_error.numel())
+                            large_delta_pos_signed_sum += float(pos_error.sum().item())
+                            large_delta_pos_wrong_sign += int((pos_pred * pos_target < 0.0).sum().item())
+                            large_delta_pos_pred_sum += float(pos_pred.sum().item())
+                            large_delta_pos_target_sum += float(pos_target.sum().item())
+
+                        neg_large_delta_mask = large_delta_mask & (target_delta_interface < 0.0)
+                        if neg_large_delta_mask.any():
+                            neg_pred = pred_delta_interface[neg_large_delta_mask]
+                            neg_target = target_delta_interface[neg_large_delta_mask]
+                            neg_error = delta_error[neg_large_delta_mask]
+                            abs_neg_error = torch.abs(neg_error)
+                            large_delta_neg_abs += float(abs_neg_error.sum().item())
+                            large_delta_neg_sq += float((neg_error ** 2).sum().item())
+                            large_delta_neg_count += int(neg_error.numel())
+                            large_delta_neg_signed_sum += float(neg_error.sum().item())
+                            large_delta_neg_wrong_sign += int((neg_pred * neg_target < 0.0).sum().item())
+                            large_delta_neg_pred_sum += float(neg_pred.sum().item())
+                            large_delta_neg_target_sum += float(neg_target.sum().item())
 
     denom = max(1, len(loader))
     if stable_leakage_values:
@@ -520,6 +719,7 @@ def run_model_epoch(
         stable_leakage_p95 = 0.0
     attribute_window_diagnostics = attr_window_metrics.finalize()
     attribute_aggregation = attr_aggregation_metrics.finalize()
+    physical_attribute_metrics = physical_metrics.finalize()
     all_window_attr = attribute_window_diagnostics['all_windows']
     stable_water_air_sample_attr = attribute_aggregation['sample_aggregation']['stable_water_air']['mean_logits']
     model_pool_sample_attr = attribute_aggregation['sample_model_pool']
@@ -553,6 +753,10 @@ def run_model_epoch(
         'loss_attr': loss_sums['attr'] / denom,
         'loss_attr_sample': loss_sums['attr_sample'] / denom,
         'loss_attr_window': loss_sums['attr_window'] / denom,
+        'loss_physical': loss_sums['physical'] / denom,
+        'loss_physical_dry_mass': loss_sums['physical_dry_mass'] / denom,
+        'loss_physical_capacity_ratio': loss_sums['physical_capacity_ratio'] / denom,
+        'loss_physical_is_open_container': loss_sums['physical_is_open_container'] / denom,
         'loss_pol': loss_sums['pol'] / denom,
         'contrastive_loss_sum': (loss_sums['clip'] + loss_sums['inv']) / denom,
         'medium_accuracy': accuracy_from_confusion(phase_confusion),
@@ -592,6 +796,51 @@ def run_model_epoch(
         'control_interface_hit_rate_100': control_interface_hits_100 / max(1, control_interface_count),
         'control_interface_hit_rate_200': control_interface_hits_200 / max(1, control_interface_count),
         'control_interface_hit_rate_300': control_interface_hits_300 / max(1, control_interface_count),
+        'delta_interface_mae': delta_interface_abs / max(1, delta_interface_count),
+        'delta_interface_mse': delta_interface_sq / max(1, delta_interface_count),
+        'delta_interface_bias': delta_interface_signed_sum / max(1, delta_interface_count),
+        'large_delta_threshold': large_delta_threshold,
+        'large_delta_interface_count': large_delta_interface_count,
+        'large_delta_interface_mae': large_delta_interface_abs / max(1, large_delta_interface_count),
+        'large_delta_interface_mse': large_delta_interface_sq / max(1, large_delta_interface_count),
+        'large_delta_interface_bias': large_delta_interface_signed_sum / max(1, large_delta_interface_count),
+        'large_delta_interface_hit_rate_100': large_delta_interface_hits_100 / max(1, large_delta_interface_count),
+        'large_delta_interface_hit_rate_200': large_delta_interface_hits_200 / max(1, large_delta_interface_count),
+        'large_delta_interface_hit_rate_300': large_delta_interface_hits_300 / max(1, large_delta_interface_count),
+        'large_delta_wrong_sign_rate': large_delta_interface_wrong_sign / max(1, large_delta_interface_count),
+        'large_delta_pred_mean': large_delta_interface_pred_sum / max(1, large_delta_interface_count),
+        'large_delta_target_mean': large_delta_interface_target_sum / max(1, large_delta_interface_count),
+        'large_delta_pos_count': large_delta_pos_count,
+        'large_delta_pos_mae': large_delta_pos_abs / max(1, large_delta_pos_count),
+        'large_delta_pos_mse': large_delta_pos_sq / max(1, large_delta_pos_count),
+        'large_delta_pos_bias': large_delta_pos_signed_sum / max(1, large_delta_pos_count),
+        'large_delta_pos_wrong_sign_rate': large_delta_pos_wrong_sign / max(1, large_delta_pos_count),
+        'large_delta_pos_pred_mean': large_delta_pos_pred_sum / max(1, large_delta_pos_count),
+        'large_delta_pos_target_mean': large_delta_pos_target_sum / max(1, large_delta_pos_count),
+        'large_delta_neg_count': large_delta_neg_count,
+        'large_delta_neg_mae': large_delta_neg_abs / max(1, large_delta_neg_count),
+        'large_delta_neg_mse': large_delta_neg_sq / max(1, large_delta_neg_count),
+        'large_delta_neg_bias': large_delta_neg_signed_sum / max(1, large_delta_neg_count),
+        'large_delta_neg_wrong_sign_rate': large_delta_neg_wrong_sign / max(1, large_delta_neg_count),
+        'large_delta_neg_pred_mean': large_delta_neg_pred_sum / max(1, large_delta_neg_count),
+        'large_delta_neg_target_mean': large_delta_neg_target_sum / max(1, large_delta_neg_count),
+        'direction_gate_large_delta_acc': direction_gate_large_delta_correct / max(1, direction_gate_large_delta_count),
+        'direction_gate_large_delta_margin': direction_gate_large_delta_margin_sum / max(1, direction_gate_large_delta_count),
+        'direction_gate_pos_acc': direction_gate_pos_correct / max(1, direction_gate_pos_count),
+        'direction_gate_pos_margin': direction_gate_pos_margin_sum / max(1, direction_gate_pos_count),
+        'direction_gate_pos_prob_mean': direction_gate_pos_prob_sum / max(1, direction_gate_pos_count),
+        'direction_gate_neg_acc': direction_gate_neg_correct / max(1, direction_gate_neg_count),
+        'direction_gate_neg_margin': direction_gate_neg_margin_sum / max(1, direction_gate_neg_count),
+        'direction_gate_neg_prob_mean': direction_gate_neg_prob_sum / max(1, direction_gate_neg_count),
+        'direction_magnitude_scale': direction_magnitude_scale,
+        'direction_magnitude_pos_mae': direction_magnitude_pos_abs / max(1, direction_magnitude_pos_count),
+        'direction_magnitude_pos_active_mean': direction_magnitude_pos_active_sum / max(1, direction_magnitude_pos_count),
+        'direction_magnitude_pos_target_mean': direction_magnitude_pos_target_sum / max(1, direction_magnitude_pos_count),
+        'direction_magnitude_pos_opposite_mean': direction_magnitude_pos_opposite_sum / max(1, direction_magnitude_pos_count),
+        'direction_magnitude_neg_mae': direction_magnitude_neg_abs / max(1, direction_magnitude_neg_count),
+        'direction_magnitude_neg_active_mean': direction_magnitude_neg_active_sum / max(1, direction_magnitude_neg_count),
+        'direction_magnitude_neg_target_mean': direction_magnitude_neg_target_sum / max(1, direction_magnitude_neg_count),
+        'direction_magnitude_neg_opposite_mean': direction_magnitude_neg_opposite_sum / max(1, direction_magnitude_neg_count),
         'stable_leakage_mean': stable_leakage_mean,
         'stable_leakage_p95': stable_leakage_p95,
         'gate_mae': gate_abs_sum / max(1, gate_count),
@@ -608,9 +857,35 @@ def run_model_epoch(
         'attribute_object_aggregation': attribute_aggregation['object_aggregation'],
         'attribute_sample_model_pool': attribute_aggregation['sample_model_pool'],
         'attribute_object_model_pool': attribute_aggregation['object_model_pool'],
+        'physical_attribute_metrics': physical_attribute_metrics,
     }
+    large_delta_pos_present = large_delta_pos_count > 0
+    large_delta_neg_present = large_delta_neg_count > 0
+    large_delta_balance_denominator = max(1, int(large_delta_pos_present) + int(large_delta_neg_present))
+    metrics['large_delta_balanced_mae'] = (
+        (metrics['large_delta_pos_mae'] if large_delta_pos_present else 0.0)
+        + (metrics['large_delta_neg_mae'] if large_delta_neg_present else 0.0)
+    ) / large_delta_balance_denominator
+    metrics['large_delta_balanced_wrong_sign_rate'] = (
+        (metrics['large_delta_pos_wrong_sign_rate'] if large_delta_pos_present else 0.0)
+        + (metrics['large_delta_neg_wrong_sign_rate'] if large_delta_neg_present else 0.0)
+    ) / large_delta_balance_denominator
+    metrics['large_delta_pos_neg_mae_gap'] = (
+        abs(metrics['large_delta_pos_mae'] - metrics['large_delta_neg_mae'])
+        if large_delta_pos_present and large_delta_neg_present
+        else 0.0
+    )
+    metrics['large_delta_pos_neg_wrong_sign_gap'] = (
+        abs(metrics['large_delta_pos_wrong_sign_rate'] - metrics['large_delta_neg_wrong_sign_rate'])
+        if large_delta_pos_present and large_delta_neg_present
+        else 0.0
+    )
+    metrics['large_delta_balanced_score'] = (
+        metrics['large_delta_balanced_mae'] + 100.0 * metrics['large_delta_balanced_wrong_sign_rate']
+    )
     metrics.update(flatten_window_metrics(attribute_window_diagnostics))
     metrics.update(flatten_aggregation_metrics(attribute_aggregation))
+    metrics.update(flatten_physical_metrics(physical_attribute_metrics))
     return metrics
 
 

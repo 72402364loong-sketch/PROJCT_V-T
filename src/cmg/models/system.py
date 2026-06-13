@@ -9,6 +9,7 @@ from .modules import (
     MediumBeliefHead,
     MultiAttributeHead,
     PhaseAwareGateStabilizer,
+    PhysicalAttributeHead,
     PolicyHead,
     TactileContentEncoder,
     TactileEvidenceEncoder,
@@ -22,15 +23,25 @@ class CrossMediumSystem(nn.Module):
         visual_config = model_config['visual']
         tactile_config = model_config['tactile']
         attribute_config = model_config['attributes']
+        physical_attribute_config = model_config.get('physical_attributes', {})
+        if not isinstance(physical_attribute_config, dict):
+            physical_attribute_config = {}
         medium_config = model_config['medium']
         policy_config = model_config['policy']
         proj_dim = int(visual_config['proj_dim'])
         self.visual_proj_dim = proj_dim
         visual_hidden_dim = int(visual_config.get('hidden_dim', visual_config.get('token_dim', proj_dim)))
         self.stop_gradient = bool(attribute_config.get('stop_gradient', True))
+        self.physical_attributes_enabled = bool(physical_attribute_config.get('enabled', False))
         self.policy_base_source = str(policy_config.get('base_source', 'learned')).strip().lower()
         self.policy_gate_source = str(policy_config.get('gate_source', 'medium_prob')).strip().lower()
         self.use_interface_context = bool(policy_config.get('use_interface_context', False))
+        self.use_reference_force_context = bool(policy_config.get('use_reference_force_context', False))
+        self.reference_force_context_scale = float(policy_config.get('reference_force_context_scale', 100.0))
+        if self.reference_force_context_scale <= 0.0:
+            raise RuntimeError(
+                f"policy.reference_force_context_scale must be positive, got {self.reference_force_context_scale}."
+            )
         self.tactile = SimpleNamespace(
             input_dim=int(tactile_config['input_dim']),
             num_taxels=int(tactile_config.get('num_taxels', 12)),
@@ -75,16 +86,29 @@ class CrossMediumSystem(nn.Module):
             geometry_classes=int(attribute_config.get('geometry_classes', 4)),
             surface_classes=int(attribute_config.get('surface_classes', 2)),
         )
+        self.physical_attribute_head = (
+            PhysicalAttributeHead(
+                input_dim=attribute_input_dim,
+                hidden_dim=int(physical_attribute_config.get('hidden_dim', attribute_config['hidden_dim'])),
+                dropout=float(physical_attribute_config.get('dropout', 0.0)),
+            )
+            if self.physical_attributes_enabled
+            else None
+        )
         policy_input_dim = (
             visual_hidden_dim
             + int(tactile_config['content_hidden_dim'])
             + int(attribute_config['object_feature_dim'])
         )
-        policy_context_dim = (
-            visual_hidden_dim
-            + int(tactile_config['content_hidden_dim'])
-            + int(tactile_config['evidence_hidden_dim'])
-        ) if self.use_interface_context else 0
+        policy_context_dim = 0
+        if self.use_interface_context:
+            policy_context_dim += (
+                visual_hidden_dim
+                + int(tactile_config['content_hidden_dim'])
+                + int(tactile_config['evidence_hidden_dim'])
+            )
+        if self.use_reference_force_context:
+            policy_context_dim += 1
         policy_state_dim = int(tactile_config['evidence_hidden_dim']) + int(medium_config['hidden_dim']) + 3
         self.policy_head = PolicyHead(
             input_dim=policy_input_dim,
@@ -94,6 +118,7 @@ class CrossMediumSystem(nn.Module):
             state_input_dim=policy_state_dim,
             context_input_dim=policy_context_dim,
             context_scale_init=float(policy_config.get('context_scale_init', 0.0)),
+            residual_output_scale=float(policy_config.get('residual_output_scale', 1.0)),
         )
 
     @staticmethod
@@ -144,10 +169,18 @@ class CrossMediumSystem(nn.Module):
         h_v: torch.Tensor,
         z_content: torch.Tensor,
         batch: dict[str, torch.Tensor] | None = None,
-    ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor] | None, torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    ) -> tuple[
+        dict[str, torch.Tensor],
+        dict[str, torch.Tensor] | None,
+        dict[str, torch.Tensor] | None,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor | None,
+    ]:
         attribute_inputs = torch.cat([h_v, z_content], dim=-1)
         attribute_outputs = self.attribute_head(attribute_inputs)
         sample_attribute_outputs = None
+        sample_physical_attribute_outputs = None
         sample_attribute_pool_mask = None
         if batch is not None:
             batch_size, max_windows = batch['window_mask'].shape
@@ -157,10 +190,19 @@ class CrossMediumSystem(nn.Module):
                 sample_attribute_pool_mask,
             )
             sample_attribute_outputs = self.attribute_head(pooled_attribute_inputs)
+            if self.physical_attribute_head is not None:
+                sample_physical_attribute_outputs = self.physical_attribute_head(pooled_attribute_inputs)
         g_obj_context = attribute_outputs['g_obj_context'].detach() if self.stop_gradient else attribute_outputs['g_obj_context']
         g_obj = self.attribute_head.object_projection(g_obj_context)
         task_context = torch.cat([h_v, z_content, g_obj], dim=-1)
-        return attribute_outputs, sample_attribute_outputs, g_obj, task_context, sample_attribute_pool_mask
+        return (
+            attribute_outputs,
+            sample_attribute_outputs,
+            sample_physical_attribute_outputs,
+            g_obj,
+            task_context,
+            sample_attribute_pool_mask,
+        )
 
     @staticmethod
     def _pool_interface_context(
@@ -200,6 +242,7 @@ class CrossMediumSystem(nn.Module):
         flat_medium_features = medium_sequence_features.reshape(batch_size * max_windows, -1)
         state_context = torch.cat([z_med_window, flat_medium_features, flat_medium], dim=-1)
         residual_context = None
+        residual_context_parts: list[torch.Tensor] = []
         pooled_context = None
         if self.use_interface_context:
             context_mask = batch.get('context_window_mask')
@@ -215,9 +258,35 @@ class CrossMediumSystem(nn.Module):
             )
             effective_context_mask = context_mask.bool() & batch['window_mask'].bool()
             pooled_context = self._pool_interface_context(context_features, effective_context_mask)
-            residual_context = pooled_context[:, None, :].expand(-1, max_windows, -1).reshape(batch_size * max_windows, -1)
+            residual_context_parts.append(
+                pooled_context[:, None, :].expand(-1, max_windows, -1).reshape(batch_size * max_windows, -1)
+            )
+        if self.use_reference_force_context:
+            reference_force = batch.get('reference_forces')
+            if reference_force is None:
+                reference_context = torch.zeros(
+                    batch_size,
+                    max_windows,
+                    1,
+                    device=flat_medium.device,
+                    dtype=flat_medium.dtype,
+                )
+            else:
+                reference_context = reference_force.to(device=flat_medium.device, dtype=flat_medium.dtype).unsqueeze(-1)
+                reference_context = torch.nan_to_num(reference_context, nan=0.0)
+                reference_context = reference_context / self.reference_force_context_scale
+            residual_context_parts.append(reference_context.reshape(batch_size * max_windows, 1))
+        if residual_context_parts:
+            residual_context = torch.cat(residual_context_parts, dim=-1)
 
-        attribute_outputs, sample_attribute_outputs, g_obj, task_context, sample_attribute_pool_mask = self._build_task_context(
+        (
+            attribute_outputs,
+            sample_attribute_outputs,
+            sample_physical_attribute_outputs,
+            g_obj,
+            task_context,
+            sample_attribute_pool_mask,
+        ) = self._build_task_context(
             h_v,
             z_content,
             batch,
@@ -265,6 +334,19 @@ class CrossMediumSystem(nn.Module):
             'force_interface_delta': policy_outputs['force_interface_delta'],
             'interface_gate': policy_outputs['interface_gate'],
         }
+        for key in (
+            'force_interface_delta_raw',
+            'force_interface_delta_pos_raw',
+            'force_interface_delta_neg_raw',
+            'force_interface_delta_pos_magnitude',
+            'force_interface_delta_neg_magnitude',
+            'residual_direction_logit_neg',
+            'residual_direction_logit_pos',
+            'residual_direction_prob_neg',
+            'residual_direction_prob_pos',
+        ):
+            if key in policy_outputs:
+                outputs[key] = policy_outputs[key]
         if sample_attribute_outputs is not None:
             outputs.update(
                 {
@@ -274,6 +356,14 @@ class CrossMediumSystem(nn.Module):
                     'sample_fragility_entropy': sample_attribute_outputs['fragility_entropy'],
                     'sample_geometry_entropy': sample_attribute_outputs['geometry_entropy'],
                     'sample_surface_entropy': sample_attribute_outputs['surface_entropy'],
+                }
+            )
+        if sample_physical_attribute_outputs is not None:
+            outputs.update(
+                {
+                    'sample_dry_mass_g_normalized_pred': sample_physical_attribute_outputs['dry_mass_g_normalized_pred'],
+                    'sample_capacity_ratio_normalized_pred': sample_physical_attribute_outputs['capacity_ratio_normalized_pred'],
+                    'sample_is_open_container_logit': sample_physical_attribute_outputs['is_open_container_logit'],
                 }
             )
         if sample_attribute_pool_mask is not None:
@@ -297,7 +387,7 @@ class CrossMediumSystem(nn.Module):
         z_med_window = self.evidence_encoder(batch['tactile_low'], batch['tactile_mask'])
         medium_logits, p_medium, next_hidden, medium_step_features = self.medium_head.step(z_med_window, hidden_state=medium_hidden)
         state_context = torch.cat([z_med_window, medium_step_features, p_medium], dim=-1)
-        attribute_outputs, _, g_obj, task_context, _ = self._build_task_context(h_v, z_content)
+        attribute_outputs, _, _, g_obj, task_context, _ = self._build_task_context(h_v, z_content)
         policy_outputs = self.policy_head(task_context, p_medium, state_context=state_context, residual_context=None)
         if self.policy_base_source == 'reference_force':
             policy_outputs = self._apply_reference_force_base_override(policy_outputs, batch)
@@ -323,6 +413,19 @@ class CrossMediumSystem(nn.Module):
             'force_interface_delta': policy_outputs['force_interface_delta'],
             'interface_gate': policy_outputs['interface_gate'],
         }
+        for key in (
+            'force_interface_delta_raw',
+            'force_interface_delta_pos_raw',
+            'force_interface_delta_neg_raw',
+            'force_interface_delta_pos_magnitude',
+            'force_interface_delta_neg_magnitude',
+            'residual_direction_logit_neg',
+            'residual_direction_logit_pos',
+            'residual_direction_prob_neg',
+            'residual_direction_prob_pos',
+        ):
+            if key in policy_outputs:
+                outputs[key] = policy_outputs[key]
         if 'force_base_learned' in policy_outputs:
             outputs['force_base_learned'] = policy_outputs['force_base_learned']
         return outputs

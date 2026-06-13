@@ -128,8 +128,32 @@ def collect_policy_rows(context: dict[str, Any], *, batch_size: int, num_workers
 
             force_pred = outputs['force_pred'].reshape_as(batch['expert_forces']).detach().cpu()
             force_base = outputs['force_base'].reshape_as(batch['expert_forces']).detach().cpu()
+            force_base_learned = outputs.get('force_base_learned')
+            if force_base_learned is not None:
+                force_base_learned = force_base_learned.reshape_as(batch['expert_forces']).detach().cpu()
             force_delta = outputs['force_interface_delta'].reshape_as(batch['expert_forces']).detach().cpu()
+            force_delta_raw = outputs.get('force_interface_delta_raw')
+            if force_delta_raw is not None:
+                force_delta_raw = force_delta_raw.reshape_as(batch['expert_forces']).detach().cpu()
+            residual_diagnostics = {}
+            for key in (
+                'force_interface_delta_pos_raw',
+                'force_interface_delta_neg_raw',
+                'force_interface_delta_pos_magnitude',
+                'force_interface_delta_neg_magnitude',
+                'residual_direction_logit_neg',
+                'residual_direction_logit_pos',
+                'residual_direction_prob_neg',
+                'residual_direction_prob_pos',
+            ):
+                value = outputs.get(key)
+                if value is not None:
+                    residual_diagnostics[key] = value.reshape_as(batch['expert_forces']).detach().cpu()
             gate = outputs['interface_gate'].reshape_as(batch['expert_forces']).detach().cpu()
+            raw_gate = outputs.get('raw_interface_gate')
+            if raw_gate is not None:
+                raw_gate = raw_gate.reshape_as(batch['expert_forces']).detach().cpu()
+            medium_probs = outputs['medium_probs'].detach().cpu()
             expert = batch['expert_forces'].detach().cpu()
             control_target = batch['control_force_targets'].detach().cpu()
             reference = batch['reference_forces'].detach().cpu()
@@ -152,7 +176,21 @@ def collect_policy_rows(context: dict[str, Any], *, batch_size: int, num_workers
                     expert_value = finite_or_nan(expert[batch_index, window_index].item())
                     reference_value = finite_or_nan(reference[batch_index, window_index].item())
                     delta_value = finite_or_nan(force_delta[batch_index, window_index].item())
+                    raw_delta_value = (
+                        finite_or_nan(force_delta_raw[batch_index, window_index].item())
+                        if force_delta_raw is not None
+                        else float('nan')
+                    )
+                    residual_diagnostic_values = {
+                        key: finite_or_nan(value[batch_index, window_index].item())
+                        for key, value in residual_diagnostics.items()
+                    }
                     gate_value = finite_or_nan(gate[batch_index, window_index].item())
+                    raw_gate_value = (
+                        finite_or_nan(raw_gate[batch_index, window_index].item())
+                        if raw_gate is not None
+                        else float('nan')
+                    )
                     delta_target_value = finite_or_nan(delta_target[batch_index, window_index].item())
                     rows.append(
                         {
@@ -169,17 +207,126 @@ def collect_policy_rows(context: dict[str, Any], *, batch_size: int, num_workers
                             'has_control_target': int(bool(has_control[batch_index, window_index].item())),
                             'force_pred': pred_value,
                             'force_base': finite_or_nan(force_base[batch_index, window_index].item()),
+                            'force_base_learned': (
+                                finite_or_nan(force_base_learned[batch_index, window_index].item())
+                                if force_base_learned is not None
+                                else float('nan')
+                            ),
                             'force_interface_delta': delta_value,
+                            'force_interface_delta_raw': raw_delta_value,
+                            'force_interface_delta_pos_raw': residual_diagnostic_values.get(
+                                'force_interface_delta_pos_raw', float('nan')
+                            ),
+                            'force_interface_delta_neg_raw': residual_diagnostic_values.get(
+                                'force_interface_delta_neg_raw', float('nan')
+                            ),
+                            'force_interface_delta_pos_magnitude': residual_diagnostic_values.get(
+                                'force_interface_delta_pos_magnitude', float('nan')
+                            ),
+                            'force_interface_delta_neg_magnitude': residual_diagnostic_values.get(
+                                'force_interface_delta_neg_magnitude', float('nan')
+                            ),
+                            'residual_direction_logit_neg': residual_diagnostic_values.get(
+                                'residual_direction_logit_neg', float('nan')
+                            ),
+                            'residual_direction_logit_pos': residual_diagnostic_values.get(
+                                'residual_direction_logit_pos', float('nan')
+                            ),
+                            'residual_direction_prob_neg': residual_diagnostic_values.get(
+                                'residual_direction_prob_neg', float('nan')
+                            ),
+                            'residual_direction_prob_pos': residual_diagnostic_values.get(
+                                'residual_direction_prob_pos', float('nan')
+                            ),
                             'interface_gate': gate_value,
+                            'raw_interface_gate': raw_gate_value,
+                            'medium_prob_water': finite_or_nan(medium_probs[batch_index, window_index, 0].item()),
+                            'medium_prob_interface': finite_or_nan(medium_probs[batch_index, window_index, 1].item()),
+                            'medium_prob_air': finite_or_nan(medium_probs[batch_index, window_index, 2].item()),
                             'gated_residual': gate_value * delta_value if np.isfinite(gate_value) and np.isfinite(delta_value) else float('nan'),
                             'expert_force': expert_value,
                             'control_force_target': target_value,
                             'reference_force': reference_value,
                             'delta_force_target': delta_target_value,
                             'prediction_error': pred_value - target_value if np.isfinite(pred_value) and np.isfinite(target_value) else float('nan'),
+                            'absolute_error': abs(pred_value - target_value) if np.isfinite(pred_value) and np.isfinite(target_value) else float('nan'),
                         }
                     )
     return rows
+
+
+def summarize_group(rows: pd.DataFrame, group_keys: list[str]) -> pd.DataFrame:
+    if rows.empty:
+        return pd.DataFrame()
+    valid = rows.loc[
+        rows['has_control_target'].astype(int).eq(1)
+        & np.isfinite(rows['prediction_error'].astype(float))
+    ].copy()
+    if valid.empty:
+        return pd.DataFrame(columns=[*group_keys, 'window_count', 'mae', 'rmse', 'bias', 'hit_rate_100', 'hit_rate_200', 'hit_rate_300'])
+
+    records: list[dict[str, Any]] = []
+    for key_values, group in valid.groupby(group_keys, dropna=False):
+        if not isinstance(key_values, tuple):
+            key_values = (key_values,)
+        error = group['prediction_error'].to_numpy(dtype=np.float64)
+        absolute = np.abs(error)
+        record = {key: value for key, value in zip(group_keys, key_values)}
+        record.update(
+            {
+                'window_count': int(len(group)),
+                'mae': float(np.mean(absolute)),
+                'rmse': float(np.sqrt(np.mean(error ** 2))),
+                'bias': float(np.mean(error)),
+                'hit_rate_100': float(np.mean(absolute <= 100.0)),
+                'hit_rate_200': float(np.mean(absolute <= 200.0)),
+                'hit_rate_300': float(np.mean(absolute <= 300.0)),
+                'gate_mean': float(np.nanmean(group['interface_gate'].to_numpy(dtype=np.float64))),
+                'gated_residual_abs_mean': float(np.nanmean(np.abs(group['gated_residual'].to_numpy(dtype=np.float64)))),
+            }
+        )
+        records.append(record)
+    return pd.DataFrame(records)
+
+
+def choose_render_sample_ids(
+    selected_sample_ids: list[str],
+    sample_summary: pd.DataFrame,
+    *,
+    limit: int | None,
+    selection: str,
+) -> list[str]:
+    if limit is None:
+        return selected_sample_ids
+    count = max(0, int(limit))
+    if count == 0 or not selected_sample_ids:
+        return []
+    if sample_summary.empty or selection == 'first':
+        return selected_sample_ids[:count]
+
+    summary = sample_summary.copy()
+    summary['sample_id'] = summary['sample_id'].astype(str)
+    summary = summary.loc[summary['sample_id'].isin(set(selected_sample_ids))]
+    if summary.empty:
+        return selected_sample_ids[:count]
+
+    if selection == 'best':
+        ordered = summary.sort_values(['mae', 'sample_id'], ascending=[True, True])
+        return ordered['sample_id'].astype(str).head(count).tolist()
+    if selection == 'worst':
+        ordered = summary.sort_values(['mae', 'sample_id'], ascending=[False, True])
+        return ordered['sample_id'].astype(str).head(count).tolist()
+    if selection == 'mixed':
+        best = summary.sort_values(['mae', 'sample_id'], ascending=[True, True])['sample_id'].astype(str).tolist()
+        worst = summary.sort_values(['mae', 'sample_id'], ascending=[False, True])['sample_id'].astype(str).tolist()
+        picked: list[str] = []
+        for candidate in [*(best[: max(1, count // 2)]), *(worst[: count])]:
+            if candidate not in picked:
+                picked.append(candidate)
+            if len(picked) >= count:
+                break
+        return picked
+    raise ValueError(f'Unsupported selection: {selection!r}')
 
 
 def write_rows(path: Path, rows: list[dict[str, Any]]) -> None:
@@ -232,18 +379,27 @@ def plot_sample(
     control_target = rows['control_force_target'].to_numpy(dtype=np.float32)
     expert_force = rows['expert_force'].to_numpy(dtype=np.float32)
     reference = rows['reference_force'].to_numpy(dtype=np.float32)
+    force_base = rows['force_base'].to_numpy(dtype=np.float32)
+    force_base_learned = rows['force_base_learned'].to_numpy(dtype=np.float32)
     gate = rows['interface_gate'].to_numpy(dtype=np.float32)
+    raw_gate = rows['raw_interface_gate'].to_numpy(dtype=np.float32)
+    medium_prob_water = rows['medium_prob_water'].to_numpy(dtype=np.float32)
+    medium_prob_interface = rows['medium_prob_interface'].to_numpy(dtype=np.float32)
+    medium_prob_air = rows['medium_prob_air'].to_numpy(dtype=np.float32)
     delta = rows['force_interface_delta'].to_numpy(dtype=np.float32)
+    delta_target = rows['delta_force_target'].to_numpy(dtype=np.float32)
+    gated_residual = rows['gated_residual'].to_numpy(dtype=np.float32)
+    prediction_error = rows['prediction_error'].to_numpy(dtype=np.float32)
 
-    y_min, y_max = compute_y_limits([measured_force, measured_force_low, pred, control_target, expert_force, reference])
+    y_min, y_max = compute_y_limits([measured_force, measured_force_low, pred, control_target, expert_force, reference, force_base])
     fig, axes = plt.subplots(
-        nrows=3,
+        nrows=4,
         ncols=1,
-        figsize=(18, 10),
+        figsize=(18, 12),
         sharex=True,
-        gridspec_kw={'height_ratios': [3.4, 1.3, 1.3], 'hspace': 0.12},
+        gridspec_kw={'height_ratios': [3.4, 1.25, 1.25, 1.1], 'hspace': 0.12},
     )
-    force_ax, gate_ax, phase_ax = axes
+    force_ax, residual_ax, gate_ax, error_ax = axes
 
     for _, row in rows.iterrows():
         color = PHASE_COLORS.get(str(row['phase_label']), '#999999')
@@ -254,35 +410,54 @@ def plot_sample(
     force_ax.plot(tactile_times, measured_force_low, color=EMA_COLOR, linewidth=1.3, alpha=0.85, label='EMA measured force')
     force_ax.plot(centers, pred, color=PRED_COLOR, linewidth=1.8, marker='o', markersize=3.5, label='policy force_pred')
     force_ax.plot(centers, control_target, color=TARGET_COLOR, linewidth=1.4, linestyle='--', marker='x', markersize=4, label='control target')
+    force_ax.plot(centers, force_base, color=REFERENCE_COLOR, linewidth=1.3, linestyle='-.', label='force_base')
     if np.isfinite(reference).any():
-        force_ax.plot(centers, reference, color=REFERENCE_COLOR, linewidth=1.0, linestyle=':', label='reference_force')
+        force_ax.plot(centers, reference, color='#9a8c98', linewidth=1.0, linestyle=':', label='reference_force')
+    if np.isfinite(force_base_learned).any():
+        force_ax.plot(centers, force_base_learned, color='#adb5bd', linewidth=0.9, linestyle=':', label='learned base')
     force_ax.set_ylabel('Force')
     force_ax.set_ylim(y_min, y_max)
     force_ax.grid(alpha=0.25)
     force_ax.legend(loc='upper right', fontsize=9)
 
+    residual_ax.axhline(0.0, color='#555555', linewidth=0.8, alpha=0.7)
+    residual_ax.plot(centers, delta, color='#f77f00', linewidth=1.2, marker='.', label='pred delta')
+    residual_ax.plot(centers, gated_residual, color='#bc6c25', linewidth=1.5, marker='o', markersize=3, label='gate * delta')
+    residual_ax.plot(centers, delta_target, color='#343a40', linewidth=1.0, linestyle='--', label='target delta')
+    residual_ax.set_ylabel('Residual')
+    residual_ax.grid(alpha=0.25)
+    residual_ax.legend(loc='upper right', fontsize=9, ncol=3)
+
     gate_ax.plot(centers, gate, color='#9d4edd', linewidth=1.5, marker='.', label='interface_gate')
+    if np.isfinite(raw_gate).any():
+        gate_ax.plot(centers, raw_gate, color='#5a189a', linewidth=1.0, linestyle='--', alpha=0.75, label='raw interface prob')
+    gate_ax.plot(centers, medium_prob_water, color=PHASE_COLORS['Water'], linewidth=0.9, alpha=0.65, label='p(Water)')
+    gate_ax.plot(centers, medium_prob_interface, color=PHASE_COLORS['Interface'], linewidth=0.9, alpha=0.75, label='p(Interface)')
+    gate_ax.plot(centers, medium_prob_air, color=PHASE_COLORS['Air'], linewidth=0.9, alpha=0.65, label='p(Air)')
     gate_ax.set_ylabel('Gate')
     gate_ax.set_ylim(-0.05, 1.05)
     gate_ax.grid(alpha=0.25)
-    gate_ax.legend(loc='upper right', fontsize=9)
+    gate_ax.legend(loc='upper right', fontsize=8, ncol=5)
 
-    delta_ax = gate_ax.twinx()
-    delta_ax.plot(centers, delta, color='#f77f00', linewidth=1.0, alpha=0.75, label='delta')
-    delta_ax.set_ylabel('Delta')
-
-    phase_ax.set_ylim(0, 1)
-    phase_ax.set_yticks([])
-    phase_ax.set_ylabel('Phase')
+    error_ax.axhline(0.0, color='#555555', linewidth=0.8, alpha=0.7)
+    error_ax.plot(centers, prediction_error, color='#d00000', linewidth=1.1, marker='.', label='pred - target')
+    error_ax.set_ylabel('Error / Phase')
     for _, row in rows.iterrows():
         color = PHASE_COLORS.get(str(row['phase_label']), '#999999')
         start = float(row['window_start'])
         end = float(row['window_end'])
-        phase_ax.axvspan(start, end, ymin=0.15, ymax=0.85, color=color, alpha=0.65, linewidth=0)
+        error_ax.axvspan(start, end, ymin=0.02, ymax=0.18, color=color, alpha=0.70, linewidth=0)
         if int(row['is_stable_mask']) == 1:
-            phase_ax.plot([start, end], [0.92, 0.92], color=color, linewidth=3.0)
-    phase_ax.grid(alpha=0.12)
-    phase_ax.set_xlabel('Time (s)')
+            error_ax.plot(
+                [start, end],
+                [0.96, 0.96],
+                color=color,
+                linewidth=2.0,
+                transform=error_ax.get_xaxis_transform(),
+                clip_on=False,
+            )
+    error_ax.grid(alpha=0.18)
+    error_ax.set_xlabel('Time (s)')
 
     for label, time_sec in collect_event_times(sample):
         for ax in axes:
@@ -291,7 +466,7 @@ def plot_sample(
 
     phase_handles = [Patch(facecolor=color, alpha=0.65, label=phase) for phase, color in PHASE_COLORS.items()]
     phase_handles.append(Line2D([0], [0], color='#444444', linestyle=':', label='events'))
-    phase_ax.legend(handles=phase_handles, loc='upper right', fontsize=9, ncol=4)
+    error_ax.legend(handles=phase_handles, loc='upper right', fontsize=9, ncol=4)
 
     title = (
         f'{sample["sample_id"]} | object={sample["object_id"]} | trial={sample["trial_result"]} | '
@@ -321,6 +496,7 @@ def main() -> None:
     parser.add_argument('--subset', default='val', choices=['train', 'val', 'test'])
     parser.add_argument('--sample-id', nargs='*', default=None)
     parser.add_argument('--limit', type=int, default=3)
+    parser.add_argument('--selection', default='first', choices=['first', 'best', 'worst', 'mixed'])
     parser.add_argument('--batch-size', type=int, default=1)
     parser.add_argument('--num-workers', type=int, default=0)
     parser.add_argument('--output-dir', default=None)
@@ -336,7 +512,7 @@ def main() -> None:
         subset=args.subset,
         only_stable=False,
     )
-    selected_sample_ids = restrict_context_dataset(context, args.sample_id, args.limit)
+    selected_sample_ids = restrict_context_dataset(context, args.sample_id, None)
 
     rows = collect_policy_rows(context, batch_size=int(args.batch_size), num_workers=int(args.num_workers))
     if args.output_dir:
@@ -354,10 +530,26 @@ def main() -> None:
     rows_path = output_dir / 'policy_force_windows.csv'
     write_rows(rows_path, rows)
     rows_df = pd.DataFrame(rows)
+    sample_summary = summarize_group(rows_df, ['sample_id', 'object_id'])
+    phase_summary = summarize_group(rows_df, ['phase_label'])
+    sample_phase_summary = summarize_group(rows_df, ['sample_id', 'object_id', 'phase_label'])
+    sample_summary_path = output_dir / 'policy_force_sample_summary.csv'
+    phase_summary_path = output_dir / 'policy_force_phase_summary.csv'
+    sample_phase_summary_path = output_dir / 'policy_force_sample_phase_summary.csv'
+    sample_summary.to_csv(sample_summary_path, index=False, encoding='utf-8-sig')
+    phase_summary.to_csv(phase_summary_path, index=False, encoding='utf-8-sig')
+    sample_phase_summary.to_csv(sample_phase_summary_path, index=False, encoding='utf-8-sig')
+
+    render_sample_ids = choose_render_sample_ids(
+        selected_sample_ids,
+        sample_summary,
+        limit=args.limit,
+        selection=str(args.selection),
+    )
     samples = pd.read_csv(project_root / 'data' / 'processed' / 'samples.csv')
 
     render_results: list[dict[str, Any]] = []
-    for sample_id in selected_sample_ids:
+    for sample_id in render_sample_ids:
         sample_match = samples.loc[samples['sample_id'].astype(str) == str(sample_id)]
         if sample_match.empty:
             raise ValueError(f'Could not find sample metadata for {sample_id}')
@@ -378,7 +570,11 @@ def main() -> None:
         'checkpoint_path': str(checkpoint_path),
         'subset': args.subset,
         'rows_path': str(rows_path),
+        'sample_summary_path': str(sample_summary_path),
+        'phase_summary_path': str(phase_summary_path),
+        'sample_phase_summary_path': str(sample_phase_summary_path),
         'output_dir': str(output_dir),
+        'selection': args.selection,
         'rendered': render_results,
     }
     summary_path = output_dir / 'policy_force_curve_summary.json'
@@ -389,8 +585,10 @@ def main() -> None:
             'output_dir': str(output_dir),
             'summary_path': str(summary_path),
             'rows_path': str(rows_path),
+            'sample_summary_path': str(sample_summary_path),
+            'phase_summary_path': str(phase_summary_path),
             'rendered_count': len(render_results),
-            'sample_ids': selected_sample_ids,
+            'sample_ids': render_sample_ids,
         }
     )
 

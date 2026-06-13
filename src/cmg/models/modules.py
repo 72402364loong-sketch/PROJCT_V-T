@@ -639,6 +639,29 @@ class MultiAttributeHead(nn.Module):
         }
 
 
+class PhysicalAttributeHead(nn.Module):
+    def __init__(self, input_dim: int, hidden_dim: int, dropout: float = 0.0) -> None:
+        super().__init__()
+        self.shared = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(float(dropout)),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+        )
+        self.dry_mass = nn.Linear(hidden_dim, 1)
+        self.capacity_ratio = nn.Linear(hidden_dim, 1)
+        self.is_open_container = nn.Linear(hidden_dim, 1)
+
+    def forward(self, features: torch.Tensor) -> dict[str, torch.Tensor]:
+        hidden = self.shared(features)
+        return {
+            'dry_mass_g_normalized_pred': self.dry_mass(hidden).squeeze(-1),
+            'capacity_ratio_normalized_pred': self.capacity_ratio(hidden).squeeze(-1),
+            'is_open_container_logit': self.is_open_container(hidden).squeeze(-1),
+        }
+
+
 class PolicyHead(nn.Module):
     def __init__(
         self,
@@ -650,19 +673,23 @@ class PolicyHead(nn.Module):
         state_input_dim: int | None = None,
         context_input_dim: int = 0,
         context_scale_init: float = 0.0,
+        residual_output_scale: float = 1.0,
     ) -> None:
         super().__init__()
         self.head_type = str(head_type)
         self.state_input_dim = input_dim if state_input_dim is None else int(state_input_dim)
         self.context_input_dim = int(context_input_dim)
         self.context_scale_init = float(context_scale_init)
+        self.residual_output_scale = float(residual_output_scale)
+        if self.residual_output_scale <= 0.0:
+            raise RuntimeError(f'residual_output_scale must be positive, got {self.residual_output_scale}.')
         self.film = nn.Sequential(
             nn.Linear(3, film_hidden_dim),
             nn.GELU(),
             nn.Linear(film_hidden_dim, hidden_dim * 2),
         )
 
-        if self.head_type == 'state_residual':
+        if self.head_type in {'state_residual', 'state_residual_sign_specific'}:
             self.input_layer = None
             self.hidden_layer = None
             self.output_layer = None
@@ -679,7 +706,23 @@ class PolicyHead(nn.Module):
                 else None
             )
             self.residual_hidden_layer = nn.Linear(hidden_dim, hidden_dim)
-            self.residual_output_layer = nn.Linear(hidden_dim, 1)
+            self.residual_output_layer = nn.Linear(hidden_dim, 1) if self.head_type == 'state_residual' else None
+            self.residual_pos_output_layer = (
+                nn.Linear(hidden_dim, 1) if self.head_type == 'state_residual_sign_specific' else None
+            )
+            self.residual_neg_output_layer = (
+                nn.Linear(hidden_dim, 1) if self.head_type == 'state_residual_sign_specific' else None
+            )
+            self.residual_direction_output_layer = (
+                nn.Linear(hidden_dim, 2) if self.head_type == 'state_residual_sign_specific' else None
+            )
+            if self.head_type == 'state_residual_sign_specific':
+                nn.init.zeros_(self.residual_pos_output_layer.weight)
+                nn.init.zeros_(self.residual_pos_output_layer.bias)
+                nn.init.zeros_(self.residual_neg_output_layer.weight)
+                nn.init.zeros_(self.residual_neg_output_layer.bias)
+                nn.init.zeros_(self.residual_direction_output_layer.weight)
+                nn.init.zeros_(self.residual_direction_output_layer.bias)
         else:
             self.input_layer = nn.Linear(input_dim, hidden_dim)
             self.hidden_layer = nn.Linear(hidden_dim, hidden_dim)
@@ -694,6 +737,9 @@ class PolicyHead(nn.Module):
             self.residual_context_scale = None
             self.residual_hidden_layer = None
             self.residual_output_layer = None
+            self.residual_pos_output_layer = None
+            self.residual_neg_output_layer = None
+            self.residual_direction_output_layer = None
 
     def forward(
         self,
@@ -711,9 +757,9 @@ class PolicyHead(nn.Module):
         else:
             interface_gate = torch.zeros(task_context.shape[0], device=task_context.device)
 
-        if self.head_type == 'state_residual':
+        if self.head_type in {'state_residual', 'state_residual_sign_specific'}:
             if state_context is None:
-                raise RuntimeError('state_residual policy head requires state_context.')
+                raise RuntimeError(f'{self.head_type} policy head requires state_context.')
             base_hidden = F.gelu(self.base_state_input_layer(state_context))
             base_hidden = F.gelu(self.base_hidden_layer(base_hidden))
             base_force = self.base_output_layer(base_hidden).squeeze(-1)
@@ -733,12 +779,39 @@ class PolicyHead(nn.Module):
             gamma, beta = self.film(p_medium).chunk(2, dim=-1)
             residual_hidden = (1.0 + gamma) * residual_hidden + beta
             residual_hidden = F.gelu(self.residual_hidden_layer(residual_hidden))
-            interface_delta = self.residual_output_layer(residual_hidden).squeeze(-1)
+            if self.head_type == 'state_residual_sign_specific':
+                pos_raw = self.residual_pos_output_layer(residual_hidden).squeeze(-1)
+                neg_raw = self.residual_neg_output_layer(residual_hidden).squeeze(-1)
+                direction_logits = self.residual_direction_output_layer(residual_hidden)
+                direction_probs = torch.softmax(direction_logits, dim=-1)
+                pos_magnitude = F.softplus(pos_raw)
+                neg_magnitude = F.softplus(neg_raw)
+                raw_interface_delta = direction_probs[..., 1] * pos_magnitude - direction_probs[..., 0] * neg_magnitude
+                interface_delta = self.residual_output_scale * raw_interface_delta
+                force_pred = base_force + interface_gate * interface_delta
+                return {
+                    'force_pred': force_pred,
+                    'force_base': base_force,
+                    'force_interface_delta': interface_delta,
+                    'force_interface_delta_raw': raw_interface_delta,
+                    'force_interface_delta_pos_raw': pos_raw,
+                    'force_interface_delta_neg_raw': neg_raw,
+                    'force_interface_delta_pos_magnitude': pos_magnitude,
+                    'force_interface_delta_neg_magnitude': neg_magnitude,
+                    'residual_direction_logit_neg': direction_logits[..., 0],
+                    'residual_direction_logit_pos': direction_logits[..., 1],
+                    'residual_direction_prob_neg': direction_probs[..., 0],
+                    'residual_direction_prob_pos': direction_probs[..., 1],
+                    'interface_gate': interface_gate,
+                }
+            raw_interface_delta = self.residual_output_layer(residual_hidden).squeeze(-1)
+            interface_delta = self.residual_output_scale * raw_interface_delta
             force_pred = base_force + interface_gate * interface_delta
             return {
                 'force_pred': force_pred,
                 'force_base': base_force,
                 'force_interface_delta': interface_delta,
+                'force_interface_delta_raw': raw_interface_delta,
                 'interface_gate': interface_gate,
             }
 

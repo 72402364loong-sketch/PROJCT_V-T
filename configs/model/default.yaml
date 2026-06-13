@@ -44,6 +44,11 @@ attributes:
   object_feature_dim: 128
   stop_gradient: true
 
+physical_attributes:
+  enabled: false
+  hidden_dim: 128
+  dropout: 0.0
+
 policy:
   hidden_dim: 256
   film_hidden_dim: 128
