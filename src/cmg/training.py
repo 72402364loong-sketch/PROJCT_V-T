@@ -445,6 +445,18 @@ def run_model_epoch(
             policy_loss_config.get('direction_magnitude_scale', delta_normalization_scale),
         )
     )
+    direction_magnitude_pos_scale = float(
+        policy_loss_config.get(
+            'sign_magnitude_pos_scale',
+            policy_loss_config.get('direction_magnitude_pos_scale', direction_magnitude_scale),
+        )
+    )
+    direction_magnitude_neg_scale = float(
+        policy_loss_config.get(
+            'sign_magnitude_neg_scale',
+            policy_loss_config.get('direction_magnitude_neg_scale', direction_magnitude_scale),
+        )
+    )
     iterator = tqdm(loader, desc=mode, leave=False)
     for batch in iterator:
         batch = move_to_device(batch, device)
@@ -653,12 +665,14 @@ def run_model_epoch(
                             magnitude_neg_interface = direction_neg_magnitude[interface_control_mask]
                             large_delta_magnitude_pos = magnitude_pos_interface[large_delta_mask]
                             large_delta_magnitude_neg = magnitude_neg_interface[large_delta_mask]
-                            target_magnitude = torch.abs(large_delta_target) / direction_magnitude_scale
 
                             magnitude_target_pos = large_delta_target > 0.0
                             if magnitude_target_pos.any():
                                 pos_active = large_delta_magnitude_pos[magnitude_target_pos]
-                                pos_target_magnitude = target_magnitude[magnitude_target_pos]
+                                pos_target_magnitude = (
+                                    torch.abs(large_delta_target[magnitude_target_pos])
+                                    / direction_magnitude_pos_scale
+                                )
                                 pos_opposite = large_delta_magnitude_neg[magnitude_target_pos]
                                 direction_magnitude_pos_abs += float(
                                     torch.abs(pos_active - pos_target_magnitude).sum().item()
@@ -671,7 +685,10 @@ def run_model_epoch(
                             magnitude_target_neg = large_delta_target < 0.0
                             if magnitude_target_neg.any():
                                 neg_active = large_delta_magnitude_neg[magnitude_target_neg]
-                                neg_target_magnitude = target_magnitude[magnitude_target_neg]
+                                neg_target_magnitude = (
+                                    torch.abs(large_delta_target[magnitude_target_neg])
+                                    / direction_magnitude_neg_scale
+                                )
                                 neg_opposite = large_delta_magnitude_pos[magnitude_target_neg]
                                 direction_magnitude_neg_abs += float(
                                     torch.abs(neg_active - neg_target_magnitude).sum().item()
@@ -833,6 +850,8 @@ def run_model_epoch(
         'direction_gate_neg_margin': direction_gate_neg_margin_sum / max(1, direction_gate_neg_count),
         'direction_gate_neg_prob_mean': direction_gate_neg_prob_sum / max(1, direction_gate_neg_count),
         'direction_magnitude_scale': direction_magnitude_scale,
+        'direction_magnitude_pos_scale': direction_magnitude_pos_scale,
+        'direction_magnitude_neg_scale': direction_magnitude_neg_scale,
         'direction_magnitude_pos_mae': direction_magnitude_pos_abs / max(1, direction_magnitude_pos_count),
         'direction_magnitude_pos_active_mean': direction_magnitude_pos_active_sum / max(1, direction_magnitude_pos_count),
         'direction_magnitude_pos_target_mean': direction_magnitude_pos_target_sum / max(1, direction_magnitude_pos_count),

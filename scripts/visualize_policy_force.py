@@ -19,7 +19,7 @@ if str(SRC) not in sys.path:
 
 from cmg.constants import INDEX_TO_PHASE
 from cmg.data import sequence_collate_fn
-from cmg.data.tactile import compute_measured_force_curve, ema_filter, load_tactile_array
+from cmg.data.tactile import compute_clean_force_curve, compute_measured_force_curve, load_tactile_array
 from cmg.evaluation import prepare_evaluation_context, resolve_path
 from cmg.training import move_to_device
 
@@ -40,7 +40,6 @@ PRED_COLOR = '#c1121f'
 TARGET_COLOR = '#2b2d42'
 REFERENCE_COLOR = '#6d597a'
 MEASURED_COLOR = '#264653'
-EMA_COLOR = '#457b9d'
 
 
 def resolve_data_path(project_root: Path, relative_path: str) -> Path:
@@ -354,6 +353,57 @@ def compute_y_limits(series_list: list[np.ndarray]) -> tuple[float, float]:
     return low - pad, high + pad
 
 
+def infer_display_sign(*series_list: np.ndarray) -> float:
+    values: list[np.ndarray] = []
+    for series in series_list:
+        finite = series[np.isfinite(series)]
+        if finite.size:
+            values.append(finite)
+    if not values:
+        return 1.0
+    combined = np.concatenate(values)
+    return -1.0 if float(np.nanmedian(combined)) < 0.0 else 1.0
+
+
+def compute_plot_force_curves(
+    tactile: np.ndarray,
+    *,
+    data_config: dict[str, Any],
+    tactile_dt: float,
+    sync_offset: float,
+    contact_time: float | None,
+) -> tuple[np.ndarray, str]:
+    expert_force_mode = str(data_config.get('expert_force_mode', 'measured_force')).strip().lower()
+    if expert_force_mode == 'local_reference_delta':
+        raw_curve = compute_clean_force_curve(
+            tactile,
+            dt=tactile_dt,
+            sync_offset_sec=sync_offset,
+            contact_time=contact_time,
+            alpha=float(data_config['ema_alpha_expert']),
+            normal_sign_table=data_config['normal_sign_table'],
+            smoothing_mode='none',
+            baseline_mode=str(data_config.get('expert_force_baseline_mode', 'none')),
+            baseline_window_sec=float(data_config.get('expert_force_baseline_window_sec', 0.5)),
+        )
+        return raw_curve, ' (target frame)'
+
+    raw_curve = compute_measured_force_curve(tactile, normal_sign_table=data_config['normal_sign_table'])
+    return raw_curve, ''
+
+
+def apply_force_display(series: np.ndarray, *, display_sign: float, force_display_mode: str) -> np.ndarray:
+    if force_display_mode == 'positive':
+        return np.abs(display_sign * series)
+    return series
+
+
+def mask_non_interface(series: np.ndarray, phase_labels: np.ndarray, *, scope: str) -> np.ndarray:
+    if str(scope).strip().lower() != 'interface':
+        return series
+    return np.where(phase_labels == 'Interface', series, np.nan)
+
+
 def plot_sample(
     *,
     project_root: Path,
@@ -362,6 +412,9 @@ def plot_sample(
     sample_rows: pd.DataFrame,
     output_path: Path,
     title_suffix: str,
+    residual_plot_mode: str,
+    force_display_mode: str,
+    main_correction_scope: str,
 ) -> dict[str, Any]:
     tactile_path = resolve_data_path(project_root, str(sample['tactile_path']))
     tactile_dt = float(data_config['tactile_dt'])
@@ -370,11 +423,19 @@ def plot_sample(
         sync_offset = 0.0
     tactile = load_tactile_array(tactile_path)
     tactile_times = sync_offset + np.arange(tactile.shape[0], dtype=np.float32) * tactile_dt
-    measured_force = compute_measured_force_curve(tactile, normal_sign_table=data_config['normal_sign_table'])
-    measured_force_low = ema_filter(measured_force, alpha=float(data_config['ema_alpha_expert']))
+    contact_time_value = finite_or_nan(sample.get('t_contact_all'))
+    contact_time = float(contact_time_value) if np.isfinite(contact_time_value) else None
+    measured_force, measured_label_suffix = compute_plot_force_curves(
+        tactile,
+        data_config=data_config,
+        tactile_dt=tactile_dt,
+        sync_offset=sync_offset,
+        contact_time=contact_time,
+    )
 
     rows = sample_rows.sort_values('window_center').reset_index(drop=True)
     centers = rows['window_center'].to_numpy(dtype=np.float32)
+    phase_labels = rows['phase_label'].astype(str).to_numpy()
     pred = rows['force_pred'].to_numpy(dtype=np.float32)
     control_target = rows['control_force_target'].to_numpy(dtype=np.float32)
     expert_force = rows['expert_force'].to_numpy(dtype=np.float32)
@@ -391,7 +452,54 @@ def plot_sample(
     gated_residual = rows['gated_residual'].to_numpy(dtype=np.float32)
     prediction_error = rows['prediction_error'].to_numpy(dtype=np.float32)
 
-    y_min, y_max = compute_y_limits([measured_force, measured_force_low, pred, control_target, expert_force, reference, force_base])
+    display_sign = (
+        infer_display_sign(pred, control_target, expert_force, reference, force_base)
+        if force_display_mode == 'positive'
+        else 1.0
+    )
+    measured_force_display = apply_force_display(
+        measured_force,
+        display_sign=display_sign,
+        force_display_mode=force_display_mode,
+    )
+    reference_display = apply_force_display(
+        reference,
+        display_sign=display_sign,
+        force_display_mode=force_display_mode,
+    )
+    correction_reference = np.where(np.isfinite(reference), reference, force_base)
+    reconstructed_pred_display = apply_force_display(
+        correction_reference + gated_residual,
+        display_sign=display_sign,
+        force_display_mode=force_display_mode,
+    )
+    reconstructed_target_display = apply_force_display(
+        correction_reference + delta_target,
+        display_sign=display_sign,
+        force_display_mode=force_display_mode,
+    )
+    main_pred_display = mask_non_interface(
+        reconstructed_pred_display,
+        phase_labels,
+        scope=main_correction_scope,
+    )
+    main_target_display = mask_non_interface(
+        reconstructed_target_display,
+        phase_labels,
+        scope=main_correction_scope,
+    )
+    absolute_prediction_error = np.abs(prediction_error)
+
+    y_min, y_max = compute_y_limits(
+        [
+            measured_force_display,
+            reference_display,
+            main_pred_display,
+            main_target_display,
+        ]
+    )
+    if force_display_mode == 'positive':
+        y_min = max(0.0, y_min)
     fig, axes = plt.subplots(
         nrows=4,
         ncols=1,
@@ -406,25 +514,68 @@ def plot_sample(
         for ax in axes:
             ax.axvspan(float(row['window_start']), float(row['window_end']), color=color, alpha=0.10, linewidth=0)
 
-    force_ax.plot(tactile_times, measured_force, color=MEASURED_COLOR, linewidth=0.9, alpha=0.45, label='raw measured force')
-    force_ax.plot(tactile_times, measured_force_low, color=EMA_COLOR, linewidth=1.3, alpha=0.85, label='EMA measured force')
-    force_ax.plot(centers, pred, color=PRED_COLOR, linewidth=1.8, marker='o', markersize=3.5, label='policy force_pred')
-    force_ax.plot(centers, control_target, color=TARGET_COLOR, linewidth=1.4, linestyle='--', marker='x', markersize=4, label='control target')
-    force_ax.plot(centers, force_base, color=REFERENCE_COLOR, linewidth=1.3, linestyle='-.', label='force_base')
-    if np.isfinite(reference).any():
-        force_ax.plot(centers, reference, color='#9a8c98', linewidth=1.0, linestyle=':', label='reference_force')
-    if np.isfinite(force_base_learned).any():
-        force_ax.plot(centers, force_base_learned, color='#adb5bd', linewidth=0.9, linestyle=':', label='learned base')
-    force_ax.set_ylabel('Force')
+    force_ax.plot(
+        tactile_times,
+        measured_force_display,
+        color=MEASURED_COLOR,
+        linewidth=0.9,
+        alpha=0.45,
+        label=f'raw measured force{measured_label_suffix}',
+    )
+    if np.isfinite(reference_display).any():
+        force_ax.plot(centers, reference_display, color='#9a8c98', linewidth=1.1, linestyle=':', label='reference')
+    force_ax.plot(
+        centers,
+        main_pred_display,
+        color=PRED_COLOR,
+        linewidth=1.8,
+        marker='o',
+        markersize=3.5,
+        label='reference + pred correction' + (' (interface)' if main_correction_scope == 'interface' else ''),
+    )
+    force_ax.plot(
+        centers,
+        main_target_display,
+        color=TARGET_COLOR,
+        linewidth=1.4,
+        linestyle='--',
+        marker='x',
+        markersize=4,
+        label='reference + target correction' + (' (interface)' if main_correction_scope == 'interface' else ''),
+    )
+    force_ax.set_ylabel('Force magnitude' if force_display_mode == 'positive' else 'Force')
     force_ax.set_ylim(y_min, y_max)
     force_ax.grid(alpha=0.25)
     force_ax.legend(loc='upper right', fontsize=9)
 
-    residual_ax.axhline(0.0, color='#555555', linewidth=0.8, alpha=0.7)
-    residual_ax.plot(centers, delta, color='#f77f00', linewidth=1.2, marker='.', label='pred delta')
-    residual_ax.plot(centers, gated_residual, color='#bc6c25', linewidth=1.5, marker='o', markersize=3, label='gate * delta')
-    residual_ax.plot(centers, delta_target, color='#343a40', linewidth=1.0, linestyle='--', label='target delta')
-    residual_ax.set_ylabel('Residual')
+    if residual_plot_mode == 'delta':
+        residual_ax.axhline(0.0, color='#555555', linewidth=0.8, alpha=0.7)
+        residual_ax.plot(centers, delta, color='#f77f00', linewidth=1.2, marker='.', label='pred delta')
+        residual_ax.plot(centers, gated_residual, color='#bc6c25', linewidth=1.5, marker='o', markersize=3, label='gate * delta')
+        residual_ax.plot(centers, delta_target, color='#343a40', linewidth=1.0, linestyle='--', label='target delta')
+        residual_ax.set_ylabel('Residual')
+    else:
+        residual_ax.plot(centers, reference_display, color='#9a8c98', linewidth=1.0, linestyle=':', label='reference')
+        residual_ax.plot(
+            centers,
+            reconstructed_pred_display,
+            color='#f77f00',
+            linewidth=1.5,
+            marker='o',
+            markersize=3,
+            label='reference + pred correction',
+        )
+        residual_ax.plot(
+            centers,
+            reconstructed_target_display,
+            color='#343a40',
+            linewidth=1.1,
+            linestyle='--',
+            label='reference + target correction',
+        )
+        if force_display_mode == 'positive':
+            residual_ax.set_ylim(y_min, y_max)
+        residual_ax.set_ylabel('Corrected force')
     residual_ax.grid(alpha=0.25)
     residual_ax.legend(loc='upper right', fontsize=9, ncol=3)
 
@@ -440,7 +591,7 @@ def plot_sample(
     gate_ax.legend(loc='upper right', fontsize=8, ncol=5)
 
     error_ax.axhline(0.0, color='#555555', linewidth=0.8, alpha=0.7)
-    error_ax.plot(centers, prediction_error, color='#d00000', linewidth=1.1, marker='.', label='pred - target')
+    error_ax.plot(centers, absolute_prediction_error, color='#d00000', linewidth=1.1, marker='.', label='|pred - target|')
     error_ax.set_ylabel('Error / Phase')
     for _, row in rows.iterrows():
         color = PHASE_COLORS.get(str(row['phase_label']), '#999999')
@@ -499,6 +650,24 @@ def main() -> None:
     parser.add_argument('--selection', default='first', choices=['first', 'best', 'worst', 'mixed'])
     parser.add_argument('--batch-size', type=int, default=1)
     parser.add_argument('--num-workers', type=int, default=0)
+    parser.add_argument(
+        '--residual-plot-mode',
+        default='delta',
+        choices=['force_reconstruction', 'delta'],
+        help='Use delta for residual diagnostics, or force_reconstruction for an alternate corrected-force subplot.',
+    )
+    parser.add_argument(
+        '--force-display-mode',
+        default='positive',
+        choices=['positive', 'signed'],
+        help='Use positive to display internal signed control forces as positive force magnitudes.',
+    )
+    parser.add_argument(
+        '--main-correction-scope',
+        default='all',
+        choices=['all', 'interface'],
+        help='Limit corrected force curves in the main subplot to interface windows if desired.',
+    )
     parser.add_argument('--output-dir', default=None)
     args = parser.parse_args()
 
@@ -561,6 +730,9 @@ def main() -> None:
             sample_rows=sample_rows,
             output_path=output_dir / f'{sample_id}.png',
             title_suffix=f'stage={context["stage_config"]["name"]} | checkpoint={checkpoint_path.name}',
+            residual_plot_mode=str(args.residual_plot_mode),
+            force_display_mode=str(args.force_display_mode),
+            main_correction_scope=str(args.main_correction_scope),
         )
         render_results.append(result)
 
@@ -575,6 +747,9 @@ def main() -> None:
         'sample_phase_summary_path': str(sample_phase_summary_path),
         'output_dir': str(output_dir),
         'selection': args.selection,
+        'residual_plot_mode': args.residual_plot_mode,
+        'force_display_mode': args.force_display_mode,
+        'main_correction_scope': args.main_correction_scope,
         'rendered': render_results,
     }
     summary_path = output_dir / 'policy_force_curve_summary.json'

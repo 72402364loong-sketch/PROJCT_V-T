@@ -271,6 +271,8 @@ def sign_specific_magnitude_loss(
     *,
     beta: float,
     scale: float,
+    positive_scale: float | None = None,
+    negative_scale: float | None = None,
     opposite_weight: float = 0.0,
     positive_weight: float = 1.0,
     negative_weight: float = 1.0,
@@ -285,13 +287,18 @@ def sign_specific_magnitude_loss(
         )
     if scale <= 0.0:
         raise ValueError(f'direction magnitude scale must be positive, got {scale}.')
+    positive_scale = float(scale if positive_scale is None else positive_scale)
+    negative_scale = float(scale if negative_scale is None else negative_scale)
+    if positive_scale <= 0.0:
+        raise ValueError(f'positive direction magnitude scale must be positive, got {positive_scale}.')
+    if negative_scale <= 0.0:
+        raise ValueError(f'negative direction magnitude scale must be positive, got {negative_scale}.')
 
     pos_magnitude = pos_magnitude.reshape(-1)
     neg_magnitude = neg_magnitude.reshape(-1)
     flat_delta = target_delta.reshape(-1)
     flat_mask = mask.reshape(-1)
-    target_magnitude = torch.abs(flat_delta) / float(scale)
-    zero_magnitude = torch.zeros_like(target_magnitude)
+    zero_magnitude = torch.zeros_like(flat_delta)
 
     positive_mask = flat_mask & (flat_delta > 0)
     negative_mask = flat_mask & (flat_delta < 0)
@@ -302,9 +309,10 @@ def sign_specific_magnitude_loss(
     opposite_weight = float(opposite_weight)
 
     if positive_weight > 0.0 and positive_mask.any():
+        positive_target_magnitude = torch.abs(flat_delta[positive_mask]) / positive_scale
         active_loss = F.smooth_l1_loss(
             pos_magnitude[positive_mask],
-            target_magnitude[positive_mask],
+            positive_target_magnitude,
             beta=beta,
         )
         opposite_loss = (
@@ -320,9 +328,10 @@ def sign_specific_magnitude_loss(
         weights.append(positive_weight)
 
     if negative_weight > 0.0 and negative_mask.any():
+        negative_target_magnitude = torch.abs(flat_delta[negative_mask]) / negative_scale
         active_loss = F.smooth_l1_loss(
             neg_magnitude[negative_mask],
-            target_magnitude[negative_mask],
+            negative_target_magnitude,
             beta=beta,
         )
         opposite_loss = (
@@ -340,6 +349,37 @@ def sign_specific_magnitude_loss(
     if not parts:
         return zero
     return torch.stack(parts).sum() / pos_magnitude.new_tensor(sum(weights))
+
+
+def negative_under_magnitude_loss(
+    interface_delta: torch.Tensor,
+    target_delta: torch.Tensor,
+    mask: torch.Tensor,
+    *,
+    beta: float,
+    scale: float,
+    margin: float = 0.0,
+    zero: torch.Tensor,
+) -> torch.Tensor:
+    if scale <= 0.0:
+        raise ValueError(f'negative under-magnitude scale must be positive, got {scale}.')
+
+    flat_pred = interface_delta.reshape(-1)
+    flat_target = target_delta.reshape(-1)
+    flat_mask = mask.reshape(-1)
+    negative_mask = flat_mask & (flat_target < 0.0)
+    if not negative_mask.any():
+        return zero
+
+    target_abs = torch.abs(flat_target[negative_mask])
+    pred_negative_abs = torch.relu(-flat_pred[negative_mask])
+    under_magnitude = torch.relu(target_abs - pred_negative_abs - float(margin))
+    scaled_under_magnitude = under_magnitude / float(scale)
+    return F.smooth_l1_loss(
+        scaled_under_magnitude,
+        torch.zeros_like(scaled_under_magnitude),
+        beta=beta,
+    )
 
 
 def residual_direction_logits(outputs: dict[str, torch.Tensor]) -> torch.Tensor | None:
@@ -488,6 +528,18 @@ def compute_policy_loss(
                 policy_config.get('direction_magnitude_scale', delta_normalization_scale),
             )
         )
+        sign_magnitude_pos_scale = float(
+            policy_config.get(
+                'sign_magnitude_pos_scale',
+                policy_config.get('direction_magnitude_pos_scale', sign_magnitude_scale),
+            )
+        )
+        sign_magnitude_neg_scale = float(
+            policy_config.get(
+                'sign_magnitude_neg_scale',
+                policy_config.get('direction_magnitude_neg_scale', sign_magnitude_scale),
+            )
+        )
         sign_magnitude_beta = float(
             policy_config.get(
                 'sign_magnitude_beta',
@@ -500,6 +552,17 @@ def compute_policy_loss(
         sign_magnitude_neg_loss_weight = float(
             policy_config.get('sign_magnitude_neg_loss_weight', large_delta_neg_loss_weight)
         )
+        negative_under_magnitude_weight = float(
+            policy_config.get(
+                'negative_under_magnitude_weight',
+                policy_config.get('residual_negative_under_magnitude_weight', 0.0),
+            )
+        )
+        negative_under_magnitude_scale = float(
+            policy_config.get('negative_under_magnitude_scale', delta_normalization_scale)
+        )
+        negative_under_magnitude_margin = float(policy_config.get('negative_under_magnitude_margin', 0.0))
+        negative_under_magnitude_beta = float(policy_config.get('negative_under_magnitude_beta', beta))
 
         if reference_targets is None or delta_targets is None:
             raise RuntimeError('Explicit reference-delta policy loss requires reference_targets and delta_targets.')
@@ -623,9 +686,21 @@ def compute_policy_loss(
                 large_delta_mask,
                 beta=sign_magnitude_beta,
                 scale=sign_magnitude_scale,
+                positive_scale=sign_magnitude_pos_scale,
+                negative_scale=sign_magnitude_neg_scale,
                 opposite_weight=sign_magnitude_opposite_weight,
                 positive_weight=sign_magnitude_pos_loss_weight,
                 negative_weight=sign_magnitude_neg_loss_weight,
+                zero=zero,
+            )
+        if negative_under_magnitude_weight > 0.0:
+            total = total + negative_under_magnitude_weight * negative_under_magnitude_loss(
+                interface_delta,
+                delta_targets,
+                large_delta_mask,
+                beta=negative_under_magnitude_beta,
+                scale=negative_under_magnitude_scale,
+                margin=negative_under_magnitude_margin,
                 zero=zero,
             )
         if residual_stable_zero_weight > 0.0:
@@ -722,6 +797,18 @@ def compute_policy_loss(
                 policy_config.get('direction_magnitude_scale', delta_normalization_scale),
             )
         )
+        sign_magnitude_pos_scale = float(
+            policy_config.get(
+                'sign_magnitude_pos_scale',
+                policy_config.get('direction_magnitude_pos_scale', sign_magnitude_scale),
+            )
+        )
+        sign_magnitude_neg_scale = float(
+            policy_config.get(
+                'sign_magnitude_neg_scale',
+                policy_config.get('direction_magnitude_neg_scale', sign_magnitude_scale),
+            )
+        )
         sign_magnitude_beta = float(
             policy_config.get(
                 'sign_magnitude_beta',
@@ -734,6 +821,17 @@ def compute_policy_loss(
         sign_magnitude_neg_loss_weight = float(
             policy_config.get('sign_magnitude_neg_loss_weight', large_delta_neg_loss_weight)
         )
+        negative_under_magnitude_weight = float(
+            policy_config.get(
+                'negative_under_magnitude_weight',
+                policy_config.get('residual_negative_under_magnitude_weight', 0.0),
+            )
+        )
+        negative_under_magnitude_scale = float(
+            policy_config.get('negative_under_magnitude_scale', delta_normalization_scale)
+        )
+        negative_under_magnitude_margin = float(policy_config.get('negative_under_magnitude_margin', 0.0))
+        negative_under_magnitude_beta = float(policy_config.get('negative_under_magnitude_beta', beta))
 
         if 'force_base' not in outputs or 'force_interface_delta' not in outputs:
             raise RuntimeError('Decomposed residual policy loss requires force_base and force_interface_delta outputs.')
@@ -856,9 +954,21 @@ def compute_policy_loss(
                 large_delta_mask,
                 beta=sign_magnitude_beta,
                 scale=sign_magnitude_scale,
+                positive_scale=sign_magnitude_pos_scale,
+                negative_scale=sign_magnitude_neg_scale,
                 opposite_weight=sign_magnitude_opposite_weight,
                 positive_weight=sign_magnitude_pos_loss_weight,
                 negative_weight=sign_magnitude_neg_loss_weight,
+                zero=zero,
+            )
+        if negative_under_magnitude_weight > 0.0:
+            total = total + negative_under_magnitude_weight * negative_under_magnitude_loss(
+                interface_delta,
+                delta_target,
+                large_delta_mask,
+                beta=negative_under_magnitude_beta,
+                scale=negative_under_magnitude_scale,
+                margin=negative_under_magnitude_margin,
                 zero=zero,
             )
         if residual_stable_zero_weight > 0.0:
