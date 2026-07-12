@@ -35,6 +35,12 @@ class CrossMediumSystem(nn.Module):
         self.physical_attributes_enabled = bool(physical_attribute_config.get('enabled', False))
         self.policy_base_source = str(policy_config.get('base_source', 'learned')).strip().lower()
         self.policy_gate_source = str(policy_config.get('gate_source', 'medium_prob')).strip().lower()
+        self.policy_head_type = str(policy_config.get('head_type', 'legacy')).strip()
+        self.policy_per_finger = self.policy_head_type in {
+            'state_residual_per_finger',
+            'state_residual_per_finger_sign_specific',
+        }
+        self.policy_finger_count = int(policy_config.get('finger_count', 3))
         self.use_interface_context = bool(policy_config.get('use_interface_context', False))
         self.use_reference_force_context = bool(policy_config.get('use_reference_force_context', False))
         self.reference_force_context_scale = float(policy_config.get('reference_force_context_scale', 100.0))
@@ -114,11 +120,13 @@ class CrossMediumSystem(nn.Module):
             input_dim=policy_input_dim,
             hidden_dim=int(policy_config['hidden_dim']),
             film_hidden_dim=int(policy_config['film_hidden_dim']),
-            head_type=str(policy_config.get('head_type', 'legacy')),
+            head_type=self.policy_head_type,
             state_input_dim=policy_state_dim,
             context_input_dim=policy_context_dim,
             context_scale_init=float(policy_config.get('context_scale_init', 0.0)),
             residual_output_scale=float(policy_config.get('residual_output_scale', 1.0)),
+            finger_count=self.policy_finger_count,
+            finger_embedding_dim=int(policy_config.get('finger_embedding_dim', 16)),
         )
 
     @staticmethod
@@ -126,6 +134,33 @@ class CrossMediumSystem(nn.Module):
         policy_outputs: dict[str, torch.Tensor],
         batch: dict[str, torch.Tensor],
     ) -> dict[str, torch.Tensor]:
+        if 'finger_force_base' in policy_outputs and 'finger_reference_forces' in batch:
+            learned_base = policy_outputs['finger_force_base']
+            reference_force = batch['finger_reference_forces'].reshape_as(learned_base).to(
+                device=learned_base.device,
+                dtype=learned_base.dtype,
+            )
+            finite_reference = torch.isfinite(reference_force)
+            if not finite_reference.any():
+                return policy_outputs
+
+            oracle_base = torch.where(finite_reference, reference_force, learned_base)
+            interface_gate = policy_outputs['interface_gate'].reshape(-1, 1).to(
+                device=learned_base.device,
+                dtype=learned_base.dtype,
+            )
+            finger_delta = policy_outputs['finger_force_interface_delta']
+            finger_force_pred = oracle_base + interface_gate * finger_delta
+            updated = dict(policy_outputs)
+            updated['finger_force_base_learned'] = learned_base
+            updated['finger_force_base'] = oracle_base
+            updated['finger_force_pred'] = finger_force_pred
+            updated['force_base_learned'] = policy_outputs['force_base']
+            updated['force_base'] = oracle_base.mean(dim=-1)
+            updated['force_pred'] = finger_force_pred.mean(dim=-1)
+            updated['force_interface_delta'] = finger_delta.mean(dim=-1)
+            return updated
+
         if 'reference_forces' not in batch:
             return policy_outputs
 
@@ -258,24 +293,42 @@ class CrossMediumSystem(nn.Module):
             )
             effective_context_mask = context_mask.bool() & batch['window_mask'].bool()
             pooled_context = self._pool_interface_context(context_features, effective_context_mask)
-            residual_context_parts.append(
-                pooled_context[:, None, :].expand(-1, max_windows, -1).reshape(batch_size * max_windows, -1)
-            )
+            expanded_context = pooled_context[:, None, :].expand(-1, max_windows, -1).reshape(batch_size * max_windows, -1)
+            if self.policy_per_finger:
+                expanded_context = expanded_context[:, None, :].expand(-1, self.policy_finger_count, -1)
+            residual_context_parts.append(expanded_context)
         if self.use_reference_force_context:
-            reference_force = batch.get('reference_forces')
-            if reference_force is None:
-                reference_context = torch.zeros(
-                    batch_size,
-                    max_windows,
-                    1,
-                    device=flat_medium.device,
-                    dtype=flat_medium.dtype,
-                )
+            if self.policy_per_finger:
+                finger_reference_force = batch.get('finger_reference_forces')
+                if finger_reference_force is None:
+                    reference_context = torch.zeros(
+                        batch_size,
+                        max_windows,
+                        self.policy_finger_count,
+                        1,
+                        device=flat_medium.device,
+                        dtype=flat_medium.dtype,
+                    )
+                else:
+                    reference_context = finger_reference_force.to(device=flat_medium.device, dtype=flat_medium.dtype).unsqueeze(-1)
+                    reference_context = torch.nan_to_num(reference_context, nan=0.0)
+                    reference_context = reference_context / self.reference_force_context_scale
+                residual_context_parts.append(reference_context.reshape(batch_size * max_windows, self.policy_finger_count, 1))
             else:
-                reference_context = reference_force.to(device=flat_medium.device, dtype=flat_medium.dtype).unsqueeze(-1)
-                reference_context = torch.nan_to_num(reference_context, nan=0.0)
-                reference_context = reference_context / self.reference_force_context_scale
-            residual_context_parts.append(reference_context.reshape(batch_size * max_windows, 1))
+                reference_force = batch.get('reference_forces')
+                if reference_force is None:
+                    reference_context = torch.zeros(
+                        batch_size,
+                        max_windows,
+                        1,
+                        device=flat_medium.device,
+                        dtype=flat_medium.dtype,
+                    )
+                else:
+                    reference_context = reference_force.to(device=flat_medium.device, dtype=flat_medium.dtype).unsqueeze(-1)
+                    reference_context = torch.nan_to_num(reference_context, nan=0.0)
+                    reference_context = reference_context / self.reference_force_context_scale
+                residual_context_parts.append(reference_context.reshape(batch_size * max_windows, 1))
         if residual_context_parts:
             residual_context = torch.cat(residual_context_parts, dim=-1)
 
@@ -335,6 +388,19 @@ class CrossMediumSystem(nn.Module):
             'interface_gate': policy_outputs['interface_gate'],
         }
         for key in (
+            'finger_force_pred',
+            'finger_force_base',
+            'finger_force_base_learned',
+            'finger_force_interface_delta',
+            'finger_force_interface_delta_raw',
+            'finger_force_interface_delta_pos_raw',
+            'finger_force_interface_delta_neg_raw',
+            'finger_force_interface_delta_pos_magnitude',
+            'finger_force_interface_delta_neg_magnitude',
+            'finger_residual_direction_logit_neg',
+            'finger_residual_direction_logit_pos',
+            'finger_residual_direction_prob_neg',
+            'finger_residual_direction_prob_pos',
             'force_interface_delta_raw',
             'force_interface_delta_pos_raw',
             'force_interface_delta_neg_raw',
@@ -414,6 +480,19 @@ class CrossMediumSystem(nn.Module):
             'interface_gate': policy_outputs['interface_gate'],
         }
         for key in (
+            'finger_force_pred',
+            'finger_force_base',
+            'finger_force_base_learned',
+            'finger_force_interface_delta',
+            'finger_force_interface_delta_raw',
+            'finger_force_interface_delta_pos_raw',
+            'finger_force_interface_delta_neg_raw',
+            'finger_force_interface_delta_pos_magnitude',
+            'finger_force_interface_delta_neg_magnitude',
+            'finger_residual_direction_logit_neg',
+            'finger_residual_direction_logit_pos',
+            'finger_residual_direction_prob_neg',
+            'finger_residual_direction_prob_pos',
             'force_interface_delta_raw',
             'force_interface_delta_pos_raw',
             'force_interface_delta_neg_raw',

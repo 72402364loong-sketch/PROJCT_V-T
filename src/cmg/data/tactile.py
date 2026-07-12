@@ -225,13 +225,119 @@ def compute_signed_normal_force_curve(
     return force_sum.astype(np.float32)
 
 
+def estimate_z_sensor_baseline(
+    z_axis: np.ndarray,
+    time_axis: np.ndarray,
+    *,
+    contact_time: float | None,
+    mode: str,
+    window_sec: float,
+) -> np.ndarray:
+    baseline_mode = str(mode or 'none').strip().lower()
+    if z_axis.ndim != 3 or z_axis.shape[1:] != (3, 4):
+        raise ValueError(f'Expected z_axis with shape [T, 3, 4], got {z_axis.shape}')
+    if baseline_mode == 'none' or contact_time is None or np.isnan(contact_time):
+        return np.zeros((3, 4), dtype=np.float32)
+
+    mask = (time_axis >= float(contact_time) - float(window_sec)) & (time_axis < float(contact_time))
+    if not mask.any():
+        if z_axis.shape[0] == 0:
+            return np.zeros((3, 4), dtype=np.float32)
+        fallback_count = max(
+            1,
+            min(
+                z_axis.shape[0],
+                int(round(float(window_sec) / max(1e-6, float(time_axis[1] - time_axis[0]))))
+                if len(time_axis) > 1
+                else 8,
+            ),
+        )
+        mask = np.zeros(z_axis.shape[0], dtype=bool)
+        mask[:fallback_count] = True
+
+    selected = z_axis[mask]
+    if selected.size == 0:
+        return np.zeros((3, 4), dtype=np.float32)
+    if baseline_mode == 'pre_contact_median':
+        return np.median(selected, axis=0).astype(np.float32)
+    if baseline_mode == 'pre_contact_mean':
+        return np.mean(selected, axis=0).astype(np.float32)
+    raise ValueError(f'Unsupported force baseline mode: {mode!r}')
+
+
+def compute_per_finger_abs_mean_force_curve(
+    tactile_array: np.ndarray,
+    *,
+    dt: float,
+    sync_offset_sec: float,
+    contact_time: float | None,
+    alpha: float | None = None,
+    smoothing_mode: str = 'none',
+    baseline_mode: str = 'pre_contact_median',
+    baseline_window_sec: float = 0.5,
+) -> np.ndarray:
+    z_axis = extract_normal_axis(tactile_array)
+    time_axis = build_tactile_time_axis(z_axis.shape[0], dt=dt, offset_sec=sync_offset_sec)
+    baseline = estimate_z_sensor_baseline(
+        z_axis,
+        time_axis,
+        contact_time=contact_time,
+        mode=baseline_mode,
+        window_sec=baseline_window_sec,
+    )
+    centered = z_axis - baseline[None, :, :]
+    per_finger = np.mean(np.abs(centered), axis=2).astype(np.float32)
+    if alpha is None:
+        return per_finger
+    return smooth_force_curve(per_finger, alpha=alpha, mode=smoothing_mode)
+
+
+def normalize_force_target_mode(force_target_mode: Any) -> str:
+    mode = str(force_target_mode or 'signed_sum').strip().lower()
+    aliases = {
+        'signed-sum': 'signed_sum',
+        'signed_sum_after_sign_calibration': 'signed_sum',
+        'signed-sum-after-sign-calibration': 'signed_sum',
+        'per-finger-z-abs-mean': 'per_finger_z_abs_mean',
+        'finger_z_abs_mean': 'per_finger_z_abs_mean',
+    }
+    mode = aliases.get(mode, mode)
+    if mode not in {'signed_sum', 'per_finger_z_abs_mean'}:
+        raise ValueError(
+            f"Unsupported force_target_mode={force_target_mode!r}; "
+            "expected 'signed_sum' or 'per_finger_z_abs_mean'."
+        )
+    return mode
+
+
 
 def compute_measured_force_curve(
     tactile_array: np.ndarray,
     *,
     normal_sign_table: Any,
     alpha: float | None = None,
+    force_target_mode: str = 'signed_sum',
+    dt: float | None = None,
+    sync_offset_sec: float = 0.0,
+    contact_time: float | None = None,
+    smoothing_mode: str = 'ema',
+    baseline_mode: str = 'pre_contact_median',
+    baseline_window_sec: float = 0.5,
 ) -> np.ndarray:
+    mode = normalize_force_target_mode(force_target_mode)
+    if mode == 'per_finger_z_abs_mean':
+        if dt is None:
+            raise ValueError("force_target_mode='per_finger_z_abs_mean' requires dt.")
+        return compute_per_finger_abs_mean_force_curve(
+            tactile_array,
+            dt=float(dt),
+            sync_offset_sec=float(sync_offset_sec),
+            contact_time=contact_time,
+            alpha=alpha,
+            smoothing_mode=smoothing_mode,
+            baseline_mode=baseline_mode,
+            baseline_window_sec=baseline_window_sec,
+        )
     return compute_signed_normal_force_curve(
         tactile_array,
         normal_sign_table=normal_sign_table,
@@ -294,7 +400,21 @@ def compute_clean_force_curve(
     smoothing_mode: str,
     baseline_mode: str,
     baseline_window_sec: float,
+    force_target_mode: str = 'signed_sum',
 ) -> np.ndarray:
+    mode = normalize_force_target_mode(force_target_mode)
+    if mode == 'per_finger_z_abs_mean':
+        return compute_per_finger_abs_mean_force_curve(
+            tactile_array,
+            dt=dt,
+            sync_offset_sec=sync_offset_sec,
+            contact_time=contact_time,
+            alpha=alpha,
+            smoothing_mode=smoothing_mode,
+            baseline_mode=baseline_mode,
+            baseline_window_sec=baseline_window_sec,
+        )
+
     raw_force = compute_measured_force_curve(
         tactile_array,
         normal_sign_table=normal_sign_table,
@@ -320,13 +440,24 @@ def compute_expert_force_curve(
     contact_time: float | None,
     alpha: float,
     normal_sign_table: Any,
+    *,
+    force_target_mode: str = 'signed_sum',
+    sync_offset_sec: float = 0.0,
+    smoothing_mode: str = 'ema',
+    baseline_mode: str = 'pre_contact_median',
+    baseline_window_sec: float = 0.5,
 ) -> np.ndarray | None:
-    _ = dt
-    _ = contact_time
     if str(trial_result).strip().lower() != 'stable':
         return None
     return compute_measured_force_curve(
         tactile_array,
         normal_sign_table=normal_sign_table,
         alpha=alpha,
+        force_target_mode=force_target_mode,
+        dt=dt,
+        sync_offset_sec=sync_offset_sec,
+        contact_time=contact_time,
+        smoothing_mode=smoothing_mode,
+        baseline_mode=baseline_mode,
+        baseline_window_sec=baseline_window_sec,
     )

@@ -173,6 +173,7 @@ def is_allowed_lora_injection_mismatch(key: str) -> bool:
         or key.startswith('policy_head.interface_output_layer.')
         or key.startswith('policy_head.base_')
         or key.startswith('policy_head.residual_')
+        or key.startswith('policy_head.finger_')
         or key.startswith('content_encoder.conv.')
     )
 
@@ -381,6 +382,45 @@ def run_model_epoch(
     delta_interface_sq = 0.0
     delta_interface_count = 0
     delta_interface_signed_sum = 0.0
+    finger_overall_abs = 0.0
+    finger_overall_sq = 0.0
+    finger_overall_count = 0
+    finger_stable_abs = 0.0
+    finger_stable_sq = 0.0
+    finger_stable_count = 0
+    finger_interface_abs = 0.0
+    finger_interface_sq = 0.0
+    finger_interface_count = 0
+    finger_control_overall_abs = 0.0
+    finger_control_overall_sq = 0.0
+    finger_control_overall_count = 0
+    finger_control_reference_abs = 0.0
+    finger_control_reference_sq = 0.0
+    finger_control_reference_count = 0
+    finger_control_interface_abs = 0.0
+    finger_control_interface_sq = 0.0
+    finger_control_interface_count = 0
+    finger_delta_interface_abs = 0.0
+    finger_delta_interface_sq = 0.0
+    finger_delta_interface_count = 0
+    finger_delta_interface_signed_sum = 0.0
+    finger_large_delta_interface_abs = 0.0
+    finger_large_delta_interface_sq = 0.0
+    finger_large_delta_interface_count = 0
+    finger_large_delta_interface_signed_sum = 0.0
+    finger_large_delta_interface_wrong_sign = 0
+    finger_large_delta_interface_pred_sum = 0.0
+    finger_large_delta_interface_target_sum = 0.0
+    finger_large_delta_interface_pred_abs_sum = 0.0
+    finger_large_delta_interface_target_abs_sum = 0.0
+    finger_large_delta_pos_count = 0
+    finger_large_delta_pos_wrong_sign = 0
+    finger_large_delta_pos_abs = 0.0
+    finger_large_delta_neg_count = 0
+    finger_large_delta_neg_wrong_sign = 0
+    finger_large_delta_neg_abs = 0.0
+    finger_control_interface_abs_by_finger = torch.zeros(3, dtype=torch.float64)
+    finger_control_interface_count_by_finger = torch.zeros(3, dtype=torch.long)
     large_delta_interface_abs = 0.0
     large_delta_interface_sq = 0.0
     large_delta_interface_count = 0
@@ -438,6 +478,12 @@ def run_model_epoch(
     policy_loss_config = stage_config.get('policy_loss', {})
     policy_loss_config = policy_loss_config if isinstance(policy_loss_config, dict) else {}
     large_delta_threshold = float(policy_loss_config.get('large_delta_threshold', 100.0))
+    finger_large_delta_threshold = float(
+        policy_loss_config.get(
+            'finger_large_delta_threshold',
+            policy_loss_config.get('residual_large_delta_threshold', large_delta_threshold),
+        )
+    )
     delta_normalization_scale = float(policy_loss_config.get('delta_normalization_scale', 100.0))
     direction_magnitude_scale = float(
         policy_loss_config.get(
@@ -726,6 +772,109 @@ def run_model_epoch(
                             large_delta_neg_pred_sum += float(neg_pred.sum().item())
                             large_delta_neg_target_sum += float(neg_target.sum().item())
 
+        if 'finger_force_pred' in outputs and 'finger_expert_forces' in batch:
+            finger_pred = outputs['finger_force_pred'].reshape_as(batch['finger_expert_forces'])
+            finger_window_mask = window_mask.unsqueeze(-1).expand_as(batch['finger_expert_forces'])
+            finger_stable_mask = batch['stable_masks'].unsqueeze(-1).expand_as(batch['finger_expert_forces']) & finger_window_mask
+            finger_interface_mask = (batch['phase_labels'] == 1).unsqueeze(-1).expand_as(batch['finger_expert_forces']) & finger_window_mask
+            finger_expert_mask = batch['has_finger_expert'] & finger_window_mask
+
+            if finger_expert_mask.any():
+                finger_target = batch['finger_expert_forces']
+                finger_error = finger_pred[finger_expert_mask] - finger_target[finger_expert_mask]
+                finger_abs_error = finger_error.abs()
+                finger_overall_abs += float(finger_abs_error.sum().item())
+                finger_overall_sq += float((finger_error ** 2).sum().item())
+                finger_overall_count += int(finger_abs_error.numel())
+
+                finger_stable_expert_mask = finger_expert_mask & finger_stable_mask
+                if finger_stable_expert_mask.any():
+                    stable_error = finger_pred[finger_stable_expert_mask] - finger_target[finger_stable_expert_mask]
+                    finger_stable_abs += float(stable_error.abs().sum().item())
+                    finger_stable_sq += float((stable_error ** 2).sum().item())
+                    finger_stable_count += int(stable_error.numel())
+
+                finger_interface_expert_mask = finger_expert_mask & finger_interface_mask
+                if finger_interface_expert_mask.any():
+                    interface_error = finger_pred[finger_interface_expert_mask] - finger_target[finger_interface_expert_mask]
+                    finger_interface_abs += float(interface_error.abs().sum().item())
+                    finger_interface_sq += float((interface_error ** 2).sum().item())
+                    finger_interface_count += int(interface_error.numel())
+
+            finger_control_mask = batch['has_finger_control_target'] & finger_window_mask
+            if finger_control_mask.any():
+                finger_control_target = batch['finger_control_force_targets']
+                control_error_all = finger_pred[finger_control_mask] - finger_control_target[finger_control_mask]
+                control_abs_all = control_error_all.abs()
+                finger_control_overall_abs += float(control_abs_all.sum().item())
+                finger_control_overall_sq += float((control_error_all ** 2).sum().item())
+                finger_control_overall_count += int(control_abs_all.numel())
+
+                finger_reference_control_mask = finger_control_mask & batch['has_finger_reference']
+                if finger_reference_control_mask.any():
+                    reference_error = finger_pred[finger_reference_control_mask] - finger_control_target[finger_reference_control_mask]
+                    finger_control_reference_abs += float(reference_error.abs().sum().item())
+                    finger_control_reference_sq += float((reference_error ** 2).sum().item())
+                    finger_control_reference_count += int(reference_error.numel())
+
+                finger_interface_control_mask = finger_control_mask & finger_interface_mask
+                if finger_interface_control_mask.any():
+                    interface_error = finger_pred[finger_interface_control_mask] - finger_control_target[finger_interface_control_mask]
+                    finger_control_interface_abs += float(interface_error.abs().sum().item())
+                    finger_control_interface_sq += float((interface_error ** 2).sum().item())
+                    finger_control_interface_count += int(interface_error.numel())
+
+                    per_finger_abs = (finger_pred - finger_control_target).abs()
+                    for finger_index in range(min(per_finger_abs.shape[-1], finger_control_interface_abs_by_finger.numel())):
+                        mask_i = finger_interface_control_mask[..., finger_index]
+                        if mask_i.any():
+                            finger_control_interface_abs_by_finger[finger_index] += float(per_finger_abs[..., finger_index][mask_i].sum().item())
+                            finger_control_interface_count_by_finger[finger_index] += int(mask_i.sum().item())
+
+                    if 'finger_force_interface_delta' in outputs and 'finger_delta_force_targets' in batch:
+                        finger_delta = outputs['finger_force_interface_delta'].reshape_as(batch['finger_delta_force_targets'])
+                        finger_delta_pred_interface = finger_delta[finger_interface_control_mask]
+                        finger_delta_target_interface = batch['finger_delta_force_targets'][finger_interface_control_mask]
+                        delta_error = finger_delta_pred_interface - finger_delta_target_interface
+                        finger_delta_interface_abs += float(delta_error.abs().sum().item())
+                        finger_delta_interface_sq += float((delta_error ** 2).sum().item())
+                        finger_delta_interface_count += int(delta_error.numel())
+                        finger_delta_interface_signed_sum += float(delta_error.sum().item())
+
+                        finger_large_delta_mask = torch.abs(finger_delta_target_interface) >= finger_large_delta_threshold
+                        if finger_large_delta_mask.any():
+                            large_pred = finger_delta_pred_interface[finger_large_delta_mask]
+                            large_target = finger_delta_target_interface[finger_large_delta_mask]
+                            large_error = delta_error[finger_large_delta_mask]
+                            abs_large_error = large_error.abs()
+                            finger_large_delta_interface_abs += float(abs_large_error.sum().item())
+                            finger_large_delta_interface_sq += float((large_error ** 2).sum().item())
+                            finger_large_delta_interface_count += int(large_error.numel())
+                            finger_large_delta_interface_signed_sum += float(large_error.sum().item())
+                            finger_large_delta_interface_wrong_sign += int((large_pred * large_target < 0.0).sum().item())
+                            finger_large_delta_interface_pred_sum += float(large_pred.sum().item())
+                            finger_large_delta_interface_target_sum += float(large_target.sum().item())
+                            finger_large_delta_interface_pred_abs_sum += float(large_pred.abs().sum().item())
+                            finger_large_delta_interface_target_abs_sum += float(large_target.abs().sum().item())
+
+                            pos_mask = large_target > 0.0
+                            if pos_mask.any():
+                                pos_pred = large_pred[pos_mask]
+                                pos_target = large_target[pos_mask]
+                                pos_error = large_error[pos_mask]
+                                finger_large_delta_pos_count += int(pos_error.numel())
+                                finger_large_delta_pos_abs += float(pos_error.abs().sum().item())
+                                finger_large_delta_pos_wrong_sign += int((pos_pred * pos_target < 0.0).sum().item())
+
+                            neg_mask = large_target < 0.0
+                            if neg_mask.any():
+                                neg_pred = large_pred[neg_mask]
+                                neg_target = large_target[neg_mask]
+                                neg_error = large_error[neg_mask]
+                                finger_large_delta_neg_count += int(neg_error.numel())
+                                finger_large_delta_neg_abs += float(neg_error.abs().sum().item())
+                                finger_large_delta_neg_wrong_sign += int((neg_pred * neg_target < 0.0).sum().item())
+
     denom = max(1, len(loader))
     if stable_leakage_values:
         stable_leakage = torch.cat(stable_leakage_values)
@@ -816,6 +965,40 @@ def run_model_epoch(
         'delta_interface_mae': delta_interface_abs / max(1, delta_interface_count),
         'delta_interface_mse': delta_interface_sq / max(1, delta_interface_count),
         'delta_interface_bias': delta_interface_signed_sum / max(1, delta_interface_count),
+        'finger_overall_mae': finger_overall_abs / max(1, finger_overall_count),
+        'finger_overall_mse': finger_overall_sq / max(1, finger_overall_count),
+        'finger_stable_mae': finger_stable_abs / max(1, finger_stable_count),
+        'finger_stable_mse': finger_stable_sq / max(1, finger_stable_count),
+        'finger_interface_mae': finger_interface_abs / max(1, finger_interface_count),
+        'finger_interface_mse': finger_interface_sq / max(1, finger_interface_count),
+        'finger_control_overall_mae': finger_control_overall_abs / max(1, finger_control_overall_count),
+        'finger_control_overall_mse': finger_control_overall_sq / max(1, finger_control_overall_count),
+        'finger_control_reference_mae': finger_control_reference_abs / max(1, finger_control_reference_count),
+        'finger_control_reference_mse': finger_control_reference_sq / max(1, finger_control_reference_count),
+        'finger_control_interface_mae': finger_control_interface_abs / max(1, finger_control_interface_count),
+        'finger_control_interface_mse': finger_control_interface_sq / max(1, finger_control_interface_count),
+        'finger_delta_interface_mae': finger_delta_interface_abs / max(1, finger_delta_interface_count),
+        'finger_delta_interface_mse': finger_delta_interface_sq / max(1, finger_delta_interface_count),
+        'finger_delta_interface_bias': finger_delta_interface_signed_sum / max(1, finger_delta_interface_count),
+        'finger0_control_interface_mae': float(finger_control_interface_abs_by_finger[0].item()) / max(1, int(finger_control_interface_count_by_finger[0].item())),
+        'finger1_control_interface_mae': float(finger_control_interface_abs_by_finger[1].item()) / max(1, int(finger_control_interface_count_by_finger[1].item())),
+        'finger2_control_interface_mae': float(finger_control_interface_abs_by_finger[2].item()) / max(1, int(finger_control_interface_count_by_finger[2].item())),
+        'finger_large_delta_threshold': finger_large_delta_threshold,
+        'finger_large_delta_interface_count': finger_large_delta_interface_count,
+        'finger_large_delta_interface_mae': finger_large_delta_interface_abs / max(1, finger_large_delta_interface_count),
+        'finger_large_delta_interface_mse': finger_large_delta_interface_sq / max(1, finger_large_delta_interface_count),
+        'finger_large_delta_interface_bias': finger_large_delta_interface_signed_sum / max(1, finger_large_delta_interface_count),
+        'finger_large_delta_wrong_sign_rate': finger_large_delta_interface_wrong_sign / max(1, finger_large_delta_interface_count),
+        'finger_large_delta_pred_mean': finger_large_delta_interface_pred_sum / max(1, finger_large_delta_interface_count),
+        'finger_large_delta_target_mean': finger_large_delta_interface_target_sum / max(1, finger_large_delta_interface_count),
+        'finger_large_delta_pred_abs_mean': finger_large_delta_interface_pred_abs_sum / max(1, finger_large_delta_interface_count),
+        'finger_large_delta_target_abs_mean': finger_large_delta_interface_target_abs_sum / max(1, finger_large_delta_interface_count),
+        'finger_large_delta_pos_count': finger_large_delta_pos_count,
+        'finger_large_delta_pos_mae': finger_large_delta_pos_abs / max(1, finger_large_delta_pos_count),
+        'finger_large_delta_pos_wrong_sign_rate': finger_large_delta_pos_wrong_sign / max(1, finger_large_delta_pos_count),
+        'finger_large_delta_neg_count': finger_large_delta_neg_count,
+        'finger_large_delta_neg_mae': finger_large_delta_neg_abs / max(1, finger_large_delta_neg_count),
+        'finger_large_delta_neg_wrong_sign_rate': finger_large_delta_neg_wrong_sign / max(1, finger_large_delta_neg_count),
         'large_delta_threshold': large_delta_threshold,
         'large_delta_interface_count': large_delta_interface_count,
         'large_delta_interface_mae': large_delta_interface_abs / max(1, large_delta_interface_count),
@@ -901,6 +1084,34 @@ def run_model_epoch(
     )
     metrics['large_delta_balanced_score'] = (
         metrics['large_delta_balanced_mae'] + 100.0 * metrics['large_delta_balanced_wrong_sign_rate']
+    )
+    finger_large_delta_pos_present = finger_large_delta_pos_count > 0
+    finger_large_delta_neg_present = finger_large_delta_neg_count > 0
+    finger_large_delta_balance_denominator = max(
+        1,
+        int(finger_large_delta_pos_present) + int(finger_large_delta_neg_present),
+    )
+    metrics['finger_large_delta_balanced_mae'] = (
+        (metrics['finger_large_delta_pos_mae'] if finger_large_delta_pos_present else 0.0)
+        + (metrics['finger_large_delta_neg_mae'] if finger_large_delta_neg_present else 0.0)
+    ) / finger_large_delta_balance_denominator
+    metrics['finger_large_delta_balanced_wrong_sign_rate'] = (
+        (metrics['finger_large_delta_pos_wrong_sign_rate'] if finger_large_delta_pos_present else 0.0)
+        + (metrics['finger_large_delta_neg_wrong_sign_rate'] if finger_large_delta_neg_present else 0.0)
+    ) / finger_large_delta_balance_denominator
+    metrics['finger_large_delta_pos_neg_mae_gap'] = (
+        abs(metrics['finger_large_delta_pos_mae'] - metrics['finger_large_delta_neg_mae'])
+        if finger_large_delta_pos_present and finger_large_delta_neg_present
+        else 0.0
+    )
+    metrics['finger_large_delta_pos_neg_wrong_sign_gap'] = (
+        abs(metrics['finger_large_delta_pos_wrong_sign_rate'] - metrics['finger_large_delta_neg_wrong_sign_rate'])
+        if finger_large_delta_pos_present and finger_large_delta_neg_present
+        else 0.0
+    )
+    metrics['finger_large_delta_balanced_score'] = (
+        metrics['finger_large_delta_balanced_mae']
+        + 100.0 * metrics['finger_large_delta_balanced_wrong_sign_rate']
     )
     metrics.update(flatten_window_metrics(attribute_window_diagnostics))
     metrics.update(flatten_aggregation_metrics(attribute_aggregation))

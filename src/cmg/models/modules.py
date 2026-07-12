@@ -674,6 +674,8 @@ class PolicyHead(nn.Module):
         context_input_dim: int = 0,
         context_scale_init: float = 0.0,
         residual_output_scale: float = 1.0,
+        finger_count: int = 3,
+        finger_embedding_dim: int = 16,
     ) -> None:
         super().__init__()
         self.head_type = str(head_type)
@@ -681,6 +683,8 @@ class PolicyHead(nn.Module):
         self.context_input_dim = int(context_input_dim)
         self.context_scale_init = float(context_scale_init)
         self.residual_output_scale = float(residual_output_scale)
+        self.finger_count = int(finger_count)
+        self.finger_embedding_dim = int(finger_embedding_dim)
         if self.residual_output_scale <= 0.0:
             raise RuntimeError(f'residual_output_scale must be positive, got {self.residual_output_scale}.')
         self.film = nn.Sequential(
@@ -689,7 +693,71 @@ class PolicyHead(nn.Module):
             nn.Linear(film_hidden_dim, hidden_dim * 2),
         )
 
-        if self.head_type in {'state_residual', 'state_residual_sign_specific'}:
+        if self.head_type in {'state_residual_per_finger', 'state_residual_per_finger_sign_specific'}:
+            if self.finger_count <= 0:
+                raise RuntimeError(f'finger_count must be positive, got {self.finger_count}.')
+            if self.finger_embedding_dim <= 0:
+                raise RuntimeError(f'finger_embedding_dim must be positive, got {self.finger_embedding_dim}.')
+            self.input_layer = None
+            self.hidden_layer = None
+            self.output_layer = None
+            self.interface_output_layer = None
+            self.base_state_input_layer = None
+            self.base_hidden_layer = None
+            self.base_output_layer = None
+            self.residual_task_input_layer = None
+            self.residual_state_input_layer = None
+            self.residual_context_input_layer = None
+            self.residual_context_scale = None
+            self.residual_hidden_layer = None
+            self.residual_output_layer = None
+            self.residual_pos_output_layer = None
+            self.residual_neg_output_layer = None
+            self.residual_direction_output_layer = None
+            self.finger_embedding = nn.Embedding(self.finger_count, self.finger_embedding_dim)
+            self.finger_base_state_input_layer = nn.Linear(
+                self.state_input_dim + self.finger_embedding_dim,
+                hidden_dim,
+            )
+            self.finger_base_hidden_layer = nn.Linear(hidden_dim, hidden_dim)
+            self.finger_base_output_layer = nn.Linear(hidden_dim, 1)
+            self.finger_residual_task_input_layer = nn.Linear(
+                input_dim + self.finger_embedding_dim,
+                hidden_dim,
+            )
+            self.finger_residual_state_input_layer = nn.Linear(
+                self.state_input_dim + self.finger_embedding_dim,
+                hidden_dim,
+            )
+            self.finger_residual_context_input_layer = (
+                nn.Linear(self.context_input_dim, hidden_dim) if self.context_input_dim > 0 else None
+            )
+            self.finger_residual_context_scale = (
+                nn.Parameter(torch.full((1,), self.context_scale_init, dtype=torch.float32))
+                if self.context_input_dim > 0
+                else None
+            )
+            self.finger_residual_hidden_layer = nn.Linear(hidden_dim, hidden_dim)
+            self.finger_residual_output_layer = (
+                nn.Linear(hidden_dim, 1) if self.head_type == 'state_residual_per_finger' else None
+            )
+            self.finger_residual_pos_output_layer = (
+                nn.Linear(hidden_dim, 1) if self.head_type == 'state_residual_per_finger_sign_specific' else None
+            )
+            self.finger_residual_neg_output_layer = (
+                nn.Linear(hidden_dim, 1) if self.head_type == 'state_residual_per_finger_sign_specific' else None
+            )
+            self.finger_residual_direction_output_layer = (
+                nn.Linear(hidden_dim, 2) if self.head_type == 'state_residual_per_finger_sign_specific' else None
+            )
+            if self.head_type == 'state_residual_per_finger_sign_specific':
+                nn.init.zeros_(self.finger_residual_pos_output_layer.weight)
+                nn.init.zeros_(self.finger_residual_pos_output_layer.bias)
+                nn.init.zeros_(self.finger_residual_neg_output_layer.weight)
+                nn.init.zeros_(self.finger_residual_neg_output_layer.bias)
+                nn.init.zeros_(self.finger_residual_direction_output_layer.weight)
+                nn.init.zeros_(self.finger_residual_direction_output_layer.bias)
+        elif self.head_type in {'state_residual', 'state_residual_sign_specific'}:
             self.input_layer = None
             self.hidden_layer = None
             self.output_layer = None
@@ -723,6 +791,19 @@ class PolicyHead(nn.Module):
                 nn.init.zeros_(self.residual_neg_output_layer.bias)
                 nn.init.zeros_(self.residual_direction_output_layer.weight)
                 nn.init.zeros_(self.residual_direction_output_layer.bias)
+            self.finger_embedding = None
+            self.finger_base_state_input_layer = None
+            self.finger_base_hidden_layer = None
+            self.finger_base_output_layer = None
+            self.finger_residual_task_input_layer = None
+            self.finger_residual_state_input_layer = None
+            self.finger_residual_context_input_layer = None
+            self.finger_residual_context_scale = None
+            self.finger_residual_hidden_layer = None
+            self.finger_residual_output_layer = None
+            self.finger_residual_pos_output_layer = None
+            self.finger_residual_neg_output_layer = None
+            self.finger_residual_direction_output_layer = None
         else:
             self.input_layer = nn.Linear(input_dim, hidden_dim)
             self.hidden_layer = nn.Linear(hidden_dim, hidden_dim)
@@ -740,6 +821,19 @@ class PolicyHead(nn.Module):
             self.residual_pos_output_layer = None
             self.residual_neg_output_layer = None
             self.residual_direction_output_layer = None
+            self.finger_embedding = None
+            self.finger_base_state_input_layer = None
+            self.finger_base_hidden_layer = None
+            self.finger_base_output_layer = None
+            self.finger_residual_task_input_layer = None
+            self.finger_residual_state_input_layer = None
+            self.finger_residual_context_input_layer = None
+            self.finger_residual_context_scale = None
+            self.finger_residual_hidden_layer = None
+            self.finger_residual_output_layer = None
+            self.finger_residual_pos_output_layer = None
+            self.finger_residual_neg_output_layer = None
+            self.finger_residual_direction_output_layer = None
 
     def forward(
         self,
@@ -756,6 +850,90 @@ class PolicyHead(nn.Module):
             interface_gate = p_medium[..., 1]
         else:
             interface_gate = torch.zeros(task_context.shape[0], device=task_context.device)
+
+        if self.head_type in {'state_residual_per_finger', 'state_residual_per_finger_sign_specific'}:
+            if state_context is None:
+                raise RuntimeError(f'{self.head_type} policy head requires state_context.')
+            batch_items = task_context.shape[0]
+            finger_ids = torch.arange(self.finger_count, device=task_context.device)
+            finger_embedding = self.finger_embedding(finger_ids).to(dtype=task_context.dtype)
+            expanded_embedding = finger_embedding.unsqueeze(0).expand(batch_items, -1, -1)
+            expanded_task = task_context.unsqueeze(1).expand(-1, self.finger_count, -1)
+            expanded_state = state_context.unsqueeze(1).expand(-1, self.finger_count, -1)
+            task_with_finger = torch.cat([expanded_task, expanded_embedding], dim=-1)
+            state_with_finger = torch.cat([expanded_state, expanded_embedding], dim=-1)
+
+            base_hidden = F.gelu(self.finger_base_state_input_layer(state_with_finger))
+            base_hidden = F.gelu(self.finger_base_hidden_layer(base_hidden))
+            finger_base_force = self.finger_base_output_layer(base_hidden).squeeze(-1)
+
+            residual_hidden = F.gelu(
+                self.finger_residual_task_input_layer(task_with_finger)
+                + self.finger_residual_state_input_layer(state_with_finger)
+            )
+            if self.finger_residual_context_input_layer is not None:
+                if residual_context is None:
+                    residual_context = torch.zeros(
+                        batch_items,
+                        self.finger_count,
+                        self.context_input_dim,
+                        device=task_context.device,
+                        dtype=task_context.dtype,
+                    )
+                elif residual_context.ndim == 2:
+                    residual_context = residual_context.unsqueeze(1).expand(-1, self.finger_count, -1)
+                elif residual_context.ndim != 3:
+                    raise RuntimeError(
+                        'state_residual_per_finger residual_context must be [N, C] or [N, F, C], '
+                        f'got {tuple(residual_context.shape)}.'
+                    )
+                residual_hidden = residual_hidden + self.finger_residual_context_scale * self.finger_residual_context_input_layer(residual_context)
+            gamma, beta = self.film(p_medium).chunk(2, dim=-1)
+            residual_hidden = (1.0 + gamma.unsqueeze(1)) * residual_hidden + beta.unsqueeze(1)
+            residual_hidden = F.gelu(self.finger_residual_hidden_layer(residual_hidden))
+            if self.head_type == 'state_residual_per_finger_sign_specific':
+                pos_raw = self.finger_residual_pos_output_layer(residual_hidden).squeeze(-1)
+                neg_raw = self.finger_residual_neg_output_layer(residual_hidden).squeeze(-1)
+                direction_logits = self.finger_residual_direction_output_layer(residual_hidden)
+                direction_probs = torch.softmax(direction_logits, dim=-1)
+                pos_magnitude = F.softplus(pos_raw)
+                neg_magnitude = F.softplus(neg_raw)
+                raw_finger_delta = direction_probs[..., 1] * pos_magnitude - direction_probs[..., 0] * neg_magnitude
+                finger_delta = self.residual_output_scale * raw_finger_delta
+                finger_gate = interface_gate.unsqueeze(-1).expand(-1, self.finger_count)
+                finger_force_pred = finger_base_force + finger_gate * finger_delta
+                return {
+                    'force_pred': finger_force_pred.mean(dim=-1),
+                    'force_base': finger_base_force.mean(dim=-1),
+                    'force_interface_delta': finger_delta.mean(dim=-1),
+                    'finger_force_pred': finger_force_pred,
+                    'finger_force_base': finger_base_force,
+                    'finger_force_interface_delta': finger_delta,
+                    'finger_force_interface_delta_raw': raw_finger_delta,
+                    'finger_force_interface_delta_pos_raw': pos_raw,
+                    'finger_force_interface_delta_neg_raw': neg_raw,
+                    'finger_force_interface_delta_pos_magnitude': pos_magnitude,
+                    'finger_force_interface_delta_neg_magnitude': neg_magnitude,
+                    'finger_residual_direction_logit_neg': direction_logits[..., 0],
+                    'finger_residual_direction_logit_pos': direction_logits[..., 1],
+                    'finger_residual_direction_prob_neg': direction_probs[..., 0],
+                    'finger_residual_direction_prob_pos': direction_probs[..., 1],
+                    'interface_gate': interface_gate,
+                }
+            raw_finger_delta = self.finger_residual_output_layer(residual_hidden).squeeze(-1)
+            finger_delta = self.residual_output_scale * raw_finger_delta
+            finger_gate = interface_gate.unsqueeze(-1).expand(-1, self.finger_count)
+            finger_force_pred = finger_base_force + finger_gate * finger_delta
+            return {
+                'force_pred': finger_force_pred.mean(dim=-1),
+                'force_base': finger_base_force.mean(dim=-1),
+                'force_interface_delta': finger_delta.mean(dim=-1),
+                'finger_force_pred': finger_force_pred,
+                'finger_force_base': finger_base_force,
+                'finger_force_interface_delta': finger_delta,
+                'finger_force_interface_delta_raw': raw_finger_delta,
+                'interface_gate': interface_gate,
+            }
 
         if self.head_type in {'state_residual', 'state_residual_sign_specific'}:
             if state_context is None:

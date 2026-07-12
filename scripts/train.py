@@ -130,6 +130,7 @@ def make_dataset(project_root: Path, split_path: Path, subset: str, data_config:
         expert_force_baseline_mode=str(data_config.get('expert_force_baseline_mode', 'none')),
         expert_force_baseline_window_sec=float(data_config.get('expert_force_baseline_window_sec', 0.5)),
         expert_force_interface_margin_sec=float(data_config.get('expert_force_interface_margin_sec', 0.0)),
+        force_target_mode=str(data_config.get('force_target_mode', 'signed_sum')),
         soft_gate_pre_sec=float(data_config.get('soft_gate_pre_sec', 0.0)),
         soft_gate_post_sec=float(data_config.get('soft_gate_post_sec', 0.0)),
         soft_gate_ramp=str(data_config.get('soft_gate_ramp', 'linear')),

@@ -29,6 +29,7 @@ from .tactile import (
     compute_expert_force_curve,
     load_tactile_array,
     normalize_normal_sign_table,
+    normalize_force_target_mode,
     normalize_tactile_input_axes,
     resample_tactile_window,
     select_tactile_channels,
@@ -92,6 +93,7 @@ class CrossMediumSequenceDataset(Dataset):
         expert_force_baseline_mode: str = 'none',
         expert_force_baseline_window_sec: float = 0.5,
         expert_force_interface_margin_sec: float = 0.0,
+        force_target_mode: str = 'signed_sum',
         soft_gate_pre_sec: float = 0.0,
         soft_gate_post_sec: float = 0.0,
         soft_gate_ramp: str = 'linear',
@@ -131,6 +133,8 @@ class CrossMediumSequenceDataset(Dataset):
         self.expert_force_baseline_mode = str(expert_force_baseline_mode or 'none').strip().lower()
         self.expert_force_baseline_window_sec = float(expert_force_baseline_window_sec)
         self.expert_force_interface_margin_sec = float(expert_force_interface_margin_sec)
+        self.force_target_mode = normalize_force_target_mode(force_target_mode)
+        self.finger_force_target_mode = 'per_finger_z_abs_mean'
         self.soft_gate_pre_sec = max(0.0, float(soft_gate_pre_sec))
         self.soft_gate_post_sec = max(0.0, float(soft_gate_post_sec))
         self.soft_gate_ramp = str(soft_gate_ramp or 'linear').strip().lower()
@@ -517,6 +521,23 @@ class CrossMediumSequenceDataset(Dataset):
             return float('nan')
         return float(np.mean(segment))
 
+    def _compute_window_force_vector(
+        self,
+        force_curve: np.ndarray,
+        start_idx: int,
+        end_idx: int,
+        *,
+        sample_mask: np.ndarray | None = None,
+    ) -> np.ndarray:
+        segment = force_curve[start_idx:end_idx]
+        if sample_mask is not None:
+            segment = segment[sample_mask]
+        if segment.size == 0:
+            width = int(force_curve.shape[1]) if force_curve.ndim >= 2 else 1
+            return np.full((width,), float('nan'), dtype=np.float32)
+        values = np.mean(segment, axis=0)
+        return np.asarray(values, dtype=np.float32).reshape(-1)
+
     def _resolve_reference_window_indices(self, windows: list[dict[str, Any]]) -> list[int]:
         first_interface_index = len(windows)
         for window_index, window in enumerate(windows):
@@ -547,6 +568,20 @@ class CrossMediumSequenceDataset(Dataset):
         if self.reference_force_statistic == 'median':
             return float(np.median(array)), True
         return float(np.mean(array)), True
+
+    def _aggregate_reference_force_vector(self, values: list[np.ndarray]) -> tuple[np.ndarray, bool]:
+        finite_values = [
+            np.asarray(value, dtype=np.float32)
+            for value in values
+            if np.asarray(value).ndim == 1 and bool(np.all(np.isfinite(value)))
+        ]
+        if not finite_values:
+            width = int(values[0].shape[0]) if values else 3
+            return np.full((width,), float('nan'), dtype=np.float32), False
+        array = np.stack(finite_values, axis=0).astype(np.float32)
+        if self.reference_force_statistic == 'median':
+            return np.median(array, axis=0).astype(np.float32), True
+        return np.mean(array, axis=0).astype(np.float32), True
 
 
 
@@ -583,6 +618,25 @@ class CrossMediumSequenceDataset(Dataset):
             for window_index in reference_indices
         ]
         reference_force, has_reference = self._aggregate_reference_force(values)
+        return reference_force, has_reference, set(reference_indices)
+
+    def _compute_sample_reference_force_vector(
+        self,
+        windows: list[dict[str, Any]],
+        force_curve: np.ndarray | None,
+    ) -> tuple[np.ndarray, bool, set[int]]:
+        if force_curve is None:
+            return np.full((3,), float('nan'), dtype=np.float32), False, set()
+        reference_indices = self._resolve_reference_window_indices(windows)
+        values = [
+            self._compute_window_force_vector(
+                force_curve,
+                int(windows[window_index]['tactile_start_idx']),
+                int(windows[window_index]['tactile_end_idx']),
+            )
+            for window_index in reference_indices
+        ]
+        reference_force, has_reference = self._aggregate_reference_force_vector(values)
         return reference_force, has_reference, set(reference_indices)
 
     def _window_interval_mask(
@@ -644,23 +698,37 @@ class CrossMediumSequenceDataset(Dataset):
         tactile_high, tactile_low = split_ac_dc(tactile_array, alpha=self.acdc_alpha)
         tactile_high = select_tactile_channels(tactile_high, self.tactile_channel_indices)
         tactile_low = select_tactile_channels(tactile_low, self.tactile_channel_indices)
+        sync_offset_sec = self._parse_optional_float(sample.get('sync_offset_sec')) or 0.0
+        contact_time = self._parse_optional_float(sample.get('t_contact_all'))
 
         expert_curve = compute_expert_force_curve(
             tactile_array=tactile_array,
             dt=self.tactile_dt,
             trial_result=sample['trial_result'],
-            contact_time=sample.get('t_contact_all'),
+            contact_time=contact_time,
             alpha=self.expert_alpha,
             normal_sign_table=self.normal_sign_table,
         )
+        finger_expert_curve = compute_expert_force_curve(
+            tactile_array=tactile_array,
+            dt=self.tactile_dt,
+            trial_result=sample['trial_result'],
+            contact_time=contact_time,
+            alpha=self.expert_alpha,
+            normal_sign_table=self.normal_sign_table,
+            force_target_mode=self.finger_force_target_mode,
+            sync_offset_sec=sync_offset_sec,
+            smoothing_mode=self.expert_force_smoothing,
+            baseline_mode=self.expert_force_baseline_mode,
+            baseline_window_sec=self.expert_force_baseline_window_sec,
+        )
 
         clean_force_curve = None
+        finger_clean_force_curve = None
         tactile_time_axis = None
         interface_interval_start = None
         interface_interval_end = None
         if expert_curve is not None and self.expert_force_mode == 'local_reference_delta':
-            sync_offset_sec = self._parse_optional_float(sample.get('sync_offset_sec')) or 0.0
-            contact_time = self._parse_optional_float(sample.get('t_contact_all'))
             clean_force_curve = compute_clean_force_curve(
                 tactile_array,
                 dt=self.tactile_dt,
@@ -671,6 +739,18 @@ class CrossMediumSequenceDataset(Dataset):
                 smoothing_mode=self.expert_force_smoothing,
                 baseline_mode=self.expert_force_baseline_mode,
                 baseline_window_sec=self.expert_force_baseline_window_sec,
+            )
+            finger_clean_force_curve = compute_clean_force_curve(
+                tactile_array,
+                dt=self.tactile_dt,
+                sync_offset_sec=sync_offset_sec,
+                contact_time=contact_time,
+                alpha=self.expert_alpha,
+                normal_sign_table=self.normal_sign_table,
+                smoothing_mode=self.expert_force_smoothing,
+                baseline_mode=self.expert_force_baseline_mode,
+                baseline_window_sec=self.expert_force_baseline_window_sec,
+                force_target_mode=self.finger_force_target_mode,
             )
             tactile_time_axis = build_tactile_time_axis(
                 clean_force_curve.shape[0],
@@ -684,15 +764,28 @@ class CrossMediumSequenceDataset(Dataset):
                 interface_interval_end = float(t_if_exit) + self.expert_force_interface_margin_sec
 
         reference_curve = clean_force_curve if clean_force_curve is not None else expert_curve
+        finger_reference_curve = finger_clean_force_curve if finger_clean_force_curve is not None else finger_expert_curve
         sample_reference_force, has_sample_reference, reference_window_indices = self._compute_sample_reference_force(
             windows,
             reference_curve,
+        )
+        finger_sample_reference_force, has_finger_sample_reference, finger_reference_window_indices = self._compute_sample_reference_force_vector(
+            windows,
+            finger_reference_curve,
         )
         use_local_reference_targets = (
             self.expert_force_mode == 'local_reference_delta'
             and clean_force_curve is not None
             and tactile_time_axis is not None
             and has_sample_reference
+            and interface_interval_start is not None
+            and interface_interval_end is not None
+        )
+        use_finger_local_reference_targets = (
+            self.expert_force_mode == 'local_reference_delta'
+            and finger_clean_force_curve is not None
+            and tactile_time_axis is not None
+            and has_finger_sample_reference
             and interface_interval_start is not None
             and interface_interval_end is not None
         )
@@ -711,9 +804,16 @@ class CrossMediumSequenceDataset(Dataset):
         control_force_targets: list[float] = []
         reference_forces: list[float] = []
         delta_force_targets: list[float] = []
+        finger_expert_forces: list[list[float]] = []
+        finger_control_force_targets: list[list[float]] = []
+        finger_reference_forces: list[list[float]] = []
+        finger_delta_force_targets: list[list[float]] = []
         has_expert: list[int] = []
         has_control_target: list[int] = []
         has_reference: list[int] = []
+        has_finger_expert: list[list[int]] = []
+        has_finger_control_target: list[list[int]] = []
+        has_finger_reference: list[list[int]] = []
         reference_supervision_masks: list[int] = []
         delta_supervision_masks: list[int] = []
         quiet_supervision_masks: list[int] = []
@@ -796,9 +896,17 @@ class CrossMediumSequenceDataset(Dataset):
             control_force_target = float('nan')
             reference_force = float('nan')
             delta_force_target = float('nan')
+            finger_expert_force = np.full((3,), float('nan'), dtype=np.float32)
+            finger_control_force_target = np.full((3,), float('nan'), dtype=np.float32)
+            finger_reference_force = np.full((3,), float('nan'), dtype=np.float32)
+            finger_delta_force_target = np.full((3,), float('nan'), dtype=np.float32)
             has_expert_flag = 0
             has_control_target_flag = 0
             has_reference_flag = 0
+            has_finger_expert_flag = np.zeros((3,), dtype=np.int64)
+            has_finger_control_target_flag = np.zeros((3,), dtype=np.int64)
+            has_finger_reference_flag = np.zeros((3,), dtype=np.int64)
+            finger_reference_supervision_flag = 0
             reference_supervision_flag = 0
             delta_supervision_flag = 0
             quiet_supervision_flag = 0
@@ -807,11 +915,17 @@ class CrossMediumSequenceDataset(Dataset):
             if expert_curve is not None:
                 expert_force = self._compute_window_force_value(expert_curve, start_idx, end_idx)
                 has_expert_flag = int(np.isfinite(expert_force))
+            if finger_expert_curve is not None:
+                finger_expert_force = self._compute_window_force_vector(finger_expert_curve, start_idx, end_idx)
+                has_finger_expert_flag = np.isfinite(finger_expert_force).astype(np.int64)
 
             if has_sample_reference:
                 reference_force = float(sample_reference_force)
+            if has_finger_sample_reference:
+                finger_reference_force = np.asarray(finger_sample_reference_force, dtype=np.float32)
 
             is_reference_window = window_index in reference_window_indices
+            is_finger_reference_window = window_index in finger_reference_window_indices
             if use_local_reference_targets:
                 local_overlap_mask = self._window_interval_mask(
                     tactile_time_axis,
@@ -854,13 +968,63 @@ class CrossMediumSequenceDataset(Dataset):
                     has_reference_flag = reference_supervision_flag
                     delta_force_target = float(expert_force - sample_reference_force)
 
+            if use_finger_local_reference_targets:
+                finger_overlap_mask = self._window_interval_mask(
+                    tactile_time_axis,
+                    start_idx,
+                    end_idx,
+                    interval_start=float(interface_interval_start),
+                    interval_end=float(interface_interval_end),
+                )
+                has_finger_overlap = bool(finger_overlap_mask.any())
+                finger_reference_supervision_flag = int(is_finger_reference_window or is_interface_window)
+
+                if is_interface_window:
+                    finger_target_force = self._compute_window_force_vector(
+                        finger_clean_force_curve,
+                        start_idx,
+                        end_idx,
+                        sample_mask=finger_overlap_mask if has_finger_overlap else None,
+                    )
+                    if not np.all(np.isfinite(finger_target_force)):
+                        finger_target_force = self._compute_window_force_vector(finger_clean_force_curve, start_idx, end_idx)
+                    finite_target = np.isfinite(finger_target_force)
+                    if np.any(finite_target):
+                        finger_control_force_target = finger_target_force.astype(np.float32)
+                        finger_delta_force_target = (finger_target_force - finger_sample_reference_force).astype(np.float32)
+                        has_finger_control_target_flag = finite_target.astype(np.int64)
+                elif (not is_interface_window) and (is_finger_reference_window or has_finger_overlap):
+                    finger_control_force_target = np.asarray(finger_sample_reference_force, dtype=np.float32)
+                    finger_delta_force_target = np.zeros_like(finger_control_force_target, dtype=np.float32)
+                    has_finger_control_target_flag = np.isfinite(finger_control_force_target).astype(np.int64)
+                has_finger_reference_flag = (
+                    np.isfinite(finger_reference_force) & bool(finger_reference_supervision_flag)
+                ).astype(np.int64)
+            else:
+                if np.any(has_finger_expert_flag):
+                    finger_control_force_target = finger_expert_force.astype(np.float32)
+                    has_finger_control_target_flag = has_finger_expert_flag.copy()
+                if has_finger_sample_reference and np.any(has_finger_expert_flag):
+                    finger_reference_supervision_flag = int(is_finger_reference_window or is_interface_window)
+                    finger_delta_force_target = (finger_expert_force - finger_sample_reference_force).astype(np.float32)
+                    has_finger_reference_flag = (
+                        np.isfinite(finger_reference_force) & bool(finger_reference_supervision_flag)
+                    ).astype(np.int64)
+
             expert_forces.append(expert_force)
             control_force_targets.append(control_force_target)
             reference_forces.append(reference_force)
             delta_force_targets.append(delta_force_target)
+            finger_expert_forces.append(finger_expert_force.astype(np.float32).tolist())
+            finger_control_force_targets.append(finger_control_force_target.astype(np.float32).tolist())
+            finger_reference_forces.append(finger_reference_force.astype(np.float32).tolist())
+            finger_delta_force_targets.append(finger_delta_force_target.astype(np.float32).tolist())
             has_expert.append(has_expert_flag)
             has_control_target.append(has_control_target_flag)
             has_reference.append(has_reference_flag)
+            has_finger_expert.append(has_finger_expert_flag.astype(np.int64).tolist())
+            has_finger_control_target.append(has_finger_control_target_flag.astype(np.int64).tolist())
+            has_finger_reference.append(has_finger_reference_flag.astype(np.int64).tolist())
             reference_supervision_masks.append(reference_supervision_flag)
             delta_supervision_masks.append(delta_supervision_flag)
             quiet_supervision_masks.append(quiet_supervision_flag)
@@ -889,9 +1053,16 @@ class CrossMediumSequenceDataset(Dataset):
             'control_force_targets': control_force_targets,
             'reference_forces': reference_forces,
             'delta_force_targets': delta_force_targets,
+            'finger_expert_forces': finger_expert_forces,
+            'finger_control_force_targets': finger_control_force_targets,
+            'finger_reference_forces': finger_reference_forces,
+            'finger_delta_force_targets': finger_delta_force_targets,
             'has_expert': has_expert,
             'has_control_target': has_control_target,
             'has_reference': has_reference,
+            'has_finger_expert': has_finger_expert,
+            'has_finger_control_target': has_finger_control_target,
+            'has_finger_reference': has_finger_reference,
             'reference_supervision_masks': reference_supervision_masks,
             'delta_supervision_masks': delta_supervision_masks,
             'quiet_supervision_masks': quiet_supervision_masks,
@@ -937,9 +1108,17 @@ def sequence_collate_fn(batch: list[dict[str, Any]]) -> dict[str, Any]:
     control_force_targets = torch.full((batch_size, max_windows), float('nan'), dtype=torch.float32)
     reference_forces = torch.full((batch_size, max_windows), float('nan'), dtype=torch.float32)
     delta_force_targets = torch.full((batch_size, max_windows), float('nan'), dtype=torch.float32)
+    finger_count = int(len(batch[0]['finger_expert_forces'][0])) if batch[0].get('finger_expert_forces') else 3
+    finger_expert_forces = torch.full((batch_size, max_windows, finger_count), float('nan'), dtype=torch.float32)
+    finger_control_force_targets = torch.full((batch_size, max_windows, finger_count), float('nan'), dtype=torch.float32)
+    finger_reference_forces = torch.full((batch_size, max_windows, finger_count), float('nan'), dtype=torch.float32)
+    finger_delta_force_targets = torch.full((batch_size, max_windows, finger_count), float('nan'), dtype=torch.float32)
     has_expert = torch.zeros(batch_size, max_windows, dtype=torch.bool)
     has_control_target = torch.zeros(batch_size, max_windows, dtype=torch.bool)
     has_reference = torch.zeros(batch_size, max_windows, dtype=torch.bool)
+    has_finger_expert = torch.zeros(batch_size, max_windows, finger_count, dtype=torch.bool)
+    has_finger_control_target = torch.zeros(batch_size, max_windows, finger_count, dtype=torch.bool)
+    has_finger_reference = torch.zeros(batch_size, max_windows, finger_count, dtype=torch.bool)
     reference_supervision_masks = torch.zeros(batch_size, max_windows, dtype=torch.bool)
     delta_supervision_masks = torch.zeros(batch_size, max_windows, dtype=torch.bool)
     quiet_supervision_masks = torch.zeros(batch_size, max_windows, dtype=torch.bool)
@@ -1029,9 +1208,37 @@ def sequence_collate_fn(batch: list[dict[str, Any]]) -> dict[str, Any]:
             control_force_targets[batch_index, window_index] = float(item['control_force_targets'][window_index])
             reference_forces[batch_index, window_index] = float(item['reference_forces'][window_index])
             delta_force_targets[batch_index, window_index] = float(item['delta_force_targets'][window_index])
+            finger_expert_forces[batch_index, window_index] = torch.tensor(
+                item['finger_expert_forces'][window_index],
+                dtype=torch.float32,
+            )
+            finger_control_force_targets[batch_index, window_index] = torch.tensor(
+                item['finger_control_force_targets'][window_index],
+                dtype=torch.float32,
+            )
+            finger_reference_forces[batch_index, window_index] = torch.tensor(
+                item['finger_reference_forces'][window_index],
+                dtype=torch.float32,
+            )
+            finger_delta_force_targets[batch_index, window_index] = torch.tensor(
+                item['finger_delta_force_targets'][window_index],
+                dtype=torch.float32,
+            )
             has_expert[batch_index, window_index] = bool(item['has_expert'][window_index])
             has_control_target[batch_index, window_index] = bool(item['has_control_target'][window_index])
             has_reference[batch_index, window_index] = bool(item['has_reference'][window_index])
+            has_finger_expert[batch_index, window_index] = torch.tensor(
+                item['has_finger_expert'][window_index],
+                dtype=torch.bool,
+            )
+            has_finger_control_target[batch_index, window_index] = torch.tensor(
+                item['has_finger_control_target'][window_index],
+                dtype=torch.bool,
+            )
+            has_finger_reference[batch_index, window_index] = torch.tensor(
+                item['has_finger_reference'][window_index],
+                dtype=torch.bool,
+            )
             reference_supervision_masks[batch_index, window_index] = bool(item['reference_supervision_masks'][window_index])
             delta_supervision_masks[batch_index, window_index] = bool(item['delta_supervision_masks'][window_index])
             quiet_supervision_masks[batch_index, window_index] = bool(item['quiet_supervision_masks'][window_index])
@@ -1059,9 +1266,16 @@ def sequence_collate_fn(batch: list[dict[str, Any]]) -> dict[str, Any]:
         'control_force_targets': control_force_targets,
         'reference_forces': reference_forces,
         'delta_force_targets': delta_force_targets,
+        'finger_expert_forces': finger_expert_forces,
+        'finger_control_force_targets': finger_control_force_targets,
+        'finger_reference_forces': finger_reference_forces,
+        'finger_delta_force_targets': finger_delta_force_targets,
         'has_expert': has_expert,
         'has_control_target': has_control_target,
         'has_reference': has_reference,
+        'has_finger_expert': has_finger_expert,
+        'has_finger_control_target': has_finger_control_target,
+        'has_finger_reference': has_finger_reference,
         'reference_supervision_masks': reference_supervision_masks,
         'delta_supervision_masks': delta_supervision_masks,
         'quiet_supervision_masks': quiet_supervision_masks,

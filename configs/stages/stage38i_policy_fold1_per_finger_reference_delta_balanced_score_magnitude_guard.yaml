@@ -1,0 +1,112 @@
+name: stage38i_policy_fold1_per_finger_reference_delta_balanced_score_magnitude_guard
+stage_index: 38
+checkpoint_prefix: stage38i_fold1_per_finger_reference_delta_balanced_score_magnitude_guard
+best_checkpoint_name: stage38i_fold1_per_finger_reference_delta_balanced_score_magnitude_guard_best_finger_large_delta_balanced_score.pt
+split: data/splits/split_unseen_fold1_v1.yaml
+tail_mode: all_valid
+freeze_modules:
+  - visual_encoder
+  - content_encoder
+  - evidence_encoder
+  - medium_head
+  - attribute_head.shared
+  - attribute_head.fragility
+  - attribute_head.geometry
+  - attribute_head.surface
+  - attribute_head.object_projection
+loss_weights:
+  clip: 0.0
+  inv: 0.0
+  med: 0.0
+  attr: 0.0
+  pol: 1.0
+policy_loss:
+  type: explicit_reference_delta_per_finger_smooth_l1
+  all_weight: 0.0
+  interface_weight: 0.25
+  stable_weight: 0.0
+  base_reference_weight: 0.0
+  base_stable_weight: 0.0
+  residual_interface_weight: 1.5
+  residual_large_delta_weight: 3.5
+  residual_large_delta_sign_weight: 0.8
+  large_delta_sign_margin: 0.07
+  sign_balanced_large_delta: true
+  large_delta_threshold: 100.0
+  residual_large_delta_threshold: 8.0
+  finger_large_delta_threshold: 8.0
+  large_delta_weight_alpha: 1.0
+  large_delta_weight_cap: 3.0
+  residual_stable_zero_weight: 1.25
+  residual_non_interface_weight: 0.3
+  gated_residual_interface_weight: 0.0
+  quiet_weight: 0.0
+  interface_positive_bias_weight: 0.0
+  interface_bias_margin: 0.0
+  beta: 1.0
+  delta_normalization_scale: 20.0
+selection_metric: finger_large_delta_balanced_score
+maximize_metric: false
+tie_breakers:
+  - metric: finger_large_delta_balanced_mae
+    mode: min
+  - metric: finger_large_delta_balanced_wrong_sign_rate
+    mode: min
+  - metric: finger_control_interface_mae
+    mode: min
+  - metric: finger_delta_interface_mae
+    mode: min
+  - metric: stable_leakage_mean
+    mode: min
+  - metric: epoch
+    mode: min
+data:
+  num_frames_per_window: 4
+  tactile_input_axes: [z]
+  attribute_taxonomy: coarse_v2
+  reference_force_window_count: 3
+  reference_force_statistic: median
+  expert_force_mode: local_reference_delta
+  expert_force_smoothing: zero_phase_ema
+  expert_force_baseline_mode: pre_contact_median
+  expert_force_baseline_window_sec: 0.5
+  expert_force_interface_margin_sec: 0.1
+model:
+  visual:
+    use_lora: true
+    lora_rank: 16
+    lora_alpha: 32
+    lora_dropout: 0.05
+    max_windows_per_encode: 2
+  tactile:
+    content_layers: 3
+  attributes:
+    fragility_classes: 2
+    geometry_classes: 2
+    surface_classes: 2
+    metric_tasks:
+      - geometry
+  policy:
+    head_type: state_residual_per_finger
+    base_source: reference_force
+    use_reference_force_context: true
+    reference_force_context_scale: 100.0
+    finger_count: 3
+    finger_embedding_dim: 16
+train:
+  epochs: 10
+  batch_size: 2
+  num_workers: 0
+  pin_memory: false
+  persistent_workers: false
+  sampling_mode: interface_object_aware
+  interface_sampler_alpha: 1.75
+  interface_sampler_min_expert_windows: 1
+  samples_per_object: 1
+  val_every_n_epochs: 1
+  early_stopping_patience: 4
+  warmup_ratio: 0.05
+  learning_rate: 0.00002
+  base_learning_rate: 0.00002
+  lora_learning_rate: 0.00001
+  amp_enabled: false

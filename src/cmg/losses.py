@@ -94,6 +94,7 @@ def masked_weighted_scaled_smooth_l1(
     scale: float,
     weight_alpha: float,
     weight_cap: float,
+    sample_weight: torch.Tensor | None = None,
     zero: torch.Tensor,
 ) -> torch.Tensor:
     if not mask.any():
@@ -104,6 +105,18 @@ def masked_weighted_scaled_smooth_l1(
     tgt = target[mask] / scale
     loss = F.smooth_l1_loss(pred, tgt, beta=beta, reduction='none')
     weights = 1.0 + float(weight_alpha) * torch.clamp(torch.abs(tgt), min=0.0, max=float(weight_cap))
+    if sample_weight is not None:
+        flat_weight = sample_weight.reshape(-1).to(device=loss.device, dtype=loss.dtype)
+        flat_mask = mask.reshape(-1)
+        if flat_weight.numel() != flat_mask.numel():
+            raise RuntimeError(
+                'sample_weight cannot be broadcast to policy loss mask: '
+                f'{flat_weight.numel()} vs {flat_mask.numel()}.'
+            )
+        selected_weight = flat_weight[flat_mask]
+        if not (selected_weight > 0).any():
+            return zero
+        return (loss * weights * selected_weight).sum() / selected_weight.sum().clamp_min(loss.new_tensor(1e-12))
     return (loss * weights).mean()
 
 
@@ -114,6 +127,7 @@ def masked_large_delta_sign_loss(
     *,
     scale: float,
     margin: float,
+    sample_weight: torch.Tensor | None = None,
     zero: torch.Tensor,
 ) -> torch.Tensor:
     if not mask.any():
@@ -127,7 +141,20 @@ def masked_large_delta_sign_loss(
     if not valid.any():
         return zero
     signed_pred = signs[valid] * pred[valid]
-    return torch.relu(float(margin) - signed_pred).mean()
+    loss = torch.relu(float(margin) - signed_pred)
+    if sample_weight is not None:
+        flat_weight = sample_weight.reshape(-1).to(device=loss.device, dtype=loss.dtype)
+        flat_mask = mask.reshape(-1)
+        if flat_weight.numel() != flat_mask.numel():
+            raise RuntimeError(
+                'sample_weight cannot be broadcast to policy loss mask: '
+                f'{flat_weight.numel()} vs {flat_mask.numel()}.'
+            )
+        selected_weight = flat_weight[flat_mask][valid]
+        if not (selected_weight > 0).any():
+            return zero
+        return (loss * selected_weight).sum() / selected_weight.sum().clamp_min(loss.new_tensor(1e-12))
+    return loss.mean()
 
 
 def sign_balanced_large_delta_loss(
@@ -141,6 +168,7 @@ def sign_balanced_large_delta_loss(
     weight_cap: float,
     positive_weight: float = 1.0,
     negative_weight: float = 1.0,
+    sample_weight: torch.Tensor | None = None,
     zero: torch.Tensor,
 ) -> torch.Tensor:
     positive_mask = mask & (target > 0)
@@ -160,6 +188,7 @@ def sign_balanced_large_delta_loss(
                 scale=scale,
                 weight_alpha=weight_alpha,
                 weight_cap=weight_cap,
+                sample_weight=sample_weight,
                 zero=zero,
             )
         )
@@ -175,6 +204,7 @@ def sign_balanced_large_delta_loss(
                 scale=scale,
                 weight_alpha=weight_alpha,
                 weight_cap=weight_cap,
+                sample_weight=sample_weight,
                 zero=zero,
             )
         )
@@ -193,6 +223,7 @@ def sign_balanced_large_delta_sign_loss(
     margin: float,
     positive_weight: float = 1.0,
     negative_weight: float = 1.0,
+    sample_weight: torch.Tensor | None = None,
     zero: torch.Tensor,
 ) -> torch.Tensor:
     positive_mask = mask & (target > 0)
@@ -210,6 +241,7 @@ def sign_balanced_large_delta_sign_loss(
                 positive_mask,
                 scale=scale,
                 margin=margin,
+                sample_weight=sample_weight,
                 zero=zero,
             )
         )
@@ -223,6 +255,7 @@ def sign_balanced_large_delta_sign_loss(
                 negative_mask,
                 scale=scale,
                 margin=margin,
+                sample_weight=sample_weight,
                 zero=zero,
             )
         )
@@ -239,6 +272,7 @@ def sign_balanced_direction_gate_cross_entropy(
     *,
     positive_weight: float = 1.0,
     negative_weight: float = 1.0,
+    sample_weight: torch.Tensor | None = None,
     zero: torch.Tensor,
 ) -> torch.Tensor:
     valid_mask = mask & (target_delta != 0)
@@ -254,10 +288,40 @@ def sign_balanced_direction_gate_cross_entropy(
     positive_weight = float(positive_weight)
     negative_weight = float(negative_weight)
     if positive_weight > 0.0 and positive_mask.any():
-        parts.append(positive_weight * F.cross_entropy(logits[positive_mask], targets[positive_mask]))
+        positive_loss = F.cross_entropy(logits[positive_mask], targets[positive_mask], reduction='none')
+        if sample_weight is not None:
+            flat_weight = sample_weight.reshape(-1).to(device=positive_loss.device, dtype=positive_loss.dtype)
+            if flat_weight.numel() != valid.numel():
+                raise RuntimeError(
+                    'sample_weight cannot be broadcast to policy loss mask: '
+                    f'{flat_weight.numel()} vs {valid.numel()}.'
+                )
+            selected_weight = flat_weight[positive_mask]
+            positive_loss = (
+                (positive_loss * selected_weight).sum()
+                / selected_weight.sum().clamp_min(positive_loss.new_tensor(1e-12))
+            )
+        else:
+            positive_loss = positive_loss.mean()
+        parts.append(positive_weight * positive_loss)
         weights.append(positive_weight)
     if negative_weight > 0.0 and negative_mask.any():
-        parts.append(negative_weight * F.cross_entropy(logits[negative_mask], targets[negative_mask]))
+        negative_loss = F.cross_entropy(logits[negative_mask], targets[negative_mask], reduction='none')
+        if sample_weight is not None:
+            flat_weight = sample_weight.reshape(-1).to(device=negative_loss.device, dtype=negative_loss.dtype)
+            if flat_weight.numel() != valid.numel():
+                raise RuntimeError(
+                    'sample_weight cannot be broadcast to policy loss mask: '
+                    f'{flat_weight.numel()} vs {valid.numel()}.'
+                )
+            selected_weight = flat_weight[negative_mask]
+            negative_loss = (
+                (negative_loss * selected_weight).sum()
+                / selected_weight.sum().clamp_min(negative_loss.new_tensor(1e-12))
+            )
+        else:
+            negative_loss = negative_loss.mean()
+        parts.append(negative_weight * negative_loss)
         weights.append(negative_weight)
     if not parts:
         return zero
@@ -276,6 +340,7 @@ def sign_specific_magnitude_loss(
     opposite_weight: float = 0.0,
     positive_weight: float = 1.0,
     negative_weight: float = 1.0,
+    sample_weight: torch.Tensor | None = None,
     zero: torch.Tensor,
 ) -> torch.Tensor:
     pos_magnitude = outputs.get('force_interface_delta_pos_magnitude')
@@ -302,6 +367,14 @@ def sign_specific_magnitude_loss(
 
     positive_mask = flat_mask & (flat_delta > 0)
     negative_mask = flat_mask & (flat_delta < 0)
+    flat_sample_weight = None
+    if sample_weight is not None:
+        flat_sample_weight = sample_weight.reshape(-1).to(device=flat_delta.device, dtype=flat_delta.dtype)
+        if flat_sample_weight.numel() != flat_mask.numel():
+            raise RuntimeError(
+                'sample_weight cannot be broadcast to policy loss mask: '
+                f'{flat_sample_weight.numel()} vs {flat_mask.numel()}.'
+            )
     parts = []
     weights = []
     positive_weight = float(positive_weight)
@@ -314,16 +387,33 @@ def sign_specific_magnitude_loss(
             pos_magnitude[positive_mask],
             positive_target_magnitude,
             beta=beta,
+            reduction='none',
         )
-        opposite_loss = (
-            F.smooth_l1_loss(
+        if flat_sample_weight is not None:
+            selected_weight = flat_sample_weight[positive_mask]
+            active_loss = (
+                (active_loss * selected_weight).sum()
+                / selected_weight.sum().clamp_min(active_loss.new_tensor(1e-12))
+            )
+        else:
+            active_loss = active_loss.mean()
+        if opposite_weight > 0.0:
+            opposite_loss = F.smooth_l1_loss(
                 neg_magnitude[positive_mask],
                 zero_magnitude[positive_mask],
                 beta=beta,
+                reduction='none',
             )
-            if opposite_weight > 0.0
-            else zero
-        )
+            if flat_sample_weight is not None:
+                selected_weight = flat_sample_weight[positive_mask]
+                opposite_loss = (
+                    (opposite_loss * selected_weight).sum()
+                    / selected_weight.sum().clamp_min(opposite_loss.new_tensor(1e-12))
+                )
+            else:
+                opposite_loss = opposite_loss.mean()
+        else:
+            opposite_loss = zero
         parts.append(positive_weight * (active_loss + opposite_weight * opposite_loss))
         weights.append(positive_weight)
 
@@ -333,16 +423,33 @@ def sign_specific_magnitude_loss(
             neg_magnitude[negative_mask],
             negative_target_magnitude,
             beta=beta,
+            reduction='none',
         )
-        opposite_loss = (
-            F.smooth_l1_loss(
+        if flat_sample_weight is not None:
+            selected_weight = flat_sample_weight[negative_mask]
+            active_loss = (
+                (active_loss * selected_weight).sum()
+                / selected_weight.sum().clamp_min(active_loss.new_tensor(1e-12))
+            )
+        else:
+            active_loss = active_loss.mean()
+        if opposite_weight > 0.0:
+            opposite_loss = F.smooth_l1_loss(
                 pos_magnitude[negative_mask],
                 zero_magnitude[negative_mask],
                 beta=beta,
+                reduction='none',
             )
-            if opposite_weight > 0.0
-            else zero
-        )
+            if flat_sample_weight is not None:
+                selected_weight = flat_sample_weight[negative_mask]
+                opposite_loss = (
+                    (opposite_loss * selected_weight).sum()
+                    / selected_weight.sum().clamp_min(opposite_loss.new_tensor(1e-12))
+                )
+            else:
+                opposite_loss = opposite_loss.mean()
+        else:
+            opposite_loss = zero
         parts.append(negative_weight * (active_loss + opposite_weight * opposite_loss))
         weights.append(negative_weight)
 
@@ -490,7 +597,9 @@ def compute_policy_loss(
         beta = float(policy_config.get('beta', 1.0))
         delta_normalization_scale = float(policy_config.get('delta_normalization_scale', 1.0))
         residual_large_delta_weight = float(policy_config.get('residual_large_delta_weight', 0.0))
-        large_delta_threshold = float(policy_config.get('large_delta_threshold', 0.0))
+        large_delta_threshold = float(
+            policy_config.get('residual_large_delta_threshold', policy_config.get('large_delta_threshold', 0.0))
+        )
         large_delta_weight_alpha = float(policy_config.get('large_delta_weight_alpha', 0.0))
         large_delta_weight_cap = float(policy_config.get('large_delta_weight_cap', 4.0))
         residual_large_delta_sign_weight = float(policy_config.get('residual_large_delta_sign_weight', 0.0))
@@ -571,7 +680,23 @@ def compute_policy_loss(
 
         base_force = outputs['force_base'].reshape(-1)
         interface_delta = outputs['force_interface_delta'].reshape(-1)
+        sample_weight = outputs.get('policy_sample_weight')
+        if sample_weight is not None:
+            sample_weight = sample_weight.to(device=interface_delta.device, dtype=interface_delta.dtype).reshape(-1)
+            if sample_weight.numel() != interface_delta.numel():
+                raise RuntimeError(
+                    'policy_sample_weight cannot be broadcast to force_interface_delta: '
+                    f'{sample_weight.numel()} vs {interface_delta.numel()}.'
+                )
         interface_gate = outputs['interface_gate'].reshape(-1) if 'interface_gate' in outputs else None
+        if interface_gate is not None and interface_gate.numel() != interface_delta.numel():
+            if interface_delta.numel() % max(1, interface_gate.numel()) != 0:
+                raise RuntimeError(
+                    'interface_gate cannot be broadcast to force_interface_delta: '
+                    f'{interface_gate.numel()} vs {interface_delta.numel()}.'
+                )
+            repeat_factor = interface_delta.numel() // max(1, interface_gate.numel())
+            interface_gate = interface_gate.reshape(-1, 1).expand(-1, repeat_factor).reshape(-1)
         interface_expert = delta_supervision_mask
         stable_expert = control_mask & stable_mask
         reference_mask = reference_supervision_mask
@@ -626,6 +751,7 @@ def compute_policy_loss(
                     weight_cap=large_delta_weight_cap,
                     positive_weight=large_delta_pos_loss_weight,
                     negative_weight=large_delta_neg_loss_weight,
+                    sample_weight=sample_weight,
                     zero=zero,
                 )
                 if sign_balanced_large_delta
@@ -637,6 +763,7 @@ def compute_policy_loss(
                     scale=delta_normalization_scale,
                     weight_alpha=large_delta_weight_alpha,
                     weight_cap=large_delta_weight_cap,
+                    sample_weight=sample_weight,
                     zero=zero,
                 )
             )
@@ -651,6 +778,7 @@ def compute_policy_loss(
                     margin=large_delta_sign_margin,
                     positive_weight=large_delta_pos_loss_weight,
                     negative_weight=large_delta_neg_loss_weight,
+                    sample_weight=sample_weight,
                     zero=zero,
                 )
                 if sign_balanced_large_delta
@@ -660,6 +788,7 @@ def compute_policy_loss(
                     large_delta_mask,
                     scale=delta_normalization_scale,
                     margin=large_delta_sign_margin,
+                    sample_weight=sample_weight,
                     zero=zero,
                 )
             )
@@ -677,6 +806,7 @@ def compute_policy_loss(
                 large_delta_mask,
                 positive_weight=direction_gate_pos_loss_weight,
                 negative_weight=direction_gate_neg_loss_weight,
+                sample_weight=sample_weight,
                 zero=zero,
             )
         if residual_sign_magnitude_weight > 0.0:
@@ -691,6 +821,7 @@ def compute_policy_loss(
                 opposite_weight=sign_magnitude_opposite_weight,
                 positive_weight=sign_magnitude_pos_loss_weight,
                 negative_weight=sign_magnitude_neg_loss_weight,
+                sample_weight=sample_weight,
                 zero=zero,
             )
         if negative_under_magnitude_weight > 0.0:
@@ -759,7 +890,9 @@ def compute_policy_loss(
         detach_base_target = bool(policy_config.get('detach_base_target', True))
         delta_normalization_scale = float(policy_config.get('delta_normalization_scale', 1.0))
         residual_large_delta_weight = float(policy_config.get('residual_large_delta_weight', 0.0))
-        large_delta_threshold = float(policy_config.get('large_delta_threshold', 0.0))
+        large_delta_threshold = float(
+            policy_config.get('residual_large_delta_threshold', policy_config.get('large_delta_threshold', 0.0))
+        )
         large_delta_weight_alpha = float(policy_config.get('large_delta_weight_alpha', 0.0))
         large_delta_weight_cap = float(policy_config.get('large_delta_weight_cap', 4.0))
         residual_large_delta_sign_weight = float(policy_config.get('residual_large_delta_sign_weight', 0.0))
@@ -1222,18 +1355,108 @@ def compute_losses(
     else:
         losses['inv'] = zero
 
-    force_targets = batch['control_force_targets'].reshape(-1) if 'control_force_targets' in batch else batch['expert_forces'].reshape(-1)
-    reference_targets = batch['reference_forces'].reshape(-1) if 'reference_forces' in batch else None
-    delta_targets = batch['delta_force_targets'].reshape(-1) if 'delta_force_targets' in batch else None
-    has_expert = batch['has_expert'].reshape(-1) & window_mask
-    has_reference = batch['has_reference'].reshape(-1) & window_mask if 'has_reference' in batch else has_expert.new_zeros(has_expert.shape)
-    control_mask = batch['has_control_target'].reshape(-1) & window_mask if 'has_control_target' in batch else has_expert
-    reference_supervision_mask = batch['reference_supervision_masks'].reshape(-1) & window_mask if 'reference_supervision_masks' in batch else has_reference
-    delta_supervision_mask = batch['delta_supervision_masks'].reshape(-1) & window_mask if 'delta_supervision_masks' in batch else (has_reference & (phase_targets == 1))
-    quiet_supervision_mask = batch['quiet_supervision_masks'].reshape(-1) & window_mask if 'quiet_supervision_masks' in batch else (control_mask & (phase_targets != 1))
+    raw_policy_config = policy_loss_config if isinstance(policy_loss_config, dict) else {}
+    policy_type = str(raw_policy_config.get('type', 'mse'))
+    use_per_finger_policy = policy_type in {
+        'explicit_reference_delta_per_finger_smooth_l1',
+        'explicit_reference_delta_per_finger_weighted_smooth_l1',
+    }
+
+    effective_policy_loss_config = policy_loss_config
+    if use_per_finger_policy:
+        if 'finger_force_pred' not in outputs:
+            raise RuntimeError(
+                f"policy_loss.type={policy_type!r} requires a per-finger policy head."
+            )
+        if not all(
+            key in batch
+            for key in (
+                'finger_control_force_targets',
+                'finger_reference_forces',
+                'finger_delta_force_targets',
+                'has_finger_expert',
+                'has_finger_control_target',
+                'has_finger_reference',
+            )
+        ):
+            raise RuntimeError('Per-finger policy loss requires per-finger force targets in the batch.')
+
+        finger_window_mask = batch['window_mask'].unsqueeze(-1).expand_as(batch['finger_control_force_targets']).reshape(-1)
+        finger_phase_targets = batch['phase_labels'].unsqueeze(-1).expand_as(batch['finger_control_force_targets']).reshape(-1)
+        finger_stable_mask = batch['stable_masks'].unsqueeze(-1).expand_as(batch['finger_control_force_targets']).reshape(-1)
+        force_targets = batch['finger_control_force_targets'].reshape(-1)
+        reference_targets = batch['finger_reference_forces'].reshape(-1)
+        delta_targets = batch['finger_delta_force_targets'].reshape(-1)
+        has_expert = batch['has_finger_expert'].reshape(-1) & finger_window_mask
+        has_reference = batch['has_finger_reference'].reshape(-1) & finger_window_mask
+        control_mask = batch['has_finger_control_target'].reshape(-1) & finger_window_mask
+        reference_supervision_mask = has_reference
+        delta_supervision_mask = (
+            batch['delta_supervision_masks'].unsqueeze(-1).expand_as(batch['finger_control_force_targets']).reshape(-1)
+            & control_mask
+        )
+        quiet_supervision_mask = (
+            batch['quiet_supervision_masks'].unsqueeze(-1).expand_as(batch['finger_control_force_targets']).reshape(-1)
+            & control_mask
+        )
+        phase_targets_for_policy = finger_phase_targets
+        stable_mask_for_policy = finger_stable_mask
+        window_mask_for_policy = finger_window_mask
+        effective_policy_loss_config = dict(raw_policy_config)
+        effective_policy_loss_config['type'] = 'explicit_reference_delta_weighted_smooth_l1'
+        policy_outputs = dict(outputs)
+        policy_outputs['force_pred'] = outputs['finger_force_pred']
+        policy_outputs['force_base'] = outputs['finger_force_base']
+        policy_outputs['force_interface_delta'] = outputs['finger_force_interface_delta']
+        if 'finger_force_interface_delta_pos_magnitude' in outputs:
+            policy_outputs['force_interface_delta_pos_magnitude'] = outputs[
+                'finger_force_interface_delta_pos_magnitude'
+            ]
+        if 'finger_force_interface_delta_neg_magnitude' in outputs:
+            policy_outputs['force_interface_delta_neg_magnitude'] = outputs[
+                'finger_force_interface_delta_neg_magnitude'
+            ]
+        if 'finger_residual_direction_logit_neg' in outputs:
+            policy_outputs['residual_direction_logit_neg'] = outputs['finger_residual_direction_logit_neg']
+        if 'finger_residual_direction_logit_pos' in outputs:
+            policy_outputs['residual_direction_logit_pos'] = outputs['finger_residual_direction_logit_pos']
+        finger_loss_weights = raw_policy_config.get('finger_loss_weights')
+        if finger_loss_weights is not None:
+            finger_count = int(batch['finger_control_force_targets'].shape[-1])
+            if len(finger_loss_weights) != finger_count:
+                raise RuntimeError(
+                    'policy_loss.finger_loss_weights must match finger count: '
+                    f'{len(finger_loss_weights)} vs {finger_count}.'
+                )
+            weight_tensor = torch.tensor(
+                [float(weight) for weight in finger_loss_weights],
+                device=batch['finger_control_force_targets'].device,
+                dtype=batch['finger_control_force_targets'].dtype,
+            )
+            if (weight_tensor < 0).any():
+                raise RuntimeError('policy_loss.finger_loss_weights must be non-negative.')
+            view_shape = [1] * batch['finger_control_force_targets'].ndim
+            view_shape[-1] = finger_count
+            policy_outputs['policy_sample_weight'] = (
+                weight_tensor.reshape(view_shape).expand_as(batch['finger_control_force_targets']).reshape(-1)
+            )
+    else:
+        force_targets = batch['control_force_targets'].reshape(-1) if 'control_force_targets' in batch else batch['expert_forces'].reshape(-1)
+        reference_targets = batch['reference_forces'].reshape(-1) if 'reference_forces' in batch else None
+        delta_targets = batch['delta_force_targets'].reshape(-1) if 'delta_force_targets' in batch else None
+        has_expert = batch['has_expert'].reshape(-1) & window_mask
+        has_reference = batch['has_reference'].reshape(-1) & window_mask if 'has_reference' in batch else has_expert.new_zeros(has_expert.shape)
+        control_mask = batch['has_control_target'].reshape(-1) & window_mask if 'has_control_target' in batch else has_expert
+        reference_supervision_mask = batch['reference_supervision_masks'].reshape(-1) & window_mask if 'reference_supervision_masks' in batch else has_reference
+        delta_supervision_mask = batch['delta_supervision_masks'].reshape(-1) & window_mask if 'delta_supervision_masks' in batch else (has_reference & (phase_targets == 1))
+        quiet_supervision_mask = batch['quiet_supervision_masks'].reshape(-1) & window_mask if 'quiet_supervision_masks' in batch else (control_mask & (phase_targets != 1))
+        phase_targets_for_policy = phase_targets
+        stable_mask_for_policy = stable_mask
+        window_mask_for_policy = window_mask
+        policy_outputs = outputs
     if pol_weight > 0.0 and control_mask.any():
         losses['pol'] = compute_policy_loss(
-            outputs,
+            policy_outputs,
             force_targets=force_targets,
             reference_targets=reference_targets,
             delta_targets=delta_targets,
@@ -1243,11 +1466,11 @@ def compute_losses(
             reference_supervision_mask=reference_supervision_mask,
             delta_supervision_mask=delta_supervision_mask,
             quiet_supervision_mask=quiet_supervision_mask,
-            phase_targets=phase_targets,
-            stable_mask=stable_mask,
-            window_mask=window_mask,
+            phase_targets=phase_targets_for_policy,
+            stable_mask=stable_mask_for_policy,
+            window_mask=window_mask_for_policy,
             zero=zero,
-            policy_loss_config=policy_loss_config,
+            policy_loss_config=effective_policy_loss_config,
         )
     else:
         losses['pol'] = zero
