@@ -1,0 +1,28 @@
+extends: stage38j_f20_causal.yaml
+name: stage38j_f20_medium_recalibration
+checkpoint_prefix: stage38j_f20_medium_recalibration
+best_checkpoint_name: stage38j_f20_medium_recalibration_best_medium_f1_interface.pt
+freeze_modules:
+  - visual_encoder
+  - content_encoder
+  - attribute_head
+  - policy_head
+loss_weights:
+  clip: 0.0
+  inv: 0.0
+  med: 1.0
+  attr: 0.0
+  pol: 0.0
+selection_metric: medium_f1_interface
+maximize_metric: true
+tie_breakers:
+  - metric: medium_f1_interface
+    mode: max
+  - metric: epoch
+    mode: min
+train:
+  epochs: 8
+  learning_rate: 0.000005
+  base_learning_rate: 0.000005
+  lora_learning_rate: 0.000005
+  early_stopping_patience: 3

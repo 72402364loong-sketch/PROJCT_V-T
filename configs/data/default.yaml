@@ -2,6 +2,8 @@ project_root: .
 data_root: data
 annotations_dir: data/annotations
 processed_dir: data/processed
+samples_path: data/processed/samples.csv
+windows_path: data/processed/windows.csv
 splits_dir: data/splits
 
 video_fps: 30.0

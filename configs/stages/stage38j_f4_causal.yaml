@@ -1,0 +1,9 @@
+extends: stage38j_f20_causal.yaml
+name: stage38j_f4_causal
+checkpoint_prefix: stage38j_f4_causal
+best_checkpoint_name: stage38j_f4_causal_best_finger_control_interface_mae.pt
+data:
+  samples_path: data/processed/policy_4hz_causal_v2/samples.csv
+  windows_path: data/processed/policy_4hz_causal_v2/windows.csv
+  policy_rate_hz: 4
+  policy_stride_sec: 0.25

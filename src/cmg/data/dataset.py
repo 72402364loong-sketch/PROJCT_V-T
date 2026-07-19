@@ -86,8 +86,16 @@ class CrossMediumSequenceDataset(Dataset):
         tail_mode: str = 'all_valid',
         allowed_trial_results: Iterable[str] | None = None,
         visual_feature_cache_dir: str | Path | None = None,
+        samples_path: str | Path = 'data/processed/samples.csv',
+        windows_path: str | Path = 'data/processed/windows.csv',
         reference_force_window_count: int = 3,
         reference_force_statistic: str = 'mean',
+        reference_force_duration_sec: float | None = None,
+        reference_force_source: str = 'window_targets',
+        target_aggregation: str = 'window_mean',
+        target_aggregation_sec: float | None = None,
+        target_min_samples: int = 1,
+        target_fallback: str = 'latest_causal',
         expert_force_mode: str = 'measured_force',
         expert_force_smoothing: str = 'ema',
         expert_force_baseline_mode: str = 'none',
@@ -126,8 +134,16 @@ class CrossMediumSequenceDataset(Dataset):
         self.normalization_trial_results = None if normalization_trial_results is None else {str(value).strip().lower() for value in normalization_trial_results}
         self.tail_mode = tail_mode
         self.visual_feature_cache_dir = resolve_visual_feature_cache_dir(self.project_root, visual_feature_cache_dir)
+        self.samples_path = self._resolve_optional_project_path(samples_path)
+        self.windows_path = self._resolve_optional_project_path(windows_path)
         self.reference_force_window_count = max(1, int(reference_force_window_count))
         self.reference_force_statistic = str(reference_force_statistic or 'mean').strip().lower()
+        self.reference_force_duration_sec = None if reference_force_duration_sec is None else max(0.0, float(reference_force_duration_sec))
+        self.reference_force_source = str(reference_force_source or 'window_targets').strip().lower()
+        self.target_aggregation = str(target_aggregation or 'window_mean').strip().lower()
+        self.target_aggregation_sec = None if target_aggregation_sec is None else max(0.0, float(target_aggregation_sec))
+        self.target_min_samples = max(1, int(target_min_samples))
+        self.target_fallback = str(target_fallback or 'latest_causal').strip().lower()
         self.expert_force_mode = str(expert_force_mode or 'measured_force').strip().lower()
         self.expert_force_smoothing = str(expert_force_smoothing or 'ema').strip().lower()
         self.expert_force_baseline_mode = str(expert_force_baseline_mode or 'none').strip().lower()
@@ -153,11 +169,13 @@ class CrossMediumSequenceDataset(Dataset):
         }
         self.physical_class_to_index = self._build_physical_class_index()
 
-        samples_path = self.project_root / 'data' / 'processed' / 'samples.csv'
-        windows_path = self.project_root / 'data' / 'processed' / 'windows.csv'
-        self.all_samples = pd.read_csv(samples_path)
+        if self.samples_path is None or self.windows_path is None:
+            raise ValueError('samples_path and windows_path are required.')
+        self.all_samples = pd.read_csv(self.samples_path)
         self.samples = self.all_samples.copy()
-        self.windows = pd.read_csv(windows_path)
+        self.windows = pd.read_csv(self.windows_path)
+        if 'policy_timestamp' not in self.windows.columns:
+            self.windows['policy_timestamp'] = self.windows['window_center']
         sample_ids = set(resolve_sample_ids(self.all_samples, self.split_path, subset=subset))
         self.samples = self.samples.loc[self.samples['sample_id'].isin(sample_ids)].copy()
         self.windows = self.windows.loc[self.windows['sample_id'].isin(sample_ids)].copy()
@@ -605,10 +623,19 @@ class CrossMediumSequenceDataset(Dataset):
         self,
         windows: list[dict[str, Any]],
         force_curve: np.ndarray | None,
+        *,
+        time_axis: np.ndarray | None = None,
+        reference_end_time: float | None = None,
     ) -> tuple[float, bool, set[int]]:
         if force_curve is None:
             return float('nan'), False, set()
         reference_indices = self._resolve_reference_window_indices(windows)
+        if self.reference_force_duration_sec is not None and time_axis is not None and reference_end_time is not None:
+            mask = ((time_axis >= reference_end_time - self.reference_force_duration_sec) & (time_axis <= reference_end_time))
+            selected = np.asarray(force_curve)[mask]
+            if selected.size:
+                value = float(np.median(selected)) if self.reference_force_statistic == 'median' else float(np.mean(selected))
+                return value, bool(np.isfinite(value)), set(reference_indices)
         values = [
             self._compute_window_force_value(
                 force_curve,
@@ -624,10 +651,20 @@ class CrossMediumSequenceDataset(Dataset):
         self,
         windows: list[dict[str, Any]],
         force_curve: np.ndarray | None,
+        *,
+        time_axis: np.ndarray | None = None,
+        reference_end_time: float | None = None,
     ) -> tuple[np.ndarray, bool, set[int]]:
         if force_curve is None:
             return np.full((3,), float('nan'), dtype=np.float32), False, set()
         reference_indices = self._resolve_reference_window_indices(windows)
+        if self.reference_force_duration_sec is not None and time_axis is not None and reference_end_time is not None:
+            mask = ((time_axis >= reference_end_time - self.reference_force_duration_sec) & (time_axis <= reference_end_time))
+            selected = np.asarray(force_curve)[mask]
+            if selected.size:
+                value = np.median(selected, axis=0) if self.reference_force_statistic == 'median' else np.mean(selected, axis=0)
+                value = np.asarray(value, dtype=np.float32).reshape(-1)
+                return value, bool(np.all(np.isfinite(value))), set(reference_indices)
         values = [
             self._compute_window_force_vector(
                 force_curve,
@@ -638,6 +675,31 @@ class CrossMediumSequenceDataset(Dataset):
         ]
         reference_force, has_reference = self._aggregate_reference_force_vector(values)
         return reference_force, has_reference, set(reference_indices)
+
+    def _compute_causal_target_vector(
+        self,
+        force_curve: np.ndarray,
+        time_axis: np.ndarray,
+        policy_timestamp: float,
+    ) -> np.ndarray:
+        if self.target_aggregation_sec is None:
+            raise RuntimeError('target_aggregation_sec is required for causal target aggregation.')
+        mask = ((time_axis >= policy_timestamp - self.target_aggregation_sec) & (time_axis <= policy_timestamp))
+        selected = np.asarray(force_curve)[mask]
+        if selected.shape[0] >= self.target_min_samples:
+            if self.target_aggregation == 'median':
+                return np.median(selected, axis=0).astype(np.float32)
+            if self.target_aggregation == 'mean':
+                return np.mean(selected, axis=0).astype(np.float32)
+            if self.target_aggregation in {'latest', 'latest_causal'}:
+                return np.asarray(selected[-1], dtype=np.float32)
+            raise ValueError(f'Unsupported target_aggregation={self.target_aggregation!r}.')
+        if self.target_fallback == 'latest_causal':
+            causal_indices = np.flatnonzero(time_axis <= policy_timestamp)
+            if causal_indices.size:
+                return np.asarray(force_curve[int(causal_indices[-1])], dtype=np.float32)
+        width = int(force_curve.shape[1]) if force_curve.ndim >= 2 else 1
+        return np.full((width,), float('nan'), dtype=np.float32)
 
     def _window_interval_mask(
         self,
@@ -665,7 +727,9 @@ class CrossMediumSequenceDataset(Dataset):
         if t_if_enter is None or t_if_exit is None or t_if_exit <= t_if_enter:
             return 1.0 if str(window.get('phase_label')) == 'Interface' else 0.0
 
-        center = self._parse_optional_float(window.get('window_center'))
+        center = self._parse_optional_float(window.get('policy_timestamp'))
+        if center is None:
+            center = self._parse_optional_float(window.get('window_center'))
         if center is None:
             start = self._parse_optional_float(window.get('window_start'))
             end = self._parse_optional_float(window.get('window_end'))
@@ -725,6 +789,7 @@ class CrossMediumSequenceDataset(Dataset):
 
         clean_force_curve = None
         finger_clean_force_curve = None
+        finger_raw_force_curve = None
         tactile_time_axis = None
         interface_interval_start = None
         interface_interval_end = None
@@ -757,6 +822,19 @@ class CrossMediumSequenceDataset(Dataset):
                 dt=self.tactile_dt,
                 offset_sec=sync_offset_sec,
             )
+            if self.reference_force_source == 'raw_tactile' or self.target_aggregation_sec is not None:
+                finger_raw_force_curve = compute_clean_force_curve(
+                    tactile_array,
+                    dt=self.tactile_dt,
+                    sync_offset_sec=sync_offset_sec,
+                    contact_time=contact_time,
+                    alpha=self.expert_alpha,
+                    normal_sign_table=self.normal_sign_table,
+                    smoothing_mode='none',
+                    baseline_mode=self.expert_force_baseline_mode,
+                    baseline_window_sec=self.expert_force_baseline_window_sec,
+                    force_target_mode=self.finger_force_target_mode,
+                )
             t_if_enter = self._parse_optional_float(sample.get('t_if_enter'))
             t_if_exit = self._parse_optional_float(sample.get('t_if_exit'))
             if t_if_enter is not None and t_if_exit is not None and t_if_exit > t_if_enter:
@@ -764,14 +842,23 @@ class CrossMediumSequenceDataset(Dataset):
                 interface_interval_end = float(t_if_exit) + self.expert_force_interface_margin_sec
 
         reference_curve = clean_force_curve if clean_force_curve is not None else expert_curve
-        finger_reference_curve = finger_clean_force_curve if finger_clean_force_curve is not None else finger_expert_curve
+        finger_reference_curve = (
+            finger_raw_force_curve
+            if self.reference_force_source == 'raw_tactile' and finger_raw_force_curve is not None
+            else (finger_clean_force_curve if finger_clean_force_curve is not None else finger_expert_curve)
+        )
+        reference_end_time = self._parse_optional_float(sample.get('t_if_enter'))
         sample_reference_force, has_sample_reference, reference_window_indices = self._compute_sample_reference_force(
             windows,
             reference_curve,
+            time_axis=tactile_time_axis,
+            reference_end_time=reference_end_time,
         )
         finger_sample_reference_force, has_finger_sample_reference, finger_reference_window_indices = self._compute_sample_reference_force_vector(
             windows,
             finger_reference_curve,
+            time_axis=tactile_time_axis,
+            reference_end_time=reference_end_time,
         )
         use_local_reference_targets = (
             self.expert_force_mode == 'local_reference_delta'
@@ -980,13 +1067,26 @@ class CrossMediumSequenceDataset(Dataset):
                 finger_reference_supervision_flag = int(is_finger_reference_window or is_interface_window)
 
                 if is_interface_window:
-                    finger_target_force = self._compute_window_force_vector(
-                        finger_clean_force_curve,
-                        start_idx,
-                        end_idx,
-                        sample_mask=finger_overlap_mask if has_finger_overlap else None,
-                    )
-                    if not np.all(np.isfinite(finger_target_force)):
+                    policy_timestamp = self._parse_optional_float(window.get('policy_timestamp'))
+                    if (
+                        self.target_aggregation_sec is not None
+                        and tactile_time_axis is not None
+                        and finger_raw_force_curve is not None
+                        and policy_timestamp is not None
+                    ):
+                        finger_target_force = self._compute_causal_target_vector(
+                            finger_raw_force_curve,
+                            tactile_time_axis,
+                            policy_timestamp,
+                        )
+                    else:
+                        finger_target_force = self._compute_window_force_vector(
+                            finger_clean_force_curve,
+                            start_idx,
+                            end_idx,
+                            sample_mask=finger_overlap_mask if has_finger_overlap else None,
+                        )
+                    if self.target_aggregation_sec is None and not np.all(np.isfinite(finger_target_force)):
                         finger_target_force = self._compute_window_force_vector(finger_clean_force_curve, start_idx, end_idx)
                     finite_target = np.isfinite(finger_target_force)
                     if np.any(finite_target):

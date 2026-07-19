@@ -6,9 +6,23 @@ from typing import Any
 import yaml
 
 
-def load_yaml(path: str | Path) -> dict[str, Any]:
-    with Path(path).open("r", encoding="utf-8") as handle:
-        return yaml.safe_load(handle) or {}
+def load_yaml(path: str | Path, *, _seen: set[Path] | None = None) -> dict[str, Any]:
+    config_path = Path(path).resolve()
+    seen = set() if _seen is None else set(_seen)
+    if config_path in seen:
+        chain = ' -> '.join(str(item) for item in [*seen, config_path])
+        raise ValueError(f'Circular YAML extends chain: {chain}')
+    seen.add(config_path)
+    with config_path.open("r", encoding="utf-8") as handle:
+        config = yaml.safe_load(handle) or {}
+    parent_value = config.pop('extends', None)
+    if parent_value is None:
+        return config
+    parent_path = Path(parent_value)
+    if not parent_path.is_absolute():
+        parent_path = config_path.parent / parent_path
+    parent = load_yaml(parent_path, _seen=seen)
+    return deep_update(parent, config)
 
 
 def deep_update(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:

@@ -1,0 +1,22 @@
+extends: stage38j_f20_causal.yaml
+name: stage38j_f20_v3_causal
+checkpoint_prefix: stage38j_f20_v3_causal
+best_checkpoint_name: stage38j_f20_v3_causal_best_finger_large_delta_balanced_score.pt
+selection_metric: finger_large_delta_balanced_score
+maximize_metric: false
+tie_breakers:
+  - metric: finger_delta_interface_mae
+    mode: min
+  - metric: finger_large_delta_wrong_sign_rate
+    mode: min
+  - metric: stable_leakage_mean
+    mode: min
+  - metric: epoch
+    mode: min
+data:
+  samples_path: data/processed/policy_20hz_causal_v3/samples.csv
+  windows_path: data/processed/policy_20hz_causal_v3/windows.csv
+  phase_label_mode: policy_timestamp
+policy_loss:
+  residual_stable_zero_weight: 3.0
+  residual_non_interface_weight: 0.5

@@ -32,6 +32,19 @@ def compute_phase_label(
     return 'Interface'
 
 
+def compute_phase_label_at_timestamp(
+    timestamp: float,
+    t_if_enter: float,
+    t_if_exit: float,
+) -> str:
+    """Return the semantic medium phase at one causal policy timestamp."""
+    if timestamp < t_if_enter:
+        return 'Water'
+    if timestamp <= t_if_exit:
+        return 'Interface'
+    return 'Air'
+
+
 def compute_stable_mask(
     window_start: float,
     window_end: float,

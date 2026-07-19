@@ -149,6 +149,7 @@ def collect_prediction_rows(
                                 'window_start': finite_float(window['window_start']),
                                 'window_end': finite_float(window['window_end']),
                                 'window_center': finite_float(window['window_center']),
+                                'policy_timestamp': finite_float(window.get('policy_timestamp', window['window_center'])),
                                 'phase_label': phase_label,
                                 'is_stable_mask': int(bool(stable_masks[batch_index, window_index].item())),
                                 'interface_gate': finite_float(gate[batch_index, window_index].item()),
@@ -267,7 +268,7 @@ def render_finger_plot(
     frame = rows.loc[(rows['sample_id'] == sample_id) & (rows['finger_index'] == finger_index)].copy()
     if frame.empty:
         raise ValueError(f'No prediction rows for {sample_id} {finger_name}.')
-    frame = frame.sort_values('window_center').reset_index(drop=True)
+    frame = frame.sort_values('policy_timestamp').reset_index(drop=True)
 
     time_axis, raw_curve = load_raw_per_finger_curve(
         project_root=project_root,
@@ -298,7 +299,7 @@ def render_finger_plot(
     )
     target_mask = frame['has_target'].astype(bool).to_numpy()
     reference_mask = frame['has_reference'].astype(bool).to_numpy()
-    x = frame['window_center'].to_numpy(dtype=float)
+    x = frame['policy_timestamp'].to_numpy(dtype=float)
     plot_series(
         force_ax,
         x[target_mask],
@@ -357,12 +358,20 @@ def render_finger_plot(
     ]
     handles.extend(Patch(facecolor=color, alpha=0.2, label=phase) for phase, color in PHASE_COLORS.items())
     fig.legend(handles=handles, loc='upper center', bbox_to_anchor=(0.5, 1.0), ncol=4, frameon=False)
+    condition_text = ' | '.join(
+        [
+            f'water={sample.get("water_condition", "unknown")}',
+            f'speed={sample.get("lift_speed", "unknown")}',
+            f'placement={sample.get("placement_variant", "unknown")}',
+            f'result={sample.get("trial_result", "unknown")}',
+        ]
+    )
     fig.suptitle(
-        f'{sample_id} | object={sample.get("object_id")} | {finger_name} | single-finger policy prediction',
-        y=0.905,
+        f'{sample_id} | object={sample.get("object_id")} | {finger_name} | single-finger policy prediction\n{condition_text}',
+        y=0.91,
         fontsize=13,
     )
-    fig.subplots_adjust(top=0.82)
+    fig.subplots_adjust(top=0.79)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(output_path, dpi=180, bbox_inches='tight')
@@ -381,6 +390,7 @@ def main() -> None:
     parser.add_argument('--limit', type=int, default=1)
     parser.add_argument('--batch-size', type=int, default=2)
     parser.add_argument('--num-workers', type=int, default=0)
+    parser.add_argument('--finger-index', type=int, choices=range(len(FINGER_NAMES)), default=None)
     parser.add_argument('--output-dir', default='data/processed/debug/single_finger_policy_predictions')
     args = parser.parse_args()
 
@@ -404,10 +414,31 @@ def main() -> None:
     rows_path = output_dir / f'{args.subset}_single_finger_prediction_rows.csv'
     rows.to_csv(rows_path, index=False)
 
-    samples = pd.read_csv(project_root / 'data' / 'processed' / 'samples.csv')
+    samples = pd.read_csv(resolve_path(project_root, context['data_config']['samples_path']))
+    manifest_columns = [
+        column
+        for column in [
+            'sample_id',
+            'object_id',
+            'water_condition',
+            'lift_speed',
+            'placement_variant',
+            'trial_result',
+            't_if_enter',
+            't_if_exit',
+        ]
+        if column in samples.columns
+    ]
+    manifest = samples.loc[samples['sample_id'].astype(str).isin(sample_ids), manifest_columns].copy()
+    manifest['sample_id'] = pd.Categorical(manifest['sample_id'].astype(str), categories=sample_ids, ordered=True)
+    manifest = manifest.sort_values('sample_id')
+    manifest_path = output_dir / f'{args.subset}_selected_samples_manifest.csv'
+    manifest.to_csv(manifest_path, index=False)
     rendered = []
+    finger_indices = range(len(FINGER_NAMES)) if args.finger_index is None else [int(args.finger_index)]
     for sample_id in sample_ids:
-        for finger_index, finger_name in enumerate(FINGER_NAMES):
+        for finger_index in finger_indices:
+            finger_name = FINGER_NAMES[finger_index]
             output_path = output_dir / f'{sample_id}_{finger_name}_{args.model_label}_single_finger.png'
             rendered.append(
                 render_finger_plot(
@@ -423,7 +454,15 @@ def main() -> None:
             )
             print(f'{sample_id} {finger_name} -> {output_path}')
 
-    print({'sample_ids': sample_ids, 'rows_path': str(rows_path), 'output_dir': str(output_dir), 'rendered': rendered})
+    print(
+        {
+            'sample_ids': sample_ids,
+            'rows_path': str(rows_path),
+            'manifest_path': str(manifest_path),
+            'output_dir': str(output_dir),
+            'rendered': rendered,
+        }
+    )
 
 
 if __name__ == '__main__':

@@ -1,0 +1,18 @@
+extends: stage38j_f20_medium_recalibration.yaml
+name: stage38j_f20_v3_medium_recalibration
+checkpoint_prefix: stage38j_f20_v3_medium_recalibration
+best_checkpoint_name: stage38j_f20_v3_medium_recalibration_best_medium_f1_interface.pt
+data:
+  samples_path: data/processed/policy_20hz_causal_v3/samples.csv
+  windows_path: data/processed/policy_20hz_causal_v3/windows.csv
+  phase_label_mode: policy_timestamp
+train:
+  epochs: 24
+  learning_rate: 0.00002
+  base_learning_rate: 0.00002
+  lora_learning_rate: 0.00001
+  early_stopping_patience: 6
+  phase_class_weights:
+    Water: 1.0
+    Interface: 4.0
+    Air: 1.0

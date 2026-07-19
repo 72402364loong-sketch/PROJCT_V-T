@@ -237,6 +237,7 @@ def collect_rows_for_model(
                                 'window_start': finite_float(window['window_start']),
                                 'window_end': finite_float(window['window_end']),
                                 'window_center': finite_float(window['window_center']),
+                                'policy_timestamp': finite_float(window.get('policy_timestamp', window['window_center'])),
                                 'phase_label': phase_label,
                                 'is_stable_mask': int(bool(stable_masks[batch_index, window_index].item())),
                                 'interface_gate': gate_value,
@@ -375,10 +376,10 @@ def render_sample(
                     )
         target_rows = (
             finger_rows.loc[finger_rows['model'] == model_labels[0]]
-            .sort_values('window_center')
+            .sort_values('policy_timestamp')
             .reset_index(drop=True)
         )
-        x = target_rows['window_center'].to_numpy(dtype=float)
+        x = target_rows['policy_timestamp'].to_numpy(dtype=float)
         target_mask = target_rows['has_target'].to_numpy(dtype=bool)
         reference_mask = target_rows['has_reference'].to_numpy(dtype=bool)
         plot_line(
@@ -412,12 +413,12 @@ def render_sample(
         for model_label in model_labels:
             model_rows = (
                 finger_rows.loc[finger_rows['model'] == model_label]
-                .sort_values('window_center')
+                .sort_values('policy_timestamp')
                 .reset_index(drop=True)
             )
             if model_rows.empty:
                 continue
-            mx = model_rows['window_center'].to_numpy(dtype=float)
+            mx = model_rows['policy_timestamp'].to_numpy(dtype=float)
             color = model_colors[model_label]
             plot_line(
                 force_ax,
@@ -458,13 +459,13 @@ def render_sample(
     for model_label in model_labels:
         model_rows = (
             sample_rows.loc[sample_rows['model'] == model_label]
-            [['window_center', 'interface_gate']]
+            [['policy_timestamp', 'interface_gate']]
             .drop_duplicates()
-            .sort_values('window_center')
+            .sort_values('policy_timestamp')
         )
         plot_line(
             gate_ax,
-            model_rows['window_center'].to_numpy(dtype=float),
+            model_rows['policy_timestamp'].to_numpy(dtype=float),
             model_rows['interface_gate'].to_numpy(dtype=float),
             label=f'{model_label} gate',
             color=model_colors[model_label],

@@ -1,0 +1,22 @@
+project_root: .
+processed_dir: data/processed/policy_10hz_causal_v2
+samples_path: data/processed/policy_10hz_causal_v2/samples.csv
+windows_path: data/processed/policy_10hz_causal_v2/windows.csv
+video_fps: 30.0
+tactile_dt: 0.039
+window_size_sec: 1.0
+policy_rate_hz: 10
+policy_stride_sec: 0.1
+policy_timestamp_anchor: window_end
+causal_only: true
+tactile_context_sec: 1.0
+visual_context_sec: 1.0
+interface_overlap_sec: 0.25
+stable_margin_sec: 0.25
+short_tail_min_sec: 0.5
+num_frames_per_window: 8
+tactile_points_per_window: 26
+write_sidecar_cache: true
+split_version: split_unseen_fold1_v1
+target: {aggregation: median, aggregation_sec: 0.08, min_samples: 2, fallback: latest_causal}
+reference: {duration_sec: 0.75, statistic: median, source: raw_tactile}

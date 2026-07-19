@@ -21,6 +21,8 @@ Thumbs.db
 
 # 忽略整个 data 文件夹（包括 raw.zip 和所有子目录）
 data/
+!configs/data/
+!configs/data/*.yaml
 *.zip
 *.tar.gz
 *.7z
@@ -28,6 +30,8 @@ data/
 # 忽略所有运行日志和模型权重
 runs/
 evals/
+outputs/
+.codex_tmp/
 *.pt
 *.pth
 *.ckpt

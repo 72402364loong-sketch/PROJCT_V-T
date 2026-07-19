@@ -6,8 +6,13 @@ from typing import Any
 import numpy as np
 
 
-def build_window_sidecar_relative_path(sample_id: str, window_id: str) -> Path:
-    return Path('processed') / 'cache' / sample_id / f'{window_id}.npz'
+def build_window_sidecar_relative_path(
+    sample_id: str,
+    window_id: str,
+    *,
+    cache_relative_root: str | Path = Path('processed') / 'cache',
+) -> Path:
+    return Path(cache_relative_root) / sample_id / f'{window_id}.npz'
 
 
 def resolve_window_sidecar_path(project_root: str | Path, relative_path: str | Path) -> Path:
@@ -30,8 +35,19 @@ def _normalize_np_payload(payload: dict[str, Any]) -> dict[str, np.ndarray]:
     return normalized
 
 
-def write_window_sidecar(project_root: str | Path, sample_id: str, window_id: str, payload: dict[str, Any]) -> str:
-    relative_path = build_window_sidecar_relative_path(sample_id, window_id)
+def write_window_sidecar(
+    project_root: str | Path,
+    sample_id: str,
+    window_id: str,
+    payload: dict[str, Any],
+    *,
+    cache_relative_root: str | Path = Path('processed') / 'cache',
+) -> str:
+    relative_path = build_window_sidecar_relative_path(
+        sample_id,
+        window_id,
+        cache_relative_root=cache_relative_root,
+    )
     absolute_path = resolve_window_sidecar_path(project_root, relative_path)
     absolute_path.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(absolute_path, **_normalize_np_payload(payload))

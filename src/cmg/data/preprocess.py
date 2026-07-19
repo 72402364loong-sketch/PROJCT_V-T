@@ -1,6 +1,8 @@
 ﻿from __future__ import annotations
 
 import json
+import subprocess
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -12,7 +14,7 @@ from .annotations import normalize_object_attributes, normalize_sample_events
 from .sidecar import write_window_sidecar
 from .tactile import compute_resample_mapping, load_tactile_array
 from .video import build_frame_time_array, build_window_frame_indices, get_video_metadata, sample_frame_indices_with_mapping
-from .windowing import determine_tail_type, label_window
+from .windowing import compute_phase_label_at_timestamp, determine_tail_type, label_window
 
 
 def _resolve_data_path(project_root: Path, relative_path: str) -> Path:
@@ -25,7 +27,27 @@ def _resolve_data_path(project_root: Path, relative_path: str) -> Path:
 
 
 def _round_time(value: float) -> float:
-    return round(float(value), 3)
+    return round(float(value), 6)
+
+
+def _resolve_project_path(project_root: Path, raw_path: str | Path) -> Path:
+    path = Path(raw_path)
+    return path if path.is_absolute() else project_root / path
+
+
+def _git_revision(project_root: Path) -> str:
+    try:
+        result = subprocess.run(
+            ['git', 'rev-parse', 'HEAD'],
+            cwd=project_root,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        return result.stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return 'unknown'
 
 
 def _resolve_interface_bounds(sample: dict[str, object]) -> tuple[float, float]:
@@ -101,6 +123,12 @@ def build_windows_table(
     num_frames_per_window: int | None = None,
     tactile_points_per_window: int | None = None,
     write_sidecar_cache: bool = True,
+    policy_timestamp_anchor: str = 'window_center',
+    causal_only: bool = False,
+    sidecar_cache_relative_root: str | Path = Path('processed') / 'cache',
+    target_aggregation_sec: float | None = None,
+    reference_duration_sec: float | None = None,
+    phase_label_mode: str = 'window_overlap',
 ) -> pd.DataFrame:
     root = Path(project_root)
     expected_video_frames = int(round(window_size_sec * video_fps))
@@ -128,9 +156,24 @@ def build_windows_table(
             continue
         window_starts = np.arange(float(sample['t_start']), max_start + 1e-6, window_stride_sec)
         tactile_times_full = float(sample['sync_offset_sec']) + np.arange(tactile_count, dtype=np.float32) * tactile_dt
+        anchor = str(policy_timestamp_anchor).strip().lower()
+        if anchor not in {'window_start', 'window_center', 'window_end'}:
+            raise ValueError(f'Unsupported policy_timestamp_anchor={policy_timestamp_anchor!r}.')
+        normalized_phase_label_mode = str(phase_label_mode).strip().lower()
+        if normalized_phase_label_mode not in {'window_overlap', 'policy_timestamp'}:
+            raise ValueError(f'Unsupported phase_label_mode={phase_label_mode!r}.')
         for window_index, window_start in enumerate(window_starts):
             window_start = _round_time(window_start)
             window_end = _round_time(window_start + window_size_sec)
+            window_center = _round_time(window_start + 0.5 * window_size_sec)
+            policy_timestamp = {
+                'window_start': window_start,
+                'window_center': window_center,
+                'window_end': window_end,
+            }[anchor]
+            reference_end = float(t_if_enter)
+            target_start = policy_timestamp if target_aggregation_sec is None else policy_timestamp - float(target_aggregation_sec)
+            reference_start = reference_end if reference_duration_sec is None else reference_end - float(reference_duration_sec)
             window_id = f"{sample['sample_id']}_W{window_index:03d}"
             label = label_window(
                 window_start=window_start,
@@ -140,6 +183,12 @@ def build_windows_table(
                 overlap_threshold=interface_overlap_sec,
                 stable_margin=stable_margin_sec,
             )
+            semantic_phase_label = compute_phase_label_at_timestamp(
+                policy_timestamp,
+                t_if_enter,
+                t_if_exit,
+            )
+            phase_label = semantic_phase_label if normalized_phase_label_mode == 'policy_timestamp' else label.phase_label
             frame_indices = build_window_frame_indices(
                 frame_count=frame_count,
                 fps=float(metadata['fps'] or video_fps),
@@ -160,6 +209,11 @@ def build_windows_table(
             tactile_points = max(0, tactile_end_idx - tactile_start_idx)
             tactile_indices = np.arange(tactile_start_idx, tactile_end_idx, dtype=np.int32)
             tactile_times_window = tactile_times_full[tactile_start_idx:tactile_end_idx]
+            if causal_only:
+                if frame_times.size and float(np.max(frame_times)) > policy_timestamp + 1e-6:
+                    raise ValueError(f'Future video frame detected in {window_id}.')
+                if tactile_times_window.size and float(np.max(tactile_times_window)) > policy_timestamp + 1e-6:
+                    raise ValueError(f'Future tactile sample detected in {window_id}.')
             if tactile_points_per_window is not None:
                 tactile_mapping = compute_resample_mapping(tactile_points, tactile_points_per_window)
                 tactile_target_times = _project_target_times(tactile_times_window, tactile_mapping)
@@ -184,7 +238,17 @@ def build_windows_table(
                     payload={
                         'window_start': np.asarray([window_start], dtype=np.float32),
                         'window_end': np.asarray([window_end], dtype=np.float32),
-                        'window_center': np.asarray([window_start + 0.5 * window_size_sec], dtype=np.float32),
+                        'window_center': np.asarray([window_center], dtype=np.float32),
+                        'policy_timestamp': np.asarray([policy_timestamp], dtype=np.float32),
+                        'causal_only': np.asarray([causal_only], dtype=bool),
+                        'target_interval_start': np.asarray([target_start], dtype=np.float32),
+                        'target_interval_end': np.asarray([policy_timestamp], dtype=np.float32),
+                        'reference_interval_start': np.asarray([reference_start], dtype=np.float32),
+                        'reference_interval_end': np.asarray([reference_end], dtype=np.float32),
+                        'phase_label': np.asarray([phase_label]),
+                        'semantic_phase_label': np.asarray([semantic_phase_label]),
+                        'window_overlap_phase_label': np.asarray([label.phase_label]),
+                        'context_stable_mask': np.asarray([label.is_stable_mask], dtype=bool),
                         'sync_offset_sec': np.asarray([float(sample['sync_offset_sec'])], dtype=np.float32),
                         'video_frame_indices_all': np.asarray(frame_indices, dtype=np.int32),
                         'video_frame_times_all': frame_times.astype(np.float32),
@@ -202,6 +266,7 @@ def build_windows_table(
                         'tactile_resample_valid_mask': tactile_mapping['valid_mask'].astype(bool),
                         'tactile_resample_target_times': tactile_target_times.astype(np.float32),
                     },
+                    cache_relative_root=sidecar_cache_relative_root,
                 )
 
             rows.append(
@@ -212,9 +277,13 @@ def build_windows_table(
                     'object_pool': sample['object_pool'],
                     'window_start': window_start,
                     'window_end': window_end,
-                    'window_center': _round_time(window_start + 0.5 * window_size_sec),
-                    'phase_label': label.phase_label,
+                    'window_center': window_center,
+                    'policy_timestamp': policy_timestamp,
+                    'phase_label': phase_label,
+                    'semantic_phase_label': semantic_phase_label,
+                    'window_overlap_phase_label': label.phase_label,
                     'is_stable_mask': int(label.is_stable_mask),
+                    'context_stable_mask': int(label.is_stable_mask),
                     'stable_phase': label.stable_phase or '',
                     'tail_type': tail_type,
                     'valid_ratio_video': round(len(frame_indices) / max(1, expected_video_frames), 6),
@@ -235,33 +304,69 @@ def build_windows_table(
     return pd.DataFrame(rows).sort_values(['sample_id', 'window_start']).reset_index(drop=True)
 
 
-def write_preprocessed_outputs(project_root: str | Path) -> tuple[pd.DataFrame, pd.DataFrame]:
+def write_preprocessed_outputs(
+    project_root: str | Path,
+    *,
+    config_path: str | Path = 'configs/data/default.yaml',
+    output_dir: str | Path | None = None,
+    generation_command: str | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
     root = Path(project_root)
-    processed_root = root / 'data' / 'processed'
-    stats_root = processed_root / 'stats'
-    processed_root.mkdir(parents=True, exist_ok=True)
-    stats_root.mkdir(parents=True, exist_ok=True)
-
-    data_config_path = root / 'configs' / 'data' / 'default.yaml'
+    data_config_path = _resolve_project_path(root, config_path)
     data_config = {}
     if data_config_path.exists():
         with data_config_path.open('r', encoding='utf-8') as handle:
             data_config = yaml.safe_load(handle) or {}
 
+    configured_output = output_dir or data_config.get('processed_dir', 'data/processed')
+    processed_root = _resolve_project_path(root, configured_output)
+    stats_root = processed_root / 'stats'
+    processed_root.mkdir(parents=True, exist_ok=True)
+    stats_root.mkdir(parents=True, exist_ok=True)
+
     samples = build_samples_table(root)
+    policy_stride_sec = float(data_config.get('policy_stride_sec', data_config.get('window_stride_sec', 0.25)))
+    policy_rate_hz = float(data_config.get('policy_rate_hz', 1.0 / policy_stride_sec))
+    policy_timestamp_anchor = str(data_config.get('policy_timestamp_anchor', 'window_center'))
+    causal_only = bool(data_config.get('causal_only', False))
+    phase_label_mode = str(data_config.get('phase_label_mode', 'window_overlap'))
+    if policy_stride_sec <= 0.0 or policy_rate_hz <= 0.0:
+        raise ValueError('policy_stride_sec and policy_rate_hz must be positive.')
+    if not np.isclose(policy_rate_hz * policy_stride_sec, 1.0, atol=1e-6):
+        raise ValueError('policy_rate_hz and policy_stride_sec are inconsistent.')
+    if causal_only and policy_timestamp_anchor.strip().lower() != 'window_end':
+        raise ValueError("causal-v2 preprocessing requires policy_timestamp_anchor='window_end'.")
+    tactile_context_sec = float(data_config.get('tactile_context_sec', data_config.get('window_size_sec', 1.0)))
+    visual_context_sec = float(data_config.get('visual_context_sec', data_config.get('window_size_sec', 1.0)))
+    if causal_only and (
+        not np.isclose(tactile_context_sec, float(data_config.get('window_size_sec', 1.0)))
+        or not np.isclose(visual_context_sec, float(data_config.get('window_size_sec', 1.0)))
+    ):
+        raise ValueError('Current causal-v2 builder requires tactile/visual context to equal window_size_sec.')
+    try:
+        processed_relative = processed_root.relative_to(root / 'data')
+        sidecar_cache_relative_root = processed_relative / 'cache'
+    except ValueError as exc:
+        raise ValueError('processed_dir must be inside the project data directory so sidecars remain portable.') from exc
     windows = build_windows_table(
         samples=samples,
         project_root=root,
         video_fps=float(data_config.get('video_fps', 30.0)),
         tactile_dt=float(data_config.get('tactile_dt', 0.039)),
         window_size_sec=float(data_config.get('window_size_sec', 1.0)),
-        window_stride_sec=float(data_config.get('window_stride_sec', 0.25)),
+        window_stride_sec=policy_stride_sec,
         interface_overlap_sec=float(data_config.get('interface_overlap_sec', 0.25)),
         stable_margin_sec=float(data_config.get('stable_margin_sec', 0.25)),
         short_tail_min_sec=float(data_config.get('short_tail_min_sec', 0.5)),
         num_frames_per_window=int(data_config.get('num_frames_per_window')) if data_config.get('num_frames_per_window') is not None else None,
         tactile_points_per_window=int(data_config.get('tactile_points_per_window')) if data_config.get('tactile_points_per_window') is not None else None,
         write_sidecar_cache=bool(data_config.get('write_sidecar_cache', True)),
+        policy_timestamp_anchor=policy_timestamp_anchor,
+        causal_only=causal_only,
+        sidecar_cache_relative_root=sidecar_cache_relative_root,
+        target_aggregation_sec=data_config.get('target', {}).get('aggregation_sec'),
+        reference_duration_sec=data_config.get('reference', {}).get('duration_sec'),
+        phase_label_mode=phase_label_mode,
     )
     samples.to_csv(processed_root / 'samples.csv', index=False, encoding='utf-8-sig')
     windows.to_csv(processed_root / 'windows.csv', index=False, encoding='utf-8-sig')
@@ -275,4 +380,37 @@ def write_preprocessed_outputs(project_root: str | Path) -> tuple[pd.DataFrame, 
     }
     with (stats_root / 'dataset_summary.json').open('w', encoding='utf-8') as handle:
         json.dump(summary, handle, ensure_ascii=False, indent=2)
+
+    manifest = {
+        'schema_version': str(data_config.get('schema_version', 'causal-v2' if causal_only else 'legacy-v1')),
+        'policy_rate_hz': policy_rate_hz,
+        'policy_stride_sec': policy_stride_sec,
+        'policy_timestamp_anchor': policy_timestamp_anchor,
+        'causal_only': causal_only,
+        'phase_label_mode': phase_label_mode,
+        'phase_label_semantics': (
+            'instantaneous phase at policy_timestamp'
+            if phase_label_mode.strip().lower() == 'policy_timestamp'
+            else 'legacy window-overlap phase'
+        ),
+        'stable_mask_semantics': 'full input context outside interface plus stable margin',
+        'tactile_context_sec': tactile_context_sec,
+        'visual_context_sec': visual_context_sec,
+        'target': data_config.get('target', {}),
+        'reference': data_config.get('reference', {}),
+        'raw_sensor_rates_hz': {
+            'video': float(data_config.get('video_fps', 30.0)),
+            'tactile': float(1.0 / float(data_config.get('tactile_dt', 0.039))),
+        },
+        'split_version': data_config.get('split_version'),
+        'generator': str(Path(__file__).relative_to(root)) if Path(__file__).is_relative_to(root) else str(Path(__file__)),
+        'git_commit': _git_revision(root),
+        'generated_at_utc': datetime.now(timezone.utc).isoformat(),
+        'generation_command': generation_command or '',
+        'num_samples': int(len(samples)),
+        'num_windows': int(len(windows)),
+        'phase_counts': summary['phase_counts'],
+    }
+    with (processed_root / 'manifest.yaml').open('w', encoding='utf-8') as handle:
+        yaml.safe_dump(manifest, handle, allow_unicode=True, sort_keys=False)
     return samples, windows

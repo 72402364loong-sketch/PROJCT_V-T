@@ -1,0 +1,41 @@
+extends: stage38j_policy_fold1_per_finger_sign_specific_direction_magnitude.yaml
+name: stage38j_f20_causal
+checkpoint_prefix: stage38j_f20_causal
+best_checkpoint_name: stage38j_f20_causal_best_finger_control_interface_mae.pt
+data:
+  samples_path: data/processed/policy_20hz_causal_v2/samples.csv
+  windows_path: data/processed/policy_20hz_causal_v2/windows.csv
+  policy_rate_hz: 20
+  policy_stride_sec: 0.05
+  policy_timestamp_anchor: window_end
+  causal_only: true
+  tactile_context_sec: 1.0
+  visual_context_sec: 1.0
+  tactile_input_axes: [z]
+  attribute_taxonomy: coarse_v2
+  target:
+    aggregation: median
+    aggregation_sec: 0.08
+    min_samples: 2
+    fallback: latest_causal
+  reference:
+    duration_sec: 0.75
+    statistic: median
+    source: raw_tactile
+  expert_force_mode: local_reference_delta
+  expert_force_smoothing: zero_phase_ema
+  expert_force_baseline_mode: pre_contact_median
+  expert_force_baseline_window_sec: 0.5
+  expert_force_interface_margin_sec: 0.1
+model:
+  policy:
+    head_type: state_residual_per_finger_sign_specific
+    base_source: reference_force
+    use_reference_force_context: true
+    reference_force_context_scale: 100.0
+    residual_output_scale: 20.0
+    finger_count: 3
+train:
+  learning_rate: 0.00002
+  base_learning_rate: 0.00002
+  lora_learning_rate: 0.00001
