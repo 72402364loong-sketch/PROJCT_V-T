@@ -1,0 +1,79 @@
+project_root: .
+schema_version: bidirectional-causal-v4
+dataset_version: bidirectional_v1
+processed_dir: data/processed/policy_20hz_bidirectional_v1_fixed_test
+samples_path: data/processed/policy_20hz_bidirectional_v1_fixed_test/samples.csv
+windows_path: data/processed/policy_20hz_bidirectional_v1_fixed_test/windows.csv
+
+split_path: data/splits/split_unseen_fixed_test_obj004_obj007_v1.yaml
+split_version: split_unseen_fixed_test_obj004_obj007_v1
+
+video_fps: 30.0
+tactile_dt: 0.039
+window_size_sec: 1.0
+policy_rate_hz: 20
+policy_stride_sec: 0.05
+policy_timestamp_anchor: window_end
+phase_label_mode: policy_timestamp
+causal_only: true
+tactile_context_sec: 1.0
+visual_context_sec: 1.0
+interface_overlap_sec: 0.25
+stable_margin_sec: 0.25
+short_tail_min_sec: 0.5
+
+num_frames_per_window: 8
+tactile_points_per_window: 26
+write_sidecar_cache: true
+image_size: 224
+roi: {x: 460, y: 28, width: 1024, height: 1024}
+clip_mean: [0.48145466, 0.4578275, 0.40821073]
+clip_std: [0.26862954, 0.26130258, 0.27577711]
+tactile_input_axes: [z]
+standardize_tactile: true
+min_valid_ratio_video: 0.8
+min_valid_ratio_tactile: 0.8
+valid_tail_mode: all_valid
+visual_feature_cache_dir: null
+
+ema_alpha_acdc: 0.1
+ema_alpha_expert: 0.1
+normal_sign_table:
+  finger0: [1.0, 1.0, 1.0, 1.0]
+  finger1: [1.0, 1.0, 1.0, 1.0]
+  finger2: [1.0, 1.0, 1.0, 1.0]
+
+attribute_taxonomy: coarse_v2
+physical_attribute_table: data/annotations/object_physical_attributes.csv
+physical_attribute_norm_stats_path: data/processed/policy_20hz_bidirectional_v1_fixed_test/stats/physical_attribute_norm_stats.json
+reference_force_window_count: 3
+expert_force_mode: local_reference_delta
+expert_force_smoothing: zero_phase_ema
+expert_force_baseline_mode: none
+expert_force_baseline_window_sec: 0.5
+expert_force_interface_margin_sec: 0.1
+force_target_mode: signed_sum
+
+direction:
+  values: [W2A, A2W]
+  to_index: {W2A: 0, A2W: 1}
+
+target:
+  aggregation: median
+  aggregation_sec: 0.08
+  min_samples: 2
+  fallback: latest_causal
+
+reference:
+  duration_sec: 0.75
+  statistic: median
+  source: raw_tactile
+  medium: source_medium
+  allowed_trial_results: [stable]
+
+force_baseline:
+  W2A: pre_contact_median
+  A2W: none
+
+policy:
+  allowed_trial_results: [stable]

@@ -1,6 +1,24 @@
 PHASE_TO_INDEX = {"Water": 0, "Interface": 1, "Air": 2}
 INDEX_TO_PHASE = {value: key for key, value in PHASE_TO_INDEX.items()}
 
+MEDIUM_TO_PHASE = {"water": "Water", "air": "Air"}
+PHASE_TO_MEDIUM = {value: key for key, value in MEDIUM_TO_PHASE.items()}
+
+DIRECTION_TO_INDEX = {"W2A": 0, "A2W": 1}
+INDEX_TO_DIRECTION = {value: key for key, value in DIRECTION_TO_INDEX.items()}
+DIRECTION_TO_MEDIA = {
+    "W2A": {
+        "source_medium": "water",
+        "target_medium": "air",
+        "reference_medium": "water",
+    },
+    "A2W": {
+        "source_medium": "air",
+        "target_medium": "water",
+        "reference_medium": "air",
+    },
+}
+
 FRAGILITY_TO_INDEX = {"fragile": 0, "robust": 1, "compliant": 2}
 GEOMETRY_TO_INDEX = {
     "cylindrical": 0,

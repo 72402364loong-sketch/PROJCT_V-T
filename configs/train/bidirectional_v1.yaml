@@ -1,0 +1,15 @@
+extends: base.yaml
+
+sampling_mode: direction_object_aware
+use_direction_aware_sampler: true
+use_object_aware_sampler: false
+direction_values: [W2A, A2W]
+direction_balance_mode: paired_cycle
+batch_size: 8
+interface_sampler_alpha: 1.0
+interface_sampler_min_expert_windows: 1
+
+default_allowed_trial_results:
+  train: [stable]
+  val: [stable]
+  test: [stable]

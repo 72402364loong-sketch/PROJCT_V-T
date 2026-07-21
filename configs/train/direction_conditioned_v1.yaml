@@ -1,0 +1,10 @@
+extends: bidirectional_v1.yaml
+
+loss_reduction:
+  mode: sample_direction_macro
+  require_all_directions_per_batch: false
+
+# Each formal stage must enable this after inserting its matching E0 W2A baseline.
+w2a_retention_guard:
+  enabled: false
+  max_relative_degradation: 0.05

@@ -1,3 +1,5 @@
 ﻿from .system import CrossMediumSystem
 
-__all__ = ['CrossMediumSystem']
+from .modules import DirectionEmbedding, ResidualFiLMAdapter
+
+__all__ = ['CrossMediumSystem', 'DirectionEmbedding', 'ResidualFiLMAdapter']

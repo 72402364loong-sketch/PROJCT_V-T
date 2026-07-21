@@ -1,0 +1,63 @@
+extends: stage39_bidirectional_base.yaml
+name: stage39a_direction_adapter_warmup
+checkpoint_prefix: stage39a_direction_adapter_warmup
+best_checkpoint_name: stage39a_direction_adapter_warmup_best_finger_control_interface_mae_macro_direction.pt
+
+training_readiness:
+  status: ready
+  reason: M5-0 E0 W2A baseline completed and retention guard configured.
+  evidence: evals/stage39e0_warmstart_baseline/e0_summary.json
+  evidence_sha256: 1b256b1c70e5beb7639ffcf586238429911814bb5d435706bfff8c5fd27daf8a
+
+initialization:
+  required: true
+  expected_source: runs/stage38j_f20_v3_causal/checkpoints/best.pt
+  allow_lora_injection: true
+  allowed_missing_prefixes:
+    - direction_embedding.*
+    - medium_direction_adapter.*
+    - policy_direction_adapter.*
+
+freeze_modules:
+  - visual_encoder
+  - content_encoder
+  - evidence_encoder
+  - medium_head
+  - attribute_head
+  - policy_head
+
+# The frozen GRU must retain training-mode forward state so gradients from the
+# Medium loss can pass through it into medium_direction_adapter under cuDNN.
+frozen_train_mode_modules:
+  - medium_head
+
+expected_trainable_prefixes:
+  - direction_embedding
+  - medium_direction_adapter
+  - policy_direction_adapter
+
+selection_metric: finger_control_interface_mae_macro_direction
+maximize_metric: false
+tie_breakers:
+  - metric: medium_f1_interface_macro_direction
+    mode: max
+  - metric: finger_delta_interface_mae_macro_direction
+    mode: min
+  - metric: epoch
+    mode: min
+
+w2a_retention_guard:
+  enabled: true
+  metric: finger_control_interface_mae_w2a
+  mode: min
+  baseline_value: 7.069268751150515
+  max_relative_degradation: 0.05
+
+train:
+  epochs: 3
+  learning_rate: 0.0001
+  base_learning_rate: 0.0001
+  lora_learning_rate: 0.0001
+  warmup_ratio: 0.10
+  min_lr_scale: 0.1
+  early_stopping_patience: 0

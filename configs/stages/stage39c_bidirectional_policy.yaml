@@ -1,0 +1,80 @@
+extends: stage39_bidirectional_base.yaml
+name: stage39c_bidirectional_policy
+checkpoint_prefix: stage39c_bidirectional_policy
+best_checkpoint_name: stage39c_bidirectional_policy_best_finger_control_interface_mae_macro_direction.pt
+
+training_readiness:
+  status: ready
+  reason: M5-0 E0 W2A baseline completed and retention guard configured.
+  evidence: evals/stage39e0_warmstart_baseline/e0_summary.json
+  evidence_sha256: 1b256b1c70e5beb7639ffcf586238429911814bb5d435706bfff8c5fd27daf8a
+
+initialization:
+  required: true
+  expected_source_stage: stage39b_bidirectional_medium
+  allow_lora_injection: true
+  allowed_missing_prefixes: []
+
+freeze_modules:
+  - visual_encoder
+  - content_encoder
+  - evidence_encoder
+  - medium_head
+  - medium_direction_adapter
+  - direction_embedding
+  - attribute_head
+  - policy_head.finger_embedding
+  - policy_head.finger_base_state_input_layer
+  - policy_head.finger_base_hidden_layer
+  - policy_head.finger_base_output_layer
+
+expected_trainable_prefixes:
+  - policy_direction_adapter
+  - policy_head.film
+  - policy_head.finger_residual_task_input_layer
+  - policy_head.finger_residual_state_input_layer
+  - policy_head.finger_residual_context_input_layer
+  - policy_head.finger_residual_context_scale
+  - policy_head.finger_residual_hidden_layer
+  - policy_head.finger_residual_pos_output_layer
+  - policy_head.finger_residual_neg_output_layer
+  - policy_head.finger_residual_direction_output_layer
+
+loss_weights:
+  med: 0.0
+  pol: 1.0
+
+selection_metric: finger_control_interface_mae_macro_direction
+maximize_metric: false
+tie_breakers:
+  - metric: finger_delta_interface_mae_macro_direction
+    mode: min
+  - metric: finger_large_delta_wrong_sign_rate_macro_direction
+    mode: min
+  - metric: stable_leakage_mean_macro_direction
+    mode: min
+  - metric: finger_control_interface_mae_w2a
+    mode: min
+  - metric: epoch
+    mode: min
+
+w2a_retention_guard:
+  enabled: true
+  metric: finger_control_interface_mae_w2a
+  mode: min
+  baseline_value: 7.069268751150515
+  max_relative_degradation: 0.05
+
+train:
+  epochs: 12
+  learning_rate: 0.00002
+  base_learning_rate: 0.00002
+  lora_learning_rate: 0.00002
+  warmup_ratio: 0.05
+  min_lr_scale: 0.1
+  early_stopping_patience: 4
+  module_learning_rate_multipliers:
+    policy_direction_adapter: 5.0
+    policy_head.finger_residual_pos_output_layer: 8.0
+    policy_head.finger_residual_neg_output_layer: 8.0
+    policy_head.finger_residual_direction_output_layer: 10.0

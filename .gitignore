@@ -20,7 +20,13 @@ Thumbs.db
 # --- 重点：科研数据与模型权重 ---
 
 # 忽略整个 data 文件夹（包括 raw.zip 和所有子目录）
+# 仅保留版本化 split 配置；原始数据与处理中间产物仍全部忽略。
 data/
+!data/
+data/*
+!data/splits/
+data/splits/*
+!data/splits/split_unseen_fixed_test_obj004_obj007_v1.yaml
 !configs/data/
 !configs/data/*.yaml
 *.zip

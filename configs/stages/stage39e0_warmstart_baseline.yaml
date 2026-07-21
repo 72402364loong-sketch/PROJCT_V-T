@@ -1,0 +1,34 @@
+extends: stage39_bidirectional_base.yaml
+name: stage39e0_warmstart_baseline
+checkpoint_prefix: stage39e0_warmstart_baseline
+
+# M5-0 is evaluation-only. It uses the current bidirectional architecture while
+# loading every compatible tensor from the frozen W2A canonical checkpoint.
+initialization:
+  required: true
+  expected_source: runs/stage38j_f20_v3_causal/checkpoints/best.pt
+  allow_lora_injection: true
+  allowed_missing_prefixes:
+    - direction_embedding.*
+    - medium_direction_adapter.*
+    - policy_direction_adapter.*
+
+e0_protocol:
+  subset: val
+  only_stable: true
+  use_archived_run_config: false
+  directions: [W2A, A2W]
+  test_access: forbidden
+  reference_only_baseline: true
+  direction_zero_effect_required: true
+
+data:
+  visual_feature_cache_dir: data/processed/cache/visual_stage39e0_val_canonical
+
+train:
+  batch_size: 2
+  num_workers: 0
+  pin_memory: false
+  persistent_workers: false
+  amp_enabled: false
+

@@ -65,7 +65,7 @@ class SlidingWindowCache:
 
 class OnlineInferenceStub:
     def __init__(self, model: torch.nn.Module, *, device: torch.device) -> None:
-        self.model = model.to(device)
+        self.model = model.to(device).eval()
         self.device = device
         self.medium_hidden: torch.Tensor | None = None
 
@@ -80,6 +80,7 @@ class OnlineInferenceStub:
         tactile_high: torch.Tensor,
         tactile_low: torch.Tensor,
         tactile_mask: torch.Tensor,
+        direction_ids: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         batch = {
             'video': video.to(self.device),
@@ -88,6 +89,8 @@ class OnlineInferenceStub:
             'tactile_low': tactile_low.to(self.device),
             'tactile_mask': tactile_mask.to(self.device),
         }
+        if direction_ids is not None:
+            batch['direction_ids'] = direction_ids.to(self.device)
         with torch.no_grad():
             outputs = self.model.forward_online_step(batch, medium_hidden=self.medium_hidden)
         self.medium_hidden = outputs['medium_hidden']

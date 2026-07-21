@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import copy
 from pathlib import Path
 from typing import Any
 
 import torch
 from torch.utils.data import DataLoader
 
-from .config import deep_update, load_yaml, sync_tactile_model_config
+from .config import deep_update, resolve_training_configs, sync_tactile_model_config
 from .data import CrossMediumSequenceDataset, sequence_collate_fn
 from .models import CrossMediumSystem
 from .training import build_phase_class_weights, load_checkpoint_context, load_model_weights, run_model_epoch
@@ -60,26 +61,28 @@ def prepare_evaluation_context(
     subset: str = 'test',
     only_stable: bool = False,
     num_workers: int | None = None,
+    use_archived_run_config: bool = True,
+    allow_lora_injection: bool = False,
+    allowed_missing_prefixes: list[str] | tuple[str, ...] | None = None,
+    initialize_pretrained_backbone: bool = True,
 ) -> dict[str, Any]:
     project_root = Path(project_root).resolve()
     stage_path = resolve_path(project_root, stage)
     checkpoint_path = resolve_path(project_root, checkpoint)
     checkpoint_context = load_checkpoint_context(checkpoint_path)
 
-    data_config = load_yaml(project_root / 'configs' / 'data' / 'default.yaml')
-    model_config = load_yaml(project_root / 'configs' / 'model' / 'default.yaml')
-    train_config = load_yaml(project_root / 'configs' / 'train' / 'base.yaml')
-    stage_config = load_yaml(stage_path)
-    data_config = deep_update(data_config, stage_config.get('data', {}))
-    model_config = deep_update(model_config, stage_config.get('model', {}))
-    train_config = deep_update(train_config, stage_config.get('train', {}))
-    data_config, model_config, train_config = apply_archived_run_config(
-        data_config,
-        model_config,
-        train_config,
-        stage_config,
-        checkpoint_context,
+    data_config, model_config, train_config, stage_config, _ = resolve_training_configs(
+        project_root,
+        stage_path,
     )
+    if use_archived_run_config:
+        data_config, model_config, train_config = apply_archived_run_config(
+            data_config,
+            model_config,
+            train_config,
+            stage_config,
+            checkpoint_context,
+        )
     model_config = sync_tactile_model_config(data_config, model_config)
     if data_config.get('visual_feature_cache_dir') and (
         float(stage_config.get('loss_weights', {}).get('clip', 0.0)) > 0.0
@@ -135,6 +138,10 @@ def prepare_evaluation_context(
         attribute_taxonomy=str(data_config.get('attribute_taxonomy', 'legacy')),
         physical_attribute_table=data_config.get('physical_attribute_table'),
         physical_attribute_norm_stats_path=data_config.get('physical_attribute_norm_stats_path'),
+        schema_version=data_config.get('schema_version'),
+        dataset_version=data_config.get('dataset_version'),
+        split_version=data_config.get('split_version'),
+        force_baseline_by_direction=data_config.get('force_baseline'),
     )
 
     loader_kwargs: dict[str, Any] = {
@@ -149,8 +156,21 @@ def prepare_evaluation_context(
     loader = DataLoader(dataset, **loader_kwargs)
 
     device = torch.device(train_config.get('device', 'cuda') if torch.cuda.is_available() else 'cpu')
-    model = CrossMediumSystem(model_config).to(device)
-    load_info = load_model_weights(model, checkpoint_path, strict=True)
+    construction_model_config = model_config
+    if not initialize_pretrained_backbone:
+        construction_model_config = copy.deepcopy(model_config)
+        visual_config = construction_model_config.get('visual', {})
+        if isinstance(visual_config, dict):
+            visual_config['pretrained'] = False
+            visual_config['pretrained_tag'] = None
+    model = CrossMediumSystem(construction_model_config).to(device)
+    load_info = load_model_weights(
+        model,
+        checkpoint_path,
+        strict=True,
+        allow_lora_injection=allow_lora_injection,
+        allowed_missing_prefixes=allowed_missing_prefixes,
+    )
     phase_class_weights = build_phase_class_weights(train_config, device)
     return {
         'project_root': project_root,
@@ -158,6 +178,10 @@ def prepare_evaluation_context(
         'checkpoint_path': checkpoint_path,
         'subset': subset,
         'only_stable': bool(only_stable),
+        'use_archived_run_config': bool(use_archived_run_config),
+        'allow_lora_injection': bool(allow_lora_injection),
+        'allowed_missing_prefixes': list(allowed_missing_prefixes or ()),
+        'initialize_pretrained_backbone': bool(initialize_pretrained_backbone),
         'stage_config': stage_config,
         'data_config': data_config,
         'model_config': model_config,
@@ -181,6 +205,10 @@ def evaluate_checkpoint(
     subset: str = 'test',
     only_stable: bool = False,
     num_workers: int | None = None,
+    use_archived_run_config: bool = True,
+    allow_lora_injection: bool = False,
+    allowed_missing_prefixes: list[str] | tuple[str, ...] | None = None,
+    initialize_pretrained_backbone: bool = True,
 ) -> dict[str, Any]:
     context = prepare_evaluation_context(
         project_root=project_root,
@@ -189,6 +217,10 @@ def evaluate_checkpoint(
         subset=subset,
         only_stable=only_stable,
         num_workers=num_workers,
+        use_archived_run_config=use_archived_run_config,
+        allow_lora_injection=allow_lora_injection,
+        allowed_missing_prefixes=allowed_missing_prefixes,
+        initialize_pretrained_backbone=initialize_pretrained_backbone,
     )
     metrics = run_model_epoch(
         context['model'],
@@ -199,12 +231,17 @@ def evaluate_checkpoint(
         model_config=context['model_config'],
         phase_class_weights=context['phase_class_weights'],
         amp_enabled=bool(context['train_config'].get('amp_enabled', False)) and context['device'].type == 'cuda',
+        loss_reduction_config=context['train_config'].get('loss_reduction'),
     )
     return {
         'stage_name': context['stage_config'].get('name'),
         'stage_path': str(context['stage_path'].resolve()),
         'subset': subset,
         'only_stable': bool(only_stable),
+        'use_archived_run_config': bool(use_archived_run_config),
+        'allow_lora_injection': bool(allow_lora_injection),
+        'allowed_missing_prefixes': list(allowed_missing_prefixes or ()),
+        'initialize_pretrained_backbone': bool(initialize_pretrained_backbone),
         'checkpoint_path': str(context['checkpoint_path'].resolve()),
         'checkpoint_run_config_path': context['load_info'].get('run_config_path'),
         'metrics': metrics,

@@ -15,7 +15,8 @@ SRC = ROOT / 'src'
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from cmg.config import deep_update, load_yaml, sync_tactile_model_config
+from cmg.config import deep_update, resolve_training_configs, sync_tactile_model_config
+from cmg.constants import DIRECTION_TO_INDEX
 from cmg.data import CrossMediumSequenceDataset
 from cmg.data.sidecar import load_window_sidecar
 from cmg.data.tactile import compute_measured_force_curve, load_tactile_array, resample_tactile_window, select_tactile_channels, split_ac_dc, standardize_tactile_window
@@ -42,13 +43,10 @@ def resolve_data_path(project_root: Path, relative_path: str) -> Path:
 
 
 def load_configs(project_root: Path, stage_path: Path, checkpoint_context: dict) -> tuple[dict, dict, dict, dict]:
-    data_config = load_yaml(project_root / 'configs' / 'data' / 'default.yaml')
-    model_config = load_yaml(project_root / 'configs' / 'model' / 'default.yaml')
-    train_config = load_yaml(project_root / 'configs' / 'train' / 'base.yaml')
-    stage_config = load_yaml(stage_path)
-    data_config = deep_update(data_config, stage_config.get('data', {}))
-    model_config = deep_update(model_config, stage_config.get('model', {}))
-    train_config = deep_update(train_config, stage_config.get('train', {}))
+    data_config, model_config, train_config, stage_config, _ = resolve_training_configs(
+        project_root,
+        stage_path,
+    )
 
     archived = checkpoint_context.get('run_config')
     if isinstance(archived, dict):
@@ -94,6 +92,12 @@ def make_stats_dataset(project_root: Path, split_path: Path, data_config: dict, 
         normalization_trial_results=train_config.get('default_allowed_trial_results', {}).get('train'),
         tail_mode=stage_config.get('tail_mode', data_config.get('valid_tail_mode', 'all_valid')),
         allowed_trial_results=train_config.get('default_allowed_trial_results', {}).get('train'),
+        samples_path=data_config.get('samples_path', 'data/processed/samples.csv'),
+        windows_path=data_config.get('windows_path', 'data/processed/windows.csv'),
+        schema_version=data_config.get('schema_version'),
+        dataset_version=data_config.get('dataset_version'),
+        split_version=data_config.get('split_version'),
+        force_baseline_by_direction=data_config.get('force_baseline'),
     )
 
 
@@ -113,12 +117,14 @@ def main() -> None:
     data_config, model_config, train_config, stage_config = load_configs(project_root, stage_path, checkpoint_context)
     split_path = project_root / stage_config['split']
 
-    samples = pd.read_csv(project_root / 'data' / 'processed' / 'samples.csv')
-    windows = pd.read_csv(project_root / 'data' / 'processed' / 'windows.csv')
+    samples = pd.read_csv(resolve_path(project_root, str(data_config.get('samples_path', 'data/processed/samples.csv'))))
+    windows = pd.read_csv(resolve_path(project_root, str(data_config.get('windows_path', 'data/processed/windows.csv'))))
     sample_rows = samples.loc[samples['sample_id'] == args.sample_id]
     if sample_rows.empty:
         raise ValueError(f'Unknown sample_id: {args.sample_id}')
     sample = sample_rows.iloc[0]
+    direction = str(sample.get('direction', 'W2A')).strip().upper()
+    direction_id = int(sample.get('direction_index', DIRECTION_TO_INDEX.get(direction, 0)))
     sample_windows = windows.loc[windows['sample_id'] == args.sample_id].sort_values('window_start').reset_index(drop=True)
     if sample_windows.empty:
         raise ValueError(f'No windows found for sample_id: {args.sample_id}')
@@ -184,6 +190,7 @@ def main() -> None:
             tactile_high=torch.from_numpy(tactile_high.astype(np.float32)).unsqueeze(0),
             tactile_low=torch.from_numpy(tactile_low.astype(np.float32)).unsqueeze(0),
             tactile_mask=torch.from_numpy(tactile_mask.astype(bool)).unsqueeze(0),
+            direction_ids=torch.tensor([direction_id], dtype=torch.long),
         )
 
         measured_force = float(np.mean(measured_force_curve[start_idx:end_idx])) if end_idx > start_idx else math.nan
@@ -192,6 +199,8 @@ def main() -> None:
             {
                 'sample_id': args.sample_id,
                 'object_id': str(sample['object_id']),
+                'direction': direction,
+                'direction_id': direction_id,
                 'trial_result': str(sample['trial_result']),
                 'water_condition': str(sample['water_condition']),
                 'lift_speed': str(sample['lift_speed']),

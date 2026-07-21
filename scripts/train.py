@@ -14,9 +14,16 @@ SRC = ROOT / 'src'
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from cmg.config import deep_update, load_yaml, sync_tactile_model_config
+from cmg.config import (
+    deep_update,
+    resolve_training_configs,
+    sync_tactile_model_config,
+    validate_direction_training_contract,
+    validate_initialization_source_contract,
+)
 from cmg.data import (
     CrossMediumSequenceDataset,
+    DirectionAwareObjectBatchSampler,
     InterfaceAwareObjectBatchSampler,
     InterfaceAwareSequenceSampler,
     ObjectAwareBatchSampler,
@@ -26,16 +33,8 @@ from cmg.models import CrossMediumSystem
 from cmg.training import Trainer, load_checkpoint_context, load_model_weights
 
 
-def load_current_configs(project_root: Path, stage_path: Path) -> tuple[dict, dict, dict, dict]:
-    data_config = load_yaml(project_root / 'configs' / 'data' / 'default.yaml')
-    model_config = load_yaml(project_root / 'configs' / 'model' / 'default.yaml')
-    train_config = load_yaml(project_root / 'configs' / 'train' / 'base.yaml')
-    stage_config = load_yaml(stage_path)
-    data_config = deep_update(data_config, stage_config.get('data', {}))
-    model_config = deep_update(model_config, stage_config.get('model', {}))
-    train_config = deep_update(train_config, stage_config.get('train', {}))
-    train_config = deep_update(train_config, {'run_name': stage_config['name']})
-    return data_config, model_config, train_config, stage_config
+def load_current_configs(project_root: Path, stage_path: Path) -> tuple[dict, dict, dict, dict, dict]:
+    return resolve_training_configs(project_root, stage_path)
 
 
 RUNTIME_DATA_OVERRIDE_KEYS = {'visual_feature_cache_dir'}
@@ -146,6 +145,10 @@ def make_dataset(project_root: Path, split_path: Path, subset: str, data_config:
         attribute_taxonomy=str(data_config.get('attribute_taxonomy', 'legacy')),
         physical_attribute_table=data_config.get('physical_attribute_table'),
         physical_attribute_norm_stats_path=data_config.get('physical_attribute_norm_stats_path'),
+        schema_version=data_config.get('schema_version'),
+        dataset_version=data_config.get('dataset_version'),
+        split_version=data_config.get('split_version'),
+        force_baseline_by_direction=data_config.get('force_baseline'),
     )
 
 
@@ -161,6 +164,18 @@ def make_train_loader(train_dataset: CrossMediumSequenceDataset, train_config: d
     }
     if int(train_config['num_workers']) > 0 and bool(train_config.get('persistent_workers', False)):
         common_kwargs['persistent_workers'] = True
+
+    if sampling_mode == 'direction_object_aware' or bool(train_config.get('use_direction_aware_sampler', False)):
+        batch_sampler = DirectionAwareObjectBatchSampler(
+            train_dataset,
+            batch_size=batch_size,
+            direction_values=tuple(train_config.get('direction_values', ['W2A', 'A2W'])),
+            balance_mode=str(train_config.get('direction_balance_mode', 'paired_cycle')),
+            interface_alpha=interface_alpha,
+            min_interface_expert_windows=min_interface_expert_windows,
+            seed=int(train_config.get('seed', 42)),
+        )
+        return DataLoader(train_dataset, batch_sampler=batch_sampler, **common_kwargs)
 
     if sampling_mode == 'interface_object_aware':
         batch_sampler = InterfaceAwareObjectBatchSampler(
@@ -234,9 +249,10 @@ def main() -> None:
     init_path = resolve_optional_path(project_root, args.init_from)
     resume_context = load_checkpoint_context(resume_path) if resume_path is not None else None
 
-    data_config, model_config, train_config, stage_config = load_current_configs(project_root, stage_path)
+    data_config, model_config, train_config, stage_config, config_sources = load_current_configs(project_root, stage_path)
     current_data_config = data_config.copy()
     current_train_config = train_config.copy()
+    initialization_info = None
     if resume_context is not None:
         data_config, model_config, train_config, stage_config = apply_resume_config(
             data_config,
@@ -251,7 +267,22 @@ def main() -> None:
             current_data_config,
             current_train_config,
         )
+        archived_run_config = resume_context.get('run_config')
+        if isinstance(archived_run_config, dict):
+            if isinstance(archived_run_config.get('config_sources'), dict):
+                config_sources = archived_run_config['config_sources']
+            if isinstance(archived_run_config.get('initialization'), dict):
+                initialization_info = archived_run_config['initialization']
     model_config = sync_tactile_model_config(data_config, model_config)
+    validate_direction_training_contract(
+        project_root,
+        data_config,
+        model_config,
+        train_config,
+        stage_config,
+        initialization_path=init_path,
+        resuming=resume_context is not None,
+    )
 
     if data_config.get('visual_feature_cache_dir') and (
         float(stage_config.get('loss_weights', {}).get('clip', 0.0)) > 0.0
@@ -278,8 +309,21 @@ def main() -> None:
 
     model = CrossMediumSystem(model_config)
     if init_path is not None:
-        init_info = load_model_weights(model, init_path, strict=True, allow_lora_injection=True)
-        print({'initialized_from': str(init_path), **init_info})
+        initialization_config = stage_config.get('initialization', {})
+        if not isinstance(initialization_config, dict):
+            raise ValueError('stage.initialization must be a mapping when provided.')
+        allowed_missing_prefixes = initialization_config.get('allowed_missing_prefixes', [])
+        if not isinstance(allowed_missing_prefixes, list):
+            raise ValueError('stage.initialization.allowed_missing_prefixes must be a list.')
+        initialization_info = load_model_weights(
+            model,
+            init_path,
+            strict=True,
+            allow_lora_injection=bool(initialization_config.get('allow_lora_injection', True)),
+            allowed_missing_prefixes=[str(prefix) for prefix in allowed_missing_prefixes],
+        )
+        validate_initialization_source_contract(stage_config, initialization_info)
+        print({'initialized_from': str(init_path), **initialization_info})
 
     if resume_context is not None and resume_context.get('run_dir'):
         run_dir = Path(str(resume_context['run_dir']))
@@ -295,6 +339,8 @@ def main() -> None:
         model_config=model_config,
         run_dir=run_dir,
         data_config=data_config,
+        config_sources=config_sources,
+        initialization_info=initialization_info,
     )
     if resume_path is not None:
         resume_info = trainer.load_checkpoint(resume_path)

@@ -1,0 +1,41 @@
+extends: default.yaml
+
+visual:
+  lora_rank: 16
+  lora_alpha: 32
+  lora_dropout: 0.05
+  max_windows_per_encode: 2
+
+tactile:
+  content_layers: 3
+
+attributes:
+  fragility_classes: 2
+  geometry_classes: 2
+  surface_classes: 2
+  metric_tasks: [geometry]
+
+policy:
+  head_type: state_residual_per_finger_sign_specific
+  base_source: reference_force
+  use_reference_force_context: true
+  reference_force_context_scale: 100.0
+  residual_output_scale: 20.0
+  finger_count: 3
+  finger_embedding_dim: 16
+
+direction_conditioning:
+  enabled: true
+  num_directions: 2
+  embedding_dim: 16
+  zero_init: true
+  require_explicit_direction: true
+  return_diagnostics: false
+  medium:
+    enabled: true
+    mode: residual_film
+    hidden_dim: 32
+  policy:
+    enabled: true
+    mode: residual_film
+    hidden_dim: 64

@@ -116,19 +116,33 @@ def load_frames_by_indices(
 
     frames: dict[int, np.ndarray] = {}
     try:
-        for frame_index in unique_indices:
-            capture.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
-            success, frame = capture.read()
-            if not success:
-                capture.release()
-                capture = cv2.VideoCapture(str(video_path))
-                if not capture.isOpened():
-                    raise FileNotFoundError(f'Unable to reopen video: {video_path}')
+        # Dense sliding-window requests are much faster and more reliable when
+        # decoded in one forward pass instead of issuing one codec seek per frame.
+        span = unique_indices[-1] - unique_indices[0] + 1
+        use_sequential_decode = span <= len(unique_indices) * 4
+        if use_sequential_decode:
+            requested = set(unique_indices)
+            capture.set(cv2.CAP_PROP_POS_FRAMES, unique_indices[0])
+            for frame_index in range(unique_indices[0], unique_indices[-1] + 1):
+                success, frame = capture.read()
+                if not success:
+                    raise RuntimeError(f'Unable to decode frame {frame_index} from {video_path}.')
+                if frame_index in requested:
+                    frames[frame_index] = preprocess_frame(frame, image_size=image_size, roi=roi)
+        else:
+            for frame_index in unique_indices:
                 capture.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
                 success, frame = capture.read()
-            if not success:
-                raise RuntimeError(f'Unable to decode frame {frame_index} from {video_path}.')
-            frames[frame_index] = preprocess_frame(frame, image_size=image_size, roi=roi)
+                if not success:
+                    capture.release()
+                    capture = cv2.VideoCapture(str(video_path))
+                    if not capture.isOpened():
+                        raise FileNotFoundError(f'Unable to reopen video: {video_path}')
+                    capture.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
+                    success, frame = capture.read()
+                if not success:
+                    raise RuntimeError(f'Unable to decode frame {frame_index} from {video_path}.')
+                frames[frame_index] = preprocess_frame(frame, image_size=image_size, roi=roi)
     finally:
         capture.release()
     return frames

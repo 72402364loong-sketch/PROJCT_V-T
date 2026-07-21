@@ -12,6 +12,7 @@ from cmg.attribute_metrics import (
     ATTRIBUTE_TASKS,
     build_attribute_window_masks,
 )
+from cmg.constants import DIRECTION_TO_INDEX
 
 
 def info_nce_loss(view_a: torch.Tensor, view_b: torch.Tensor, temperature: float) -> torch.Tensor:
@@ -502,6 +503,105 @@ def masked_mean(values: torch.Tensor, mask: torch.Tensor, *, zero: torch.Tensor)
     if not mask.any():
         return zero
     return values[mask].mean()
+
+
+def direction_macro_sample_mean(
+    sample_losses: torch.Tensor,
+    direction_ids: torch.Tensor,
+    *,
+    sample_valid: torch.Tensor | None = None,
+    require_all_directions: bool = False,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Average valid samples inside each direction, then average directions equally."""
+    if sample_losses.ndim != 1 or direction_ids.ndim != 1:
+        raise RuntimeError('direction macro reduction expects one-dimensional sample losses and direction ids.')
+    if sample_losses.shape[0] != direction_ids.shape[0]:
+        raise RuntimeError(
+            'direction macro reduction sample count mismatch: '
+            f'{sample_losses.shape[0]} losses vs {direction_ids.shape[0]} direction ids.'
+        )
+    if direction_ids.dtype not in {torch.int8, torch.int16, torch.int32, torch.int64, torch.uint8}:
+        raise RuntimeError('direction macro reduction requires integer direction ids.')
+    if sample_valid is None:
+        sample_valid = torch.ones_like(direction_ids, dtype=torch.bool)
+    else:
+        sample_valid = sample_valid.to(device=direction_ids.device, dtype=torch.bool)
+        if sample_valid.shape != direction_ids.shape:
+            raise RuntimeError('direction macro sample_valid must match direction_ids shape.')
+
+    direction_means: dict[str, torch.Tensor] = {}
+    present: list[torch.Tensor] = []
+    missing: list[str] = []
+    for direction_name, direction_index in DIRECTION_TO_INDEX.items():
+        key = direction_name.lower()
+        mask = sample_valid & (direction_ids == direction_index)
+        if mask.any():
+            direction_means[key] = sample_losses[mask].mean()
+            present.append(direction_means[key])
+        else:
+            direction_means[key] = sample_losses.new_tensor(0.0)
+            missing.append(direction_name)
+    if require_all_directions and missing:
+        raise RuntimeError(f'direction macro reduction is missing valid samples for: {missing}.')
+    macro = torch.stack(present).mean() if present else sample_losses.sum() * 0.0
+    return macro, direction_means
+
+
+def direction_class_macro_sample_mean(
+    window_losses: torch.Tensor,
+    class_targets: torch.Tensor,
+    valid_mask: torch.Tensor,
+    direction_ids: torch.Tensor,
+    *,
+    num_classes: int,
+    require_all_directions: bool = False,
+    require_all_classes_per_direction: bool = False,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Average windows per sample/class, samples per direction/class, classes, then directions."""
+    if window_losses.ndim != 2:
+        raise RuntimeError('direction-class macro reduction expects [sample, window] losses.')
+    if class_targets.shape != window_losses.shape or valid_mask.shape != window_losses.shape:
+        raise RuntimeError('direction-class macro targets and mask must match window loss shape.')
+    if direction_ids.ndim != 1 or direction_ids.shape[0] != window_losses.shape[0]:
+        raise RuntimeError('direction-class macro requires one direction id per sample.')
+    if num_classes <= 0:
+        raise RuntimeError('direction-class macro num_classes must be positive.')
+
+    valid_mask = valid_mask.to(device=window_losses.device, dtype=torch.bool)
+    class_targets = class_targets.to(device=window_losses.device)
+    direction_ids = direction_ids.to(device=window_losses.device)
+    direction_means: dict[str, torch.Tensor] = {}
+    present_directions: list[torch.Tensor] = []
+    missing_directions: list[str] = []
+    for direction_name, direction_index in DIRECTION_TO_INDEX.items():
+        key = direction_name.lower()
+        sample_indices = torch.nonzero(direction_ids == direction_index, as_tuple=False).reshape(-1)
+        class_means: list[torch.Tensor] = []
+        missing_classes: list[int] = []
+        for class_index in range(num_classes):
+            sample_class_means: list[torch.Tensor] = []
+            for sample_index in sample_indices.tolist():
+                sample_class_mask = valid_mask[sample_index] & (class_targets[sample_index] == class_index)
+                if sample_class_mask.any():
+                    sample_class_means.append(window_losses[sample_index][sample_class_mask].mean())
+            if sample_class_means:
+                class_means.append(torch.stack(sample_class_means).mean())
+            else:
+                missing_classes.append(class_index)
+        if require_all_classes_per_direction and sample_indices.numel() > 0 and missing_classes:
+            raise RuntimeError(
+                f'direction-class macro reduction is missing classes {missing_classes} for {direction_name}.'
+            )
+        if class_means:
+            direction_means[key] = torch.stack(class_means).mean()
+            present_directions.append(direction_means[key])
+        else:
+            direction_means[key] = window_losses.sum() * 0.0
+            missing_directions.append(direction_name)
+    if require_all_directions and missing_directions:
+        raise RuntimeError(f'direction-class macro reduction is missing valid samples for: {missing_directions}.')
+    macro = torch.stack(present_directions).mean() if present_directions else window_losses.sum() * 0.0
+    return macro, direction_means
 
 
 def compute_physical_attribute_loss(
@@ -1186,6 +1286,7 @@ def compute_losses(
     temperature_clip: float,
     temperature_inv: float,
     phase_class_weights: torch.Tensor,
+    loss_reduction_config: dict[str, Any] | None = None,
 ) -> dict[str, torch.Tensor]:
     window_mask = batch['window_mask'].reshape(-1)
     stable_mask = batch['stable_masks'].reshape(-1) & window_mask
@@ -1214,6 +1315,31 @@ def compute_losses(
     clip_weight = float(loss_weights.get('clip', 0.0))
     inv_weight = float(loss_weights.get('inv', 0.0))
     pol_weight = float(loss_weights.get('pol', 0.0))
+    reduction_config = loss_reduction_config if isinstance(loss_reduction_config, dict) else {}
+    reduction_mode = str(reduction_config.get('mode', 'legacy_pooled')).strip().lower()
+    balanced_medium_mode = reduction_mode == 'sample_direction_class_macro_blend'
+    direction_macro_enabled = reduction_mode in {
+        'sample_direction_macro',
+        'direction_macro',
+        'sample_direction_class_macro_blend',
+    }
+    if reduction_mode not in {
+        'legacy_pooled',
+        'pooled',
+        'sample_direction_macro',
+        'direction_macro',
+        'sample_direction_class_macro_blend',
+    }:
+        raise RuntimeError(f'Unsupported loss_reduction.mode={reduction_mode!r}.')
+    direction_ids = batch.get('direction_ids')
+    if direction_macro_enabled:
+        if direction_ids is None:
+            raise RuntimeError('sample_direction_macro loss reduction requires batch["direction_ids"].')
+        direction_ids = direction_ids.to(device=medium_logits.device).reshape(-1)
+        if direction_ids.shape[0] != batch['window_mask'].shape[0]:
+            raise RuntimeError('direction_ids must contain one value per sample for direction-macro loss.')
+        if ((direction_ids < 0) | (direction_ids >= len(DIRECTION_TO_INDEX))).any():
+            raise RuntimeError('direction_ids contain values outside the canonical W2A/A2W range.')
     attribute_loss_config = attribute_loss_config if isinstance(attribute_loss_config, dict) else {}
     attr_class_weights = attribute_loss_config.get('class_weights', {})
     attr_task_weights = attribute_loss_config.get('task_weights', {})
@@ -1273,7 +1399,83 @@ def compute_losses(
             )
         return masks[mask_name].reshape(-1)
 
-    losses['med'] = F.cross_entropy(medium_logits[window_mask], phase_targets[window_mask], weight=phase_class_weights) if med_weight > 0.0 else zero
+    losses['med_w2a'] = zero
+    losses['med_a2w'] = zero
+    losses['med_original'] = zero
+    losses['med_class_balanced'] = zero
+    losses['med_class_balanced_w2a'] = zero
+    losses['med_class_balanced_a2w'] = zero
+    losses['pol_w2a'] = zero
+    losses['pol_a2w'] = zero
+    if med_weight > 0.0 and direction_macro_enabled:
+        batch_size = int(batch['window_mask'].shape[0])
+        windows = int(batch['window_mask'].shape[1])
+        sequence_logits = medium_logits.reshape(batch_size, windows, -1)
+        sequence_targets = phase_targets.reshape(batch_size, windows)
+        sample_med_losses: list[torch.Tensor] = []
+        sample_med_valid: list[bool] = []
+        for sample_index in range(batch_size):
+            sample_mask = batch['window_mask'][sample_index].bool()
+            sample_med_valid.append(bool(sample_mask.any().item()))
+            sample_med_losses.append(
+                F.cross_entropy(
+                    sequence_logits[sample_index][sample_mask],
+                    sequence_targets[sample_index][sample_mask],
+                    weight=phase_class_weights,
+                )
+                if sample_mask.any()
+                else zero
+            )
+        original_med, direction_med = direction_macro_sample_mean(
+            torch.stack(sample_med_losses),
+            direction_ids,
+            sample_valid=torch.tensor(sample_med_valid, device=direction_ids.device, dtype=torch.bool),
+            require_all_directions=bool(reduction_config.get('require_all_directions_per_batch', False)),
+        )
+        losses['med_original'] = original_med
+        if balanced_medium_mode:
+            original_weight = float(reduction_config.get('original_direction_macro_weight', 0.5))
+            balanced_weight = float(reduction_config.get('direction_class_macro_weight', 0.5))
+            if original_weight < 0.0 or balanced_weight < 0.0 or original_weight + balanced_weight <= 0.0:
+                raise RuntimeError('Warm+Balanced Medium reduction weights must be non-negative with a positive sum.')
+            weight_sum = original_weight + balanced_weight
+            original_weight /= weight_sum
+            balanced_weight /= weight_sum
+            raw_window_losses = F.cross_entropy(
+                sequence_logits.transpose(1, 2),
+                sequence_targets,
+                reduction='none',
+            )
+            balanced_med, balanced_direction_med = direction_class_macro_sample_mean(
+                raw_window_losses,
+                sequence_targets,
+                batch['window_mask'].bool(),
+                direction_ids,
+                num_classes=sequence_logits.shape[-1],
+                require_all_directions=bool(reduction_config.get('require_all_directions_per_batch', False)),
+                require_all_classes_per_direction=bool(
+                    reduction_config.get('require_all_classes_per_direction', False)
+                ),
+            )
+            losses['med_class_balanced'] = balanced_med
+            losses['med_class_balanced_w2a'] = balanced_direction_med['w2a']
+            losses['med_class_balanced_a2w'] = balanced_direction_med['a2w']
+            losses['med'] = original_weight * original_med + balanced_weight * balanced_med
+            losses['med_w2a'] = (
+                original_weight * direction_med['w2a']
+                + balanced_weight * balanced_direction_med['w2a']
+            )
+            losses['med_a2w'] = (
+                original_weight * direction_med['a2w']
+                + balanced_weight * balanced_direction_med['a2w']
+            )
+        else:
+            losses['med'] = original_med
+            losses['med_w2a'] = direction_med['w2a']
+            losses['med_a2w'] = direction_med['a2w']
+    else:
+        losses['med'] = F.cross_entropy(medium_logits[window_mask], phase_targets[window_mask], weight=phase_class_weights) if med_weight > 0.0 else zero
+        losses['med_original'] = losses['med']
     if attr_weight > 0.0:
         window_loss_mask = _attribute_window_loss_mask()
         sample_task_losses: dict[str, torch.Tensor] = {}
@@ -1454,7 +1656,57 @@ def compute_losses(
         stable_mask_for_policy = stable_mask
         window_mask_for_policy = window_mask
         policy_outputs = outputs
-    if pol_weight > 0.0 and control_mask.any():
+    if pol_weight > 0.0 and control_mask.any() and direction_macro_enabled:
+        batch_size = int(batch['window_mask'].shape[0])
+        if use_per_finger_policy:
+            sample_ids_for_policy = (
+                torch.arange(batch_size, device=control_mask.device)[:, None, None]
+                .expand_as(batch['finger_control_force_targets'])
+                .reshape(-1)
+            )
+        else:
+            sample_ids_for_policy = (
+                torch.arange(batch_size, device=control_mask.device)[:, None]
+                .expand_as(batch['window_mask'])
+                .reshape(-1)
+            )
+        sample_policy_losses: list[torch.Tensor] = []
+        sample_policy_valid: list[bool] = []
+        for sample_index in range(batch_size):
+            sample_membership = sample_ids_for_policy == sample_index
+            sample_control_mask = control_mask & sample_membership
+            sample_policy_valid.append(bool(sample_control_mask.any().item()))
+            if sample_control_mask.any():
+                sample_policy_losses.append(
+                    compute_policy_loss(
+                        policy_outputs,
+                        force_targets=force_targets,
+                        reference_targets=reference_targets,
+                        delta_targets=delta_targets,
+                        has_expert=has_expert & sample_membership,
+                        has_reference=has_reference & sample_membership,
+                        control_mask=sample_control_mask,
+                        reference_supervision_mask=reference_supervision_mask & sample_membership,
+                        delta_supervision_mask=delta_supervision_mask & sample_membership,
+                        quiet_supervision_mask=quiet_supervision_mask & sample_membership,
+                        phase_targets=phase_targets_for_policy,
+                        stable_mask=stable_mask_for_policy & sample_membership,
+                        window_mask=window_mask_for_policy & sample_membership,
+                        zero=zero,
+                        policy_loss_config=effective_policy_loss_config,
+                    )
+                )
+            else:
+                sample_policy_losses.append(zero)
+        losses['pol'], direction_pol = direction_macro_sample_mean(
+            torch.stack(sample_policy_losses),
+            direction_ids,
+            sample_valid=torch.tensor(sample_policy_valid, device=direction_ids.device, dtype=torch.bool),
+            require_all_directions=bool(reduction_config.get('require_all_directions_per_batch', False)),
+        )
+        losses['pol_w2a'] = direction_pol['w2a']
+        losses['pol_a2w'] = direction_pol['a2w']
+    elif pol_weight > 0.0 and control_mask.any():
         losses['pol'] = compute_policy_loss(
             policy_outputs,
             force_targets=force_targets,

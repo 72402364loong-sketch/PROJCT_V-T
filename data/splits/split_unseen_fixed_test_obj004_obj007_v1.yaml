@@ -1,0 +1,32 @@
+name: split_unseen_fixed_test_obj004_obj007_v1
+kind: object_level_unseen
+notes:
+  - Full 18-object fixed holdout benchmark; this definition supersedes the earlier 12-object v1 contents.
+  - OBJ004 and OBJ007 must remain in test for every run using this split.
+  - The previous test objects OBJ004/OBJ006/OBJ007/OBJ008 remain fixed and OBJ015 adds robust silicone-mold coverage.
+  - OBJ018 is assigned to train so matte has supervised train support.
+  - Every OBJ001-OBJ018 object is assigned exactly once; excluded is empty.
+required_test_object_ids:
+  - OBJ004
+  - OBJ007
+train_object_ids:
+  - OBJ001
+  - OBJ002
+  - OBJ003
+  - OBJ009
+  - OBJ011
+  - OBJ012
+  - OBJ013
+  - OBJ016
+  - OBJ017
+  - OBJ018
+val_object_ids:
+  - OBJ005
+  - OBJ010
+  - OBJ014
+test_object_ids:
+  - OBJ004
+  - OBJ006
+  - OBJ007
+  - OBJ008
+  - OBJ015

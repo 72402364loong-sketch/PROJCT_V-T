@@ -1,0 +1,62 @@
+extends: stage39_bidirectional_base.yaml
+name: stage39b_bidirectional_medium
+checkpoint_prefix: stage39b_bidirectional_medium
+best_checkpoint_name: stage39b_bidirectional_medium_best_medium_f1_interface_macro_direction.pt
+
+training_readiness:
+  status: ready
+  reason: M5-0 E0 W2A baseline completed and retention guard configured.
+  evidence: evals/stage39e0_warmstart_baseline/e0_summary.json
+  evidence_sha256: 1b256b1c70e5beb7639ffcf586238429911814bb5d435706bfff8c5fd27daf8a
+
+initialization:
+  required: true
+  expected_source_stage: stage39a_direction_adapter_warmup
+  allow_lora_injection: true
+  allowed_missing_prefixes: []
+
+freeze_modules:
+  - visual_encoder
+  - content_encoder
+  - attribute_head
+  - policy_head
+  - policy_direction_adapter
+
+expected_trainable_prefixes:
+  - direction_embedding
+  - medium_direction_adapter
+  - evidence_encoder
+  - medium_head
+
+loss_weights:
+  med: 1.0
+  pol: 0.0
+
+selection_metric: medium_f1_interface_macro_direction
+maximize_metric: true
+tie_breakers:
+  - metric: medium_macro_f1_macro_direction
+    mode: max
+  - metric: medium_f1_interface_w2a
+    mode: max
+  - metric: epoch
+    mode: min
+
+w2a_retention_guard:
+  enabled: true
+  metric: medium_f1_interface_w2a
+  mode: max
+  baseline_value: 0.6551664654131447
+  max_relative_degradation: 0.05
+
+train:
+  epochs: 10
+  learning_rate: 0.00001
+  base_learning_rate: 0.00001
+  lora_learning_rate: 0.00001
+  warmup_ratio: 0.05
+  min_lr_scale: 0.1
+  early_stopping_patience: 4
+  module_learning_rate_multipliers:
+    medium_direction_adapter: 5.0
+    direction_embedding: 2.0

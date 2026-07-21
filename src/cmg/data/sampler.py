@@ -259,3 +259,154 @@ class InterfaceAwareObjectBatchSampler(Sampler[list[int]]):
                 yield batch
             elif batch and not self.drop_last:
                 yield batch
+
+
+class DirectionAwareObjectBatchSampler(Sampler[list[int]]):
+    """Pair W2A/A2W samples within each object and cycle only the shorter direction queue."""
+
+    def __init__(
+        self,
+        dataset,
+        batch_size: int,
+        *,
+        direction_values: Sequence[str] = ('W2A', 'A2W'),
+        balance_mode: str = 'paired_cycle',
+        interface_alpha: float = 0.0,
+        min_interface_expert_windows: int = 1,
+        drop_last: bool = False,
+        seed: int = 42,
+    ) -> None:
+        if batch_size <= 0 or batch_size % 2 != 0:
+            raise ValueError(f'direction-aware batch_size must be a positive even number, got {batch_size}.')
+        normalized_directions = tuple(str(value).strip().upper() for value in direction_values)
+        if normalized_directions != ('W2A', 'A2W'):
+            raise ValueError(f'direction_values must be (W2A, A2W), got {normalized_directions}.')
+        if str(balance_mode).strip().lower() != 'paired_cycle':
+            raise ValueError(f'Unsupported direction balance mode: {balance_mode!r}.')
+
+        self.dataset = dataset
+        self.batch_size = int(batch_size)
+        self.direction_values = normalized_directions
+        self.balance_mode = 'paired_cycle'
+        self.interface_alpha = float(interface_alpha)
+        self.min_interface_expert_windows = int(min_interface_expert_windows)
+        self.drop_last = bool(drop_last)
+        self.seed = int(seed)
+        self._iteration = 0
+        self.last_epoch_summary: dict[str, object] = {}
+
+        indices_by_object_direction: dict[str, dict[str, list[int]]] = defaultdict(
+            lambda: {direction: [] for direction in self.direction_values}
+        )
+        self.sample_weights: dict[int, float] = {}
+        for index, sample in enumerate(dataset.sample_records):
+            object_id = str(sample['object_id'])
+            direction = str(sample.get('direction', '')).strip().upper()
+            if direction not in self.direction_values:
+                raise ValueError(f'Sample {sample.get("sample_id", index)!r} has unsupported direction={direction!r}.')
+            indices_by_object_direction[object_id][direction].append(index)
+            self.sample_weights[index] = _interface_priority(
+                sample,
+                alpha=self.interface_alpha,
+                min_interface_expert_windows=self.min_interface_expert_windows,
+            )
+
+        incomplete = {
+            object_id: [direction for direction in self.direction_values if not queues[direction]]
+            for object_id, queues in indices_by_object_direction.items()
+            if any(not queues[direction] for direction in self.direction_values)
+        }
+        if incomplete:
+            raise ValueError(f'Every sampled object must contain both directions: {incomplete}.')
+        self.indices_by_object_direction = {
+            object_id: {
+                direction: sorted(indices)
+                for direction, indices in queues.items()
+            }
+            for object_id, queues in indices_by_object_direction.items()
+        }
+        self.object_ids = sorted(self.indices_by_object_direction)
+        self.pair_count_by_object = {
+            object_id: max(len(queues[direction]) for direction in self.direction_values)
+            for object_id, queues in self.indices_by_object_direction.items()
+        }
+        self.total_pair_count = sum(self.pair_count_by_object.values())
+
+    def __len__(self) -> int:
+        pairs_per_batch = self.batch_size // 2
+        if self.drop_last:
+            return self.total_pair_count // pairs_per_batch
+        return math.ceil(self.total_pair_count / pairs_per_batch)
+
+    def __iter__(self) -> Iterator[list[int]]:
+        rng = random.Random(self.seed + self._iteration)
+        self._iteration += 1
+
+        pair_queues: dict[str, list[tuple[int, int]]] = {}
+        for object_id, direction_queues in self.indices_by_object_direction.items():
+            ordered: dict[str, list[int]] = {}
+            for direction in self.direction_values:
+                indices = direction_queues[direction]
+                ordered[direction] = _weighted_order(
+                    rng,
+                    indices,
+                    [self.sample_weights[index] for index in indices],
+                )
+            pair_count = self.pair_count_by_object[object_id]
+            pair_queues[object_id] = [
+                (
+                    ordered['W2A'][pair_index % len(ordered['W2A'])],
+                    ordered['A2W'][pair_index % len(ordered['A2W'])],
+                )
+                for pair_index in range(pair_count)
+            ]
+            rng.shuffle(pair_queues[object_id])
+
+        pairs_per_batch = self.batch_size // 2
+        drawn_indices: list[int] = []
+        direction_draw_counts = {direction: 0 for direction in self.direction_values}
+        object_draw_counts = {object_id: 0 for object_id in self.object_ids}
+        batch_count = 0
+        active_objects = [object_id for object_id in self.object_ids if pair_queues[object_id]]
+        while active_objects:
+            rng.shuffle(active_objects)
+            selected_objects = active_objects[: min(pairs_per_batch, len(active_objects))]
+            batch: list[int] = []
+            for object_id in selected_objects:
+                w2a_index, a2w_index = pair_queues[object_id].pop()
+                batch.extend([w2a_index, a2w_index])
+                drawn_indices.extend([w2a_index, a2w_index])
+                direction_draw_counts['W2A'] += 1
+                direction_draw_counts['A2W'] += 1
+                object_draw_counts[object_id] += 2
+            while len(batch) < self.batch_size:
+                refill_objects = [object_id for object_id in self.object_ids if pair_queues[object_id]]
+                if not refill_objects:
+                    break
+                object_id = rng.choice(refill_objects)
+                w2a_index, a2w_index = pair_queues[object_id].pop()
+                batch.extend([w2a_index, a2w_index])
+                drawn_indices.extend([w2a_index, a2w_index])
+                direction_draw_counts['W2A'] += 1
+                direction_draw_counts['A2W'] += 1
+                object_draw_counts[object_id] += 2
+            active_objects = [object_id for object_id in active_objects if pair_queues[object_id]]
+            if len(batch) == self.batch_size:
+                batch_count += 1
+                yield batch
+            elif batch and not self.drop_last:
+                batch_count += 1
+                yield batch
+
+        unique_draws = len(set(drawn_indices))
+        repeated_draws = len(drawn_indices) - unique_draws
+        self.last_epoch_summary = {
+            'balance_mode': self.balance_mode,
+            'batch_count': batch_count,
+            'total_draws': len(drawn_indices),
+            'unique_draws': unique_draws,
+            'repeated_draws': repeated_draws,
+            'repeat_rate': float(repeated_draws / max(1, len(drawn_indices))),
+            'direction_draw_counts': direction_draw_counts,
+            'object_draw_counts': object_draw_counts,
+        }

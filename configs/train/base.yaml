@@ -18,7 +18,10 @@ grad_clip_norm: 1.0
 early_stopping_patience: 8
 log_tensorboard: true
 use_object_aware_sampler: true
+use_direction_aware_sampler: false
 samples_per_object: 2
+direction_values: [W2A, A2W]
+direction_balance_mode: paired_cycle
 
 default_allowed_trial_results:
   train:

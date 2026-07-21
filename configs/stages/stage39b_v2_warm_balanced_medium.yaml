@@ -1,0 +1,80 @@
+extends: stage39_bidirectional_base.yaml
+name: stage39b_v2_warm_balanced_medium
+checkpoint_prefix: stage39b_v2_warm_balanced_medium
+best_checkpoint_name: stage39b_v2_warm_balanced_medium_best_medium_water_interface_hmean_macro_direction.pt
+
+training_readiness:
+  status: ready
+  reason: M5-0 E0 W2A baseline completed; Warm+Balanced is an isolated Stage39b ablation.
+  evidence: evals/stage39e0_warmstart_baseline/e0_summary.json
+  evidence_sha256: 1b256b1c70e5beb7639ffcf586238429911814bb5d435706bfff8c5fd27daf8a
+
+initialization:
+  required: true
+  expected_source_stage: stage39a_direction_adapter_warmup
+  allow_lora_injection: true
+  allowed_missing_prefixes: []
+
+freeze_modules:
+  - visual_encoder
+  - content_encoder
+  - attribute_head
+  - policy_head
+  - policy_direction_adapter
+
+expected_trainable_prefixes:
+  - direction_embedding
+  - medium_direction_adapter
+  - evidence_encoder
+  - medium_head
+
+loss_weights:
+  med: 1.0
+  pol: 0.0
+
+# Preserve half of the original sample/direction-macro objective while making
+# Water, Interface, and Air equally visible inside each direction in the other half.
+train:
+  loss_reduction:
+    mode: sample_direction_class_macro_blend
+    original_direction_macro_weight: 0.5
+    direction_class_macro_weight: 0.5
+    require_all_directions_per_batch: false
+    require_all_classes_per_direction: false
+  epochs: 10
+  learning_rate: 0.00001
+  base_learning_rate: 0.00001
+  lora_learning_rate: 0.00001
+  warmup_ratio: 0.05
+  min_lr_scale: 0.1
+  early_stopping_patience: 4
+  module_learning_rate_multipliers:
+    medium_direction_adapter: 5.0
+    direction_embedding: 2.0
+
+# The harmonic mean becomes zero if either Water or Interface collapses.
+selection_metric: medium_water_interface_hmean_macro_direction
+maximize_metric: true
+tie_breakers:
+  - metric: medium_f1_interface_a2w
+    mode: max
+  - metric: medium_f1_water_a2w
+    mode: max
+  - metric: medium_f1_interface_w2a
+    mode: max
+  - metric: epoch
+    mode: min
+
+w2a_retention_guard:
+  enabled: true
+  metric: medium_f1_interface_w2a
+  mode: max
+  baseline_value: 0.6551664654131447
+  max_relative_degradation: 0.05
+
+evaluation_acceptance:
+  medium_f1_interface_w2a_min: 0.6224081421424874
+  medium_f1_water_a2w_min: 0.30
+  medium_f1_interface_a2w_min: 0.15
+  gate_false_negative_interface_a2w_max: 0.75
+  require_frozen_parameters_unchanged: true

@@ -42,6 +42,93 @@ class MLP(nn.Module):
         return self.net(inputs)
 
 
+class DirectionEmbedding(nn.Module):
+    def __init__(self, num_directions: int, embedding_dim: int) -> None:
+        super().__init__()
+        self.num_directions = int(num_directions)
+        self.embedding_dim = int(embedding_dim)
+        if self.num_directions <= 1:
+            raise ValueError(f'num_directions must be greater than one, got {self.num_directions}.')
+        if self.embedding_dim <= 0:
+            raise ValueError(f'embedding_dim must be positive, got {self.embedding_dim}.')
+        self.embedding = nn.Embedding(self.num_directions, self.embedding_dim)
+
+    def forward(self, direction_ids: torch.Tensor) -> torch.Tensor:
+        if direction_ids.ndim != 1:
+            raise RuntimeError(f'direction_ids must have shape [B], got {tuple(direction_ids.shape)}.')
+        if direction_ids.dtype not in {
+            torch.int8,
+            torch.int16,
+            torch.int32,
+            torch.int64,
+            torch.uint8,
+        }:
+            raise RuntimeError(f'direction_ids must be an integer tensor, got {direction_ids.dtype}.')
+        normalized_ids = direction_ids.to(dtype=torch.long)
+        if normalized_ids.numel() > 0:
+            minimum = int(normalized_ids.min().item())
+            maximum = int(normalized_ids.max().item())
+            if minimum < 0 or maximum >= self.num_directions:
+                raise RuntimeError(
+                    f'direction_ids must be within [0, {self.num_directions - 1}], got min={minimum}, max={maximum}.'
+                )
+        return self.embedding(normalized_ids)
+
+
+class ResidualFiLMAdapter(nn.Module):
+    def __init__(
+        self,
+        *,
+        condition_dim: int,
+        feature_dim: int,
+        hidden_dim: int,
+        zero_init: bool = True,
+    ) -> None:
+        super().__init__()
+        self.condition_dim = int(condition_dim)
+        self.feature_dim = int(feature_dim)
+        self.hidden_dim = int(hidden_dim)
+        if self.condition_dim <= 0 or self.feature_dim <= 0 or self.hidden_dim <= 0:
+            raise ValueError(
+                'ResidualFiLMAdapter dimensions must be positive, got '
+                f'condition={self.condition_dim}, feature={self.feature_dim}, hidden={self.hidden_dim}.'
+            )
+        self.input_layer = nn.Linear(self.condition_dim, self.hidden_dim)
+        self.output_layer = nn.Linear(self.hidden_dim, self.feature_dim * 2)
+        if zero_init:
+            nn.init.zeros_(self.output_layer.weight)
+            nn.init.zeros_(self.output_layer.bias)
+
+    def modulation(self, condition: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        if condition.shape[-1] != self.condition_dim:
+            raise RuntimeError(
+                f'Expected condition dim {self.condition_dim}, got shape {tuple(condition.shape)}.'
+            )
+        gamma, beta = self.output_layer(F.gelu(self.input_layer(condition))).chunk(2, dim=-1)
+        return gamma, beta
+
+    @staticmethod
+    def apply_modulation(
+        features: torch.Tensor,
+        gamma: torch.Tensor,
+        beta: torch.Tensor,
+    ) -> torch.Tensor:
+        if gamma.shape != beta.shape:
+            raise RuntimeError(f'FiLM gamma/beta shapes differ: {tuple(gamma.shape)} != {tuple(beta.shape)}.')
+        if features.shape[-1] != gamma.shape[-1]:
+            raise RuntimeError(
+                f'FiLM feature dimension mismatch: features={tuple(features.shape)}, modulation={tuple(gamma.shape)}.'
+            )
+        while gamma.ndim < features.ndim:
+            gamma = gamma.unsqueeze(-2)
+            beta = beta.unsqueeze(-2)
+        return (1.0 + gamma) * features + beta
+
+    def forward(self, features: torch.Tensor, condition: torch.Tensor) -> torch.Tensor:
+        gamma, beta = self.modulation(condition)
+        return self.apply_modulation(features, gamma, beta)
+
+
 class TemporalAttentionPooling(nn.Module):
     def __init__(self, input_dim: int) -> None:
         super().__init__()
@@ -843,6 +930,7 @@ class PolicyHead(nn.Module):
         state_context: torch.Tensor | None = None,
         residual_context: torch.Tensor | None = None,
         interface_gate_override: torch.Tensor | None = None,
+        residual_modulation: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> dict[str, torch.Tensor]:
         if interface_gate_override is not None:
             interface_gate = interface_gate_override.to(device=task_context.device, dtype=task_context.dtype).reshape(-1)
@@ -890,6 +978,12 @@ class PolicyHead(nn.Module):
                 residual_hidden = residual_hidden + self.finger_residual_context_scale * self.finger_residual_context_input_layer(residual_context)
             gamma, beta = self.film(p_medium).chunk(2, dim=-1)
             residual_hidden = (1.0 + gamma.unsqueeze(1)) * residual_hidden + beta.unsqueeze(1)
+            if residual_modulation is not None:
+                residual_hidden = ResidualFiLMAdapter.apply_modulation(
+                    residual_hidden,
+                    residual_modulation[0],
+                    residual_modulation[1],
+                )
             residual_hidden = F.gelu(self.finger_residual_hidden_layer(residual_hidden))
             if self.head_type == 'state_residual_per_finger_sign_specific':
                 pos_raw = self.finger_residual_pos_output_layer(residual_hidden).squeeze(-1)
@@ -956,6 +1050,12 @@ class PolicyHead(nn.Module):
                 residual_hidden = residual_hidden + self.residual_context_scale * self.residual_context_input_layer(residual_context)
             gamma, beta = self.film(p_medium).chunk(2, dim=-1)
             residual_hidden = (1.0 + gamma) * residual_hidden + beta
+            if residual_modulation is not None:
+                residual_hidden = ResidualFiLMAdapter.apply_modulation(
+                    residual_hidden,
+                    residual_modulation[0],
+                    residual_modulation[1],
+                )
             residual_hidden = F.gelu(self.residual_hidden_layer(residual_hidden))
             if self.head_type == 'state_residual_sign_specific':
                 pos_raw = self.residual_pos_output_layer(residual_hidden).squeeze(-1)
@@ -993,6 +1093,10 @@ class PolicyHead(nn.Module):
                 'interface_gate': interface_gate,
             }
 
+        if residual_modulation is not None:
+            raise RuntimeError(
+                f'Policy head type {self.head_type!r} does not expose a residual branch for direction conditioning.'
+            )
         hidden = F.gelu(self.input_layer(task_context))
         gamma, beta = self.film(p_medium).chunk(2, dim=-1)
         hidden = (1.0 + gamma) * hidden + beta

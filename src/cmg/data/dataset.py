@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 from typing import Any, Iterable
@@ -7,14 +8,18 @@ from typing import Any, Iterable
 import numpy as np
 import pandas as pd
 import torch
+import yaml
 from torch.utils.data import Dataset
 
 from cmg.constants import (
+    DIRECTION_TO_INDEX,
+    DIRECTION_TO_MEDIA,
     FRAGILITY_TO_INDEX,
     FRAGILITY_TO_V2,
     FRAGILITY_V2_TO_INDEX,
     GEOMETRY_TO_INDEX,
     GEOMETRY_TO_SHAPE_PROFILE_V2,
+    MEDIUM_TO_PHASE,
     PHASE_TO_INDEX,
     SHAPE_PROFILE_V2_TO_INDEX,
     SURFACE_TEXTURE_V2_TO_INDEX,
@@ -22,7 +27,7 @@ from cmg.constants import (
     SURFACE_TO_TEXTURE_V2,
 )
 
-from .splits import resolve_sample_ids
+from .splits import derive_split_labels, resolve_sample_ids, resolve_split_config
 from .tactile import (
     build_tactile_time_axis,
     compute_clean_force_curve,
@@ -58,6 +63,14 @@ PHYSICAL_REQUIRED_COLUMNS = (
     'capacity_ratio',
     *PHYSICAL_CATEGORICAL_ATTRIBUTES,
 )
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open('rb') as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b''):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 class CrossMediumSequenceDataset(Dataset):
@@ -109,6 +122,10 @@ class CrossMediumSequenceDataset(Dataset):
         attribute_taxonomy: str = 'legacy',
         physical_attribute_table: str | Path | None = 'data/annotations/object_physical_attributes.csv',
         physical_attribute_norm_stats_path: str | Path | None = 'data/processed/stats/physical_attribute_norm_stats.json',
+        schema_version: str | None = None,
+        dataset_version: str | None = None,
+        split_version: str | None = None,
+        force_baseline_by_direction: dict[str, str] | None = None,
     ) -> None:
         self.project_root = Path(project_root)
         self.split_path = Path(split_path)
@@ -162,6 +179,13 @@ class CrossMediumSequenceDataset(Dataset):
             )
         self.physical_attribute_table_path = self._resolve_optional_project_path(physical_attribute_table)
         self.physical_attribute_norm_stats_path = self._resolve_optional_project_path(physical_attribute_norm_stats_path)
+        self.schema_version = None if schema_version is None else str(schema_version)
+        self.dataset_version = None if dataset_version is None else str(dataset_version)
+        self.split_version = None if split_version is None else str(split_version)
+        self.force_baseline_by_direction = {
+            str(direction).strip().upper(): str(mode).strip().lower()
+            for direction, mode in (force_baseline_by_direction or {}).items()
+        }
         self.physical_attributes = self._load_physical_attribute_table()
         self.physical_attribute_by_object = {
             str(row['object_id']): row
@@ -171,9 +195,12 @@ class CrossMediumSequenceDataset(Dataset):
 
         if self.samples_path is None or self.windows_path is None:
             raise ValueError('samples_path and windows_path are required.')
+        self.samples_sha256 = _file_sha256(self.samples_path)
+        self.annotations_sha256 = ''
         self.all_samples = pd.read_csv(self.samples_path)
         self.samples = self.all_samples.copy()
         self.windows = pd.read_csv(self.windows_path)
+        self._validate_bidirectional_schema()
         if 'policy_timestamp' not in self.windows.columns:
             self.windows['policy_timestamp'] = self.windows['window_center']
         sample_ids = set(resolve_sample_ids(self.all_samples, self.split_path, subset=subset))
@@ -226,6 +253,109 @@ class CrossMediumSequenceDataset(Dataset):
             self.tactile_high_std = np.asarray(stats['high_std'], dtype=np.float32)
             self.tactile_low_mean = np.asarray(stats['low_mean'], dtype=np.float32)
             self.tactile_low_std = np.asarray(stats['low_std'], dtype=np.float32)
+
+    def _validate_bidirectional_schema(self) -> None:
+        is_bidirectional = (
+            (self.schema_version or '').startswith('bidirectional-')
+            or 'direction' in self.all_samples.columns
+            or 'direction' in self.windows.columns
+        )
+        if not is_bidirectional:
+            return
+
+        sample_required = {
+            'sample_id', 'object_id', 'physical_object_uid', 'direction', 'direction_index',
+            'source_medium', 'target_medium', 'reference_medium', 'split', 'split_version',
+            'trial_result', 'reference_start_time', 'reference_end_time',
+            'has_reference_candidate', 'policy_supervision_eligible', 'force_baseline_mode',
+        }
+        window_required = {
+            'window_id', 'sample_id', 'physical_object_uid', 'direction', 'direction_index',
+            'source_medium', 'target_medium', 'reference_medium', 'split', 'split_version',
+            'reference_interval_start', 'reference_interval_end', 'reference_eligible',
+            'policy_supervision_eligible',
+        }
+        missing_samples = sorted(sample_required - set(self.all_samples.columns))
+        missing_windows = sorted(window_required - set(self.windows.columns))
+        if missing_samples or missing_windows:
+            raise RuntimeError(
+                f'Bidirectional dataset schema is incomplete: samples={missing_samples}, windows={missing_windows}.'
+            )
+
+        invalid_directions = sorted(set(self.all_samples['direction'].astype(str)) - set(DIRECTION_TO_INDEX))
+        if invalid_directions:
+            raise RuntimeError(f'Unsupported direction values in samples: {invalid_directions}.')
+        for direction, media in DIRECTION_TO_MEDIA.items():
+            mask = self.all_samples['direction'].astype(str).eq(direction)
+            if not self.all_samples.loc[mask, 'direction_index'].astype(int).eq(DIRECTION_TO_INDEX[direction]).all():
+                raise RuntimeError(f'{direction} has inconsistent direction_index values.')
+            for field, expected in media.items():
+                if not self.all_samples.loc[mask, field].astype(str).eq(expected).all():
+                    raise RuntimeError(f'{direction} has inconsistent {field}; expected {expected!r}.')
+
+        resolved_split_path = self.split_path if self.split_path.is_absolute() else self.project_root / self.split_path
+        split_config = resolve_split_config(resolved_split_path)
+        expected_split_version = self.split_version or str(split_config.get('name', resolved_split_path.stem))
+        if self.split_version and self.split_version != split_config.get('name'):
+            raise RuntimeError(
+                f'Configured split_version={self.split_version!r} does not match split YAML name={split_config.get("name")!r}.'
+            )
+        if set(self.all_samples['split_version'].astype(str)) != {expected_split_version}:
+            raise RuntimeError('samples.csv split_version does not match the active split YAML.')
+        if set(self.windows['split_version'].astype(str)) != {expected_split_version}:
+            raise RuntimeError('windows.csv split_version does not match the active split YAML.')
+        self.split_version = expected_split_version
+
+        derived_splits = derive_split_labels(self.all_samples, resolved_split_path).astype(str)
+        if not self.all_samples['split'].astype(str).reset_index(drop=True).eq(derived_splits.reset_index(drop=True)).all():
+            raise RuntimeError('samples.csv split labels do not match the active split YAML.')
+        uid_split_counts = self.all_samples.groupby('physical_object_uid')['split'].nunique()
+        if (uid_split_counts > 1).any():
+            leaking = sorted(uid_split_counts.loc[uid_split_counts > 1].index.astype(str).tolist())
+            raise RuntimeError(f'physical_object_uid leakage across splits: {leaking}.')
+
+        sample_by_id = self.all_samples.set_index('sample_id')
+        for field in [
+            'physical_object_uid', 'direction', 'direction_index', 'source_medium', 'target_medium',
+            'reference_medium', 'split', 'split_version', 'policy_supervision_eligible',
+        ]:
+            expected = self.windows['sample_id'].map(sample_by_id[field])
+            if expected.isna().any() or not self.windows[field].astype(str).eq(expected.astype(str)).all():
+                raise RuntimeError(f'windows.csv {field} values do not match their parent samples.')
+
+        fail_samples = self.all_samples['trial_result'].astype(str).str.lower().ne('stable')
+        if self.all_samples.loc[fail_samples, 'has_reference_candidate'].astype(bool).any():
+            raise RuntimeError('Fail samples must not be reference eligible.')
+        if self.all_samples.loc[fail_samples, 'policy_supervision_eligible'].astype(bool).any():
+            raise RuntimeError('Fail samples must not be policy eligible.')
+        a2w_baselines = set(
+            self.all_samples.loc[self.all_samples['direction'].eq('A2W'), 'force_baseline_mode'].astype(str)
+        )
+        if a2w_baselines != {'none'}:
+            raise RuntimeError(f'A2W force_baseline_mode must be none, got {sorted(a2w_baselines)}.')
+
+        manifest_path = self.samples_path.parent / 'manifest.yaml'
+        if manifest_path.exists():
+            with manifest_path.open('r', encoding='utf-8') as handle:
+                manifest = yaml.safe_load(handle) or {}
+            self.annotations_sha256 = str(manifest.get('annotations_sha256', ''))
+            manifest_samples_sha256 = str(manifest.get('samples_sha256', ''))
+            if manifest_samples_sha256 and manifest_samples_sha256 != self.samples_sha256:
+                raise RuntimeError('samples.csv SHA-256 does not match the processed manifest.')
+            if self.schema_version is None and manifest.get('schema_version') is not None:
+                self.schema_version = str(manifest['schema_version'])
+            if self.dataset_version is None and manifest.get('dataset_version') is not None:
+                self.dataset_version = str(manifest['dataset_version'])
+            expected_versions = {
+                'schema_version': self.schema_version,
+                'dataset_version': self.dataset_version,
+                'split_version': expected_split_version,
+            }
+            for field, expected in expected_versions.items():
+                if expected is not None and str(manifest.get(field)) != str(expected):
+                    raise RuntimeError(
+                        f'Manifest {field}={manifest.get(field)!r} does not match configured value={expected!r}.'
+                    )
 
     def _annotate_sample_records_with_interface_stats(self) -> None:
         interface_index = int(PHASE_TO_INDEX['Interface'])
@@ -311,12 +441,30 @@ class CrossMediumSequenceDataset(Dataset):
             )
 
     def _physical_stats_cache_payload_is_compatible(self, payload: dict[str, Any]) -> bool:
-        if payload.get('version') != 1:
+        bidirectional = 'direction' in self.all_samples.columns
+        expected_version = 2 if bidirectional else 1
+        if payload.get('version') != expected_version:
             return False
         if payload.get('split_path') != str(self.split_path):
             return False
         if payload.get('normalization_subset') != str(self.normalization_subset):
             return False
+        if bidirectional:
+            if payload.get('dataset_version') != self.dataset_version:
+                return False
+            if payload.get('schema_version') != self.schema_version:
+                return False
+            if payload.get('split_version') != self.split_version:
+                return False
+            if payload.get('annotations_sha256') != self.annotations_sha256:
+                return False
+            if payload.get('samples_sha256') != self.samples_sha256:
+                return False
+            if payload.get('direction_set') != sorted(self.all_samples['direction'].astype(str).unique().tolist()):
+                return False
+            expected_trials = None if self.normalization_trial_results is None else sorted(self.normalization_trial_results)
+            if payload.get('normalization_trial_results') != expected_trials:
+                return False
         continuous = payload.get('continuous')
         return isinstance(continuous, dict) and all(attribute in continuous for attribute in PHYSICAL_CONTINUOUS_ATTRIBUTES)
 
@@ -366,10 +514,20 @@ class CrossMediumSequenceDataset(Dataset):
             }
 
         return {
-            'version': 1,
+            'version': 2 if 'direction' in self.all_samples.columns else 1,
+            'dataset_version': self.dataset_version,
+            'schema_version': self.schema_version,
+            'split_version': self.split_version,
+            'annotations_sha256': self.annotations_sha256,
+            'samples_sha256': self.samples_sha256,
             'split_path': str(self.split_path),
             'normalization_subset': str(self.normalization_subset),
             'normalization_trial_results': None if self.normalization_trial_results is None else sorted(self.normalization_trial_results),
+            'direction_set': (
+                sorted(self.all_samples['direction'].astype(str).unique().tolist())
+                if 'direction' in self.all_samples.columns
+                else []
+            ),
             'object_ids': object_ids,
             'continuous': continuous,
         }
@@ -463,20 +621,65 @@ class CrossMediumSequenceDataset(Dataset):
         return records
 
     def _stats_cache_path(self) -> Path:
-        cache_root = self.project_root / 'data' / 'processed' / 'cache'
+        bidirectional = 'direction' in self.all_samples.columns
+        cache_root = (
+            self.samples_path.parent / 'cache' / 'stats'
+            if bidirectional
+            else self.project_root / 'data' / 'processed' / 'cache'
+        )
         cache_root.mkdir(parents=True, exist_ok=True)
-        suffix_parts = [self.split_path.stem, self.normalization_subset, f"alpha_{str(self.acdc_alpha).replace('.', 'p')}"]
+        suffix_parts = []
+        if bidirectional:
+            suffix_parts.extend([
+                str(self.dataset_version or 'dataset'),
+                str(self.schema_version or 'schema'),
+                str(self.split_version or self.split_path.stem),
+                'annotations_' + (self.annotations_sha256[:12] or 'unversioned'),
+                'samples_' + self.samples_sha256[:12],
+                'directions_' + '_'.join(sorted(self.all_samples['direction'].astype(str).unique().tolist())),
+                (
+                    'reference_'
+                    + self.reference_force_source
+                    + '_'
+                    + str(self.reference_force_duration_sec).replace('.', 'p')
+                    + '_'
+                    + self.reference_force_statistic
+                ),
+            ])
+        else:
+            suffix_parts.append(self.split_path.stem)
+        suffix_parts.extend([self.normalization_subset, f"alpha_{str(self.acdc_alpha).replace('.', 'p')}"])
         if self.tactile_input_axes != ('x', 'y', 'z'):
             suffix_parts.append('axes_' + ''.join(self.tactile_input_axes))
         if self.normalization_trial_results:
             suffix_parts.append('trials_' + '_'.join(sorted(self.normalization_trial_results)))
         return cache_root / ('tactile_stats_' + '__'.join(suffix_parts) + '.json')
 
+    def _tactile_stats_cache_payload_is_compatible(self, payload: dict[str, Any]) -> bool:
+        if 'direction' not in self.all_samples.columns:
+            return all(key in payload for key in ['high_mean', 'high_std', 'low_mean', 'low_std'])
+        expected_trials = None if self.normalization_trial_results is None else sorted(self.normalization_trial_results)
+        return (
+            payload.get('version') == 2
+            and payload.get('dataset_version') == self.dataset_version
+            and payload.get('schema_version') == self.schema_version
+            and payload.get('split_version') == self.split_version
+            and payload.get('annotations_sha256') == self.annotations_sha256
+            and payload.get('samples_sha256') == self.samples_sha256
+            and payload.get('normalization_subset') == self.normalization_subset
+            and payload.get('normalization_trial_results') == expected_trials
+            and payload.get('direction_set') == sorted(self.all_samples['direction'].astype(str).unique().tolist())
+            and payload.get('tactile_input_axes') == list(self.tactile_input_axes)
+            and np.isclose(float(payload.get('acdc_alpha', float('nan'))), self.acdc_alpha)
+        )
+
     def _load_or_compute_tactile_stats(self) -> dict[str, list[float]]:
         cache_path = self._stats_cache_path()
         if cache_path.exists():
             with cache_path.open('r', encoding='utf-8') as handle:
-                return json.load(handle)
+                payload = json.load(handle)
+            if self._tactile_stats_cache_payload_is_compatible(payload):
+                return payload
 
         train_sample_ids = set(resolve_sample_ids(self.all_samples, self.split_path, subset=self.normalization_subset))
         stat_samples = self.all_samples.loc[self.all_samples['sample_id'].isin(train_sample_ids)].copy()
@@ -520,6 +723,27 @@ class CrossMediumSequenceDataset(Dataset):
                 'low_std': np.sqrt(low_var).astype(np.float32).tolist(),
             }
 
+        if 'direction' in self.all_samples.columns:
+            stats = {
+                'version': 2,
+                'dataset_version': self.dataset_version,
+                'schema_version': self.schema_version,
+                'split_version': self.split_version,
+                'annotations_sha256': self.annotations_sha256,
+                'samples_sha256': self.samples_sha256,
+                'normalization_subset': self.normalization_subset,
+                'normalization_trial_results': (
+                    None if self.normalization_trial_results is None else sorted(self.normalization_trial_results)
+                ),
+                'direction_set': sorted(stat_samples['direction'].astype(str).unique().tolist()),
+                'tactile_input_axes': list(self.tactile_input_axes),
+                'acdc_alpha': self.acdc_alpha,
+                'sample_count': int(len(stat_samples)),
+                'point_count': int(count),
+                'sample_ids': sorted(stat_samples['sample_id'].astype(str).tolist()),
+                **stats,
+            }
+
         with cache_path.open('w', encoding='utf-8') as handle:
             json.dump(stats, handle, ensure_ascii=False, indent=2)
         return stats
@@ -557,19 +781,39 @@ class CrossMediumSequenceDataset(Dataset):
         return np.asarray(values, dtype=np.float32).reshape(-1)
 
     def _resolve_reference_window_indices(self, windows: list[dict[str, Any]]) -> list[int]:
+        if windows and 'reference_interval_start' in windows[0] and 'reference_interval_end' in windows[0]:
+            reference_start = self._parse_optional_float(windows[0].get('reference_interval_start'))
+            reference_end = self._parse_optional_float(windows[0].get('reference_interval_end'))
+            reference_phase = MEDIUM_TO_PHASE.get(str(windows[0].get('reference_medium', '')).strip().lower())
+            if reference_start is not None and reference_end is not None and reference_phase is not None:
+                return [
+                    window_index
+                    for window_index, window in enumerate(windows)
+                    if reference_start
+                    <= float(window.get('policy_timestamp', window.get('window_end', float('-inf'))))
+                    < reference_end
+                    and str(window.get('phase_label')) == reference_phase
+                ]
+
         first_interface_index = len(windows)
         for window_index, window in enumerate(windows):
             if str(window['phase_label']) == 'Interface':
                 first_interface_index = window_index
                 break
 
-        stable_water_indices = [
+        reference_phase = 'Water'
+        if windows:
+            reference_phase = MEDIUM_TO_PHASE.get(
+                str(windows[0].get('reference_medium', 'water')).strip().lower(),
+                'Water',
+            )
+        stable_reference_indices = [
             item_index
             for item_index, window in enumerate(windows[:first_interface_index])
-            if bool(window['is_stable_mask']) and str(window['phase_label']) == 'Water'
+            if bool(window['is_stable_mask']) and str(window['phase_label']) == reference_phase
         ]
-        if stable_water_indices:
-            return stable_water_indices[-self.reference_force_window_count :]
+        if stable_reference_indices:
+            return stable_reference_indices[-self.reference_force_window_count :]
 
         stable_indices = [
             item_index
@@ -625,13 +869,23 @@ class CrossMediumSequenceDataset(Dataset):
         force_curve: np.ndarray | None,
         *,
         time_axis: np.ndarray | None = None,
+        reference_start_time: float | None = None,
         reference_end_time: float | None = None,
+        strict_interval: bool = False,
     ) -> tuple[float, bool, set[int]]:
         if force_curve is None:
             return float('nan'), False, set()
         reference_indices = self._resolve_reference_window_indices(windows)
-        if self.reference_force_duration_sec is not None and time_axis is not None and reference_end_time is not None:
-            mask = ((time_axis >= reference_end_time - self.reference_force_duration_sec) & (time_axis <= reference_end_time))
+        if time_axis is not None and reference_start_time is not None and reference_end_time is not None:
+            mask = ((time_axis >= reference_start_time) & (time_axis < reference_end_time))
+            selected = np.asarray(force_curve)[mask]
+            if selected.size:
+                value = float(np.median(selected)) if self.reference_force_statistic == 'median' else float(np.mean(selected))
+                return value, bool(np.isfinite(value)), set(reference_indices)
+            if strict_interval:
+                return float('nan'), False, set(reference_indices)
+        elif self.reference_force_duration_sec is not None and time_axis is not None and reference_end_time is not None:
+            mask = ((time_axis >= reference_end_time - self.reference_force_duration_sec) & (time_axis < reference_end_time))
             selected = np.asarray(force_curve)[mask]
             if selected.size:
                 value = float(np.median(selected)) if self.reference_force_statistic == 'median' else float(np.mean(selected))
@@ -653,13 +907,24 @@ class CrossMediumSequenceDataset(Dataset):
         force_curve: np.ndarray | None,
         *,
         time_axis: np.ndarray | None = None,
+        reference_start_time: float | None = None,
         reference_end_time: float | None = None,
+        strict_interval: bool = False,
     ) -> tuple[np.ndarray, bool, set[int]]:
         if force_curve is None:
             return np.full((3,), float('nan'), dtype=np.float32), False, set()
         reference_indices = self._resolve_reference_window_indices(windows)
-        if self.reference_force_duration_sec is not None and time_axis is not None and reference_end_time is not None:
-            mask = ((time_axis >= reference_end_time - self.reference_force_duration_sec) & (time_axis <= reference_end_time))
+        if time_axis is not None and reference_start_time is not None and reference_end_time is not None:
+            mask = ((time_axis >= reference_start_time) & (time_axis < reference_end_time))
+            selected = np.asarray(force_curve)[mask]
+            if selected.size:
+                value = np.median(selected, axis=0) if self.reference_force_statistic == 'median' else np.mean(selected, axis=0)
+                value = np.asarray(value, dtype=np.float32).reshape(-1)
+                return value, bool(np.all(np.isfinite(value))), set(reference_indices)
+            if strict_interval:
+                return np.full((3,), float('nan'), dtype=np.float32), False, set(reference_indices)
+        elif self.reference_force_duration_sec is not None and time_axis is not None and reference_end_time is not None:
+            mask = ((time_axis >= reference_end_time - self.reference_force_duration_sec) & (time_axis < reference_end_time))
             selected = np.asarray(force_curve)[mask]
             if selected.size:
                 value = np.median(selected, axis=0) if self.reference_force_statistic == 'median' else np.mean(selected, axis=0)
@@ -764,6 +1029,23 @@ class CrossMediumSequenceDataset(Dataset):
         tactile_low = select_tactile_channels(tactile_low, self.tactile_channel_indices)
         sync_offset_sec = self._parse_optional_float(sample.get('sync_offset_sec')) or 0.0
         contact_time = self._parse_optional_float(sample.get('t_contact_all'))
+        direction = str(sample.get('direction', 'W2A')).strip().upper()
+        sample_baseline_mode = str(
+            sample.get(
+                'force_baseline_mode',
+                self.force_baseline_by_direction.get(direction, self.expert_force_baseline_mode),
+            )
+        ).strip().lower()
+        if sample_baseline_mode in {'', 'nan', '<na>'}:
+            sample_baseline_mode = self.force_baseline_by_direction.get(direction, self.expert_force_baseline_mode)
+        policy_supervision_eligible = (
+            str(sample.get('trial_result', '')).strip().lower() == 'stable'
+            and bool(int(float(sample.get('policy_supervision_eligible', 1))))
+        )
+        reference_candidate_eligible = (
+            policy_supervision_eligible
+            and bool(int(float(sample.get('has_reference_candidate', 1))))
+        )
 
         expert_curve = compute_expert_force_curve(
             tactile_array=tactile_array,
@@ -772,6 +1054,10 @@ class CrossMediumSequenceDataset(Dataset):
             contact_time=contact_time,
             alpha=self.expert_alpha,
             normal_sign_table=self.normal_sign_table,
+            sync_offset_sec=sync_offset_sec,
+            smoothing_mode=self.expert_force_smoothing,
+            baseline_mode=sample_baseline_mode,
+            baseline_window_sec=self.expert_force_baseline_window_sec,
         )
         finger_expert_curve = compute_expert_force_curve(
             tactile_array=tactile_array,
@@ -783,11 +1069,12 @@ class CrossMediumSequenceDataset(Dataset):
             force_target_mode=self.finger_force_target_mode,
             sync_offset_sec=sync_offset_sec,
             smoothing_mode=self.expert_force_smoothing,
-            baseline_mode=self.expert_force_baseline_mode,
+            baseline_mode=sample_baseline_mode,
             baseline_window_sec=self.expert_force_baseline_window_sec,
         )
 
         clean_force_curve = None
+        raw_force_curve = None
         finger_clean_force_curve = None
         finger_raw_force_curve = None
         tactile_time_axis = None
@@ -802,7 +1089,7 @@ class CrossMediumSequenceDataset(Dataset):
                 alpha=self.expert_alpha,
                 normal_sign_table=self.normal_sign_table,
                 smoothing_mode=self.expert_force_smoothing,
-                baseline_mode=self.expert_force_baseline_mode,
+                baseline_mode=sample_baseline_mode,
                 baseline_window_sec=self.expert_force_baseline_window_sec,
             )
             finger_clean_force_curve = compute_clean_force_curve(
@@ -813,7 +1100,7 @@ class CrossMediumSequenceDataset(Dataset):
                 alpha=self.expert_alpha,
                 normal_sign_table=self.normal_sign_table,
                 smoothing_mode=self.expert_force_smoothing,
-                baseline_mode=self.expert_force_baseline_mode,
+                baseline_mode=sample_baseline_mode,
                 baseline_window_sec=self.expert_force_baseline_window_sec,
                 force_target_mode=self.finger_force_target_mode,
             )
@@ -823,6 +1110,18 @@ class CrossMediumSequenceDataset(Dataset):
                 offset_sec=sync_offset_sec,
             )
             if self.reference_force_source == 'raw_tactile' or self.target_aggregation_sec is not None:
+                raw_force_curve = compute_clean_force_curve(
+                    tactile_array,
+                    dt=self.tactile_dt,
+                    sync_offset_sec=sync_offset_sec,
+                    contact_time=contact_time,
+                    alpha=self.expert_alpha,
+                    normal_sign_table=self.normal_sign_table,
+                    smoothing_mode='none',
+                    baseline_mode=sample_baseline_mode,
+                    baseline_window_sec=self.expert_force_baseline_window_sec,
+                    force_target_mode=self.force_target_mode,
+                )
                 finger_raw_force_curve = compute_clean_force_curve(
                     tactile_array,
                     dt=self.tactile_dt,
@@ -831,7 +1130,7 @@ class CrossMediumSequenceDataset(Dataset):
                     alpha=self.expert_alpha,
                     normal_sign_table=self.normal_sign_table,
                     smoothing_mode='none',
-                    baseline_mode=self.expert_force_baseline_mode,
+                    baseline_mode=sample_baseline_mode,
                     baseline_window_sec=self.expert_force_baseline_window_sec,
                     force_target_mode=self.finger_force_target_mode,
                 )
@@ -841,25 +1140,42 @@ class CrossMediumSequenceDataset(Dataset):
                 interface_interval_start = float(t_if_enter) - self.expert_force_interface_margin_sec
                 interface_interval_end = float(t_if_exit) + self.expert_force_interface_margin_sec
 
-        reference_curve = clean_force_curve if clean_force_curve is not None else expert_curve
+        reference_curve = (
+            raw_force_curve
+            if self.reference_force_source == 'raw_tactile' and raw_force_curve is not None
+            else (clean_force_curve if clean_force_curve is not None else expert_curve)
+        )
         finger_reference_curve = (
             finger_raw_force_curve
             if self.reference_force_source == 'raw_tactile' and finger_raw_force_curve is not None
             else (finger_clean_force_curve if finger_clean_force_curve is not None else finger_expert_curve)
         )
-        reference_end_time = self._parse_optional_float(sample.get('t_if_enter'))
-        sample_reference_force, has_sample_reference, reference_window_indices = self._compute_sample_reference_force(
-            windows,
-            reference_curve,
-            time_axis=tactile_time_axis,
-            reference_end_time=reference_end_time,
-        )
-        finger_sample_reference_force, has_finger_sample_reference, finger_reference_window_indices = self._compute_sample_reference_force_vector(
-            windows,
-            finger_reference_curve,
-            time_axis=tactile_time_axis,
-            reference_end_time=reference_end_time,
-        )
+        reference_start_time = self._parse_optional_float(sample.get('reference_start_time'))
+        reference_end_time = self._parse_optional_float(sample.get('reference_end_time'))
+        if reference_end_time is None:
+            reference_end_time = self._parse_optional_float(sample.get('t_if_enter'))
+        strict_reference_interval = 'reference_start_time' in sample
+        if reference_candidate_eligible:
+            sample_reference_force, has_sample_reference, reference_window_indices = self._compute_sample_reference_force(
+                windows,
+                reference_curve,
+                time_axis=tactile_time_axis,
+                reference_start_time=reference_start_time,
+                reference_end_time=reference_end_time,
+                strict_interval=strict_reference_interval,
+            )
+            finger_sample_reference_force, has_finger_sample_reference, finger_reference_window_indices = self._compute_sample_reference_force_vector(
+                windows,
+                finger_reference_curve,
+                time_axis=tactile_time_axis,
+                reference_start_time=reference_start_time,
+                reference_end_time=reference_end_time,
+                strict_interval=strict_reference_interval,
+            )
+        else:
+            sample_reference_force, has_sample_reference, reference_window_indices = float('nan'), False, set()
+            finger_sample_reference_force = np.full((3,), float('nan'), dtype=np.float32)
+            has_finger_sample_reference, finger_reference_window_indices = False, set()
         use_local_reference_targets = (
             self.expert_force_mode == 'local_reference_delta'
             and clean_force_curve is not None
@@ -1111,6 +1427,26 @@ class CrossMediumSequenceDataset(Dataset):
                         np.isfinite(finger_reference_force) & bool(finger_reference_supervision_flag)
                     ).astype(np.int64)
 
+            if not policy_supervision_eligible:
+                expert_force = float('nan')
+                control_force_target = float('nan')
+                reference_force = float('nan')
+                delta_force_target = float('nan')
+                finger_expert_force[:] = float('nan')
+                finger_control_force_target[:] = float('nan')
+                finger_reference_force[:] = float('nan')
+                finger_delta_force_target[:] = float('nan')
+                has_expert_flag = 0
+                has_control_target_flag = 0
+                has_reference_flag = 0
+                has_finger_expert_flag[:] = 0
+                has_finger_control_target_flag[:] = 0
+                has_finger_reference_flag[:] = 0
+                reference_supervision_flag = 0
+                delta_supervision_flag = 0
+                quiet_supervision_flag = 0
+                soft_gate_target = 0.0
+
             expert_forces.append(expert_force)
             control_force_targets.append(control_force_target)
             reference_forces.append(reference_force)
@@ -1139,6 +1475,20 @@ class CrossMediumSequenceDataset(Dataset):
             'sample_index': self.sample_index[sample_id],
             'object_id': sample['object_id'],
             'object_index': self.object_index[sample['object_id']],
+            'physical_object_uid': str(sample.get('physical_object_uid', sample['object_id'])),
+            'direction': direction,
+            'direction_index': int(sample.get('direction_index', DIRECTION_TO_INDEX.get(direction, 0))),
+            'source_medium': str(sample.get('source_medium', DIRECTION_TO_MEDIA.get(direction, {}).get('source_medium', 'water'))),
+            'target_medium': str(sample.get('target_medium', DIRECTION_TO_MEDIA.get(direction, {}).get('target_medium', 'air'))),
+            'reference_medium': str(sample.get('reference_medium', DIRECTION_TO_MEDIA.get(direction, {}).get('reference_medium', 'water'))),
+            'split': str(sample.get('split', self.subset)),
+            'split_version': str(sample.get('split_version', self.split_version or self.split_path.stem)),
+            'trial_result': str(sample.get('trial_result', '')),
+            'force_baseline_mode': sample_baseline_mode,
+            'reference_start_time': reference_start_time,
+            'reference_end_time': reference_end_time,
+            'reference_eligible': int(reference_candidate_eligible and has_sample_reference),
+            'policy_supervision_eligible': int(policy_supervision_eligible),
             'visual_feature_windows': visual_feature_windows,
             'video_windows': video_windows,
             'frame_masks': frame_masks,
@@ -1227,6 +1577,11 @@ def sequence_collate_fn(batch: list[dict[str, Any]]) -> dict[str, Any]:
     has_interface_context = torch.zeros(batch_size, dtype=torch.bool)
     object_index = torch.zeros(batch_size, dtype=torch.long)
     sample_index = torch.zeros(batch_size, dtype=torch.long)
+    direction_ids = torch.zeros(batch_size, dtype=torch.long)
+    reference_eligible = torch.zeros(batch_size, dtype=torch.bool)
+    policy_supervision_eligible = torch.zeros(batch_size, dtype=torch.bool)
+    reference_start_times = torch.full((batch_size,), float('nan'), dtype=torch.float32)
+    reference_end_times = torch.full((batch_size,), float('nan'), dtype=torch.float32)
     fragility_label = torch.zeros(batch_size, dtype=torch.long)
     geometry_label = torch.zeros(batch_size, dtype=torch.long)
     surface_label = torch.zeros(batch_size, dtype=torch.long)
@@ -1246,6 +1601,15 @@ def sequence_collate_fn(batch: list[dict[str, Any]]) -> dict[str, Any]:
     window_lengths = torch.zeros(batch_size, dtype=torch.long)
     sample_ids: list[str] = []
     object_ids: list[str] = []
+    physical_object_uids: list[str] = []
+    directions: list[str] = []
+    source_media: list[str] = []
+    target_media: list[str] = []
+    reference_media: list[str] = []
+    splits: list[str] = []
+    split_versions: list[str] = []
+    trial_results: list[str] = []
+    force_baseline_modes: list[str] = []
     context_source_types: list[str] = []
     load_transition_classes: list[str] = []
     shape_profile_ctrls: list[str] = []
@@ -1255,9 +1619,25 @@ def sequence_collate_fn(batch: list[dict[str, Any]]) -> dict[str, Any]:
     for batch_index, item in enumerate(batch):
         sample_ids.append(item['sample_id'])
         object_ids.append(item['object_id'])
+        physical_object_uids.append(str(item.get('physical_object_uid', item['object_id'])))
+        directions.append(str(item.get('direction', 'W2A')))
+        source_media.append(str(item.get('source_medium', 'water')))
+        target_media.append(str(item.get('target_medium', 'air')))
+        reference_media.append(str(item.get('reference_medium', 'water')))
+        splits.append(str(item.get('split', '')))
+        split_versions.append(str(item.get('split_version', '')))
+        trial_results.append(str(item.get('trial_result', '')))
+        force_baseline_modes.append(str(item.get('force_baseline_mode', 'none')))
         context_source_types.append(str(item.get('context_source_type', 'none')))
         object_index[batch_index] = int(item['object_index'])
         sample_index[batch_index] = int(item['sample_index'])
+        direction_ids[batch_index] = int(item.get('direction_index', 0))
+        reference_eligible[batch_index] = bool(item.get('reference_eligible', 0))
+        policy_supervision_eligible[batch_index] = bool(item.get('policy_supervision_eligible', 1))
+        if item.get('reference_start_time') is not None:
+            reference_start_times[batch_index] = float(item['reference_start_time'])
+        if item.get('reference_end_time') is not None:
+            reference_end_times[batch_index] = float(item['reference_end_time'])
         fragility_label[batch_index] = int(item['fragility_label'])
         geometry_label[batch_index] = int(item['geometry_label'])
         surface_label[batch_index] = int(item['surface_label'])
@@ -1348,6 +1728,20 @@ def sequence_collate_fn(batch: list[dict[str, Any]]) -> dict[str, Any]:
     return {
         'sample_ids': sample_ids,
         'object_ids': object_ids,
+        'physical_object_uids': physical_object_uids,
+        'directions': directions,
+        'direction_ids': direction_ids,
+        'source_media': source_media,
+        'target_media': target_media,
+        'reference_media': reference_media,
+        'splits': splits,
+        'split_versions': split_versions,
+        'trial_results': trial_results,
+        'force_baseline_modes': force_baseline_modes,
+        'reference_eligible': reference_eligible,
+        'policy_supervision_eligible': policy_supervision_eligible,
+        'reference_start_times': reference_start_times,
+        'reference_end_times': reference_end_times,
         'context_source_types': context_source_types,
         'object_index': object_index,
         'sample_index': sample_index,

@@ -14,6 +14,8 @@ from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
+from cmg.config import sha256_file
+from cmg.direction_metrics import DirectionMetricAccumulator
 from cmg.attribute_metrics import (
     AttributeAggregationAccumulator,
     AttributeWindowMetricAccumulator,
@@ -110,8 +112,8 @@ def build_phase_class_weights(config: dict[str, Any], device: torch.device) -> t
 
 
 def load_checkpoint_context(path: str | Path) -> dict[str, Any]:
-    checkpoint_path = Path(path)
-    checkpoint = torch.load(checkpoint_path, map_location='cpu')
+    checkpoint_path = Path(path).resolve()
+    checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
     run_dir_value = checkpoint.get('run_dir') if isinstance(checkpoint, dict) else None
     run_dir = Path(run_dir_value) if run_dir_value else None
     run_config_path_value = checkpoint.get('run_config_path') if isinstance(checkpoint, dict) else None
@@ -137,6 +139,7 @@ def load_checkpoint_context(path: str | Path) -> dict[str, Any]:
 
     return {
         'checkpoint_path': str(checkpoint_path),
+        'checkpoint_sha256': sha256_file(checkpoint_path),
         'checkpoint': checkpoint,
         'stage_name': checkpoint.get('stage_name') if isinstance(checkpoint, dict) else None,
         'run_dir': str(run_dir.resolve()) if run_dir is not None else None,
@@ -178,6 +181,41 @@ def is_allowed_lora_injection_mismatch(key: str) -> bool:
     )
 
 
+def key_matches_prefix(key: str, prefix: str) -> bool:
+    normalized = str(prefix).strip()
+    if normalized.endswith('*'):
+        normalized = normalized[:-1]
+    if not normalized:
+        return False
+    return key == normalized.rstrip('.') or key.startswith(normalized)
+
+
+def state_dict_module_report(
+    target_state: dict[str, torch.Tensor],
+    loaded_keys: list[str],
+) -> dict[str, dict[str, int]]:
+    report: dict[str, dict[str, int]] = {}
+    loaded = set(loaded_keys)
+    for key, value in target_state.items():
+        module_name = key.split('.', 1)[0]
+        module = report.setdefault(
+            module_name,
+            {
+                'target_tensor_count': 0,
+                'target_value_count': 0,
+                'loaded_tensor_count': 0,
+                'loaded_value_count': 0,
+            },
+        )
+        value_count = int(value.numel())
+        module['target_tensor_count'] += 1
+        module['target_value_count'] += value_count
+        if key in loaded:
+            module['loaded_tensor_count'] += 1
+            module['loaded_value_count'] += value_count
+    return report
+
+
 
 def load_model_weights(
     model: nn.Module,
@@ -185,36 +223,100 @@ def load_model_weights(
     *,
     strict: bool = True,
     allow_lora_injection: bool = False,
+    allowed_missing_prefixes: list[str] | tuple[str, ...] | None = None,
 ) -> dict[str, Any]:
     context = load_checkpoint_context(path)
     checkpoint = context['checkpoint']
     state_dict = checkpoint['model'] if isinstance(checkpoint, dict) and 'model' in checkpoint else checkpoint
+    if not isinstance(state_dict, dict) or not all(isinstance(key, str) for key in state_dict):
+        raise RuntimeError(f'Checkpoint {context["checkpoint_path"]} does not contain a valid model state_dict.')
+    target_state = model.state_dict()
     remapped_keys: dict[str, str] = {}
     if allow_lora_injection:
-        state_dict, remapped_keys = remap_open_clip_lora_keys(state_dict, set(model.state_dict().keys()))
-        strict = False
-    incompatible = model.load_state_dict(state_dict, strict=strict)
-    missing_keys = list(incompatible.missing_keys)
-    unexpected_keys = list(incompatible.unexpected_keys)
-    if allow_lora_injection:
-        disallowed_missing = [key for key in missing_keys if not is_allowed_lora_injection_mismatch(key)]
-        disallowed_unexpected = [key for key in unexpected_keys if not is_allowed_lora_injection_mismatch(key)]
-        if disallowed_missing or disallowed_unexpected:
-            details = {
-                'missing_keys': missing_keys,
-                'unexpected_keys': unexpected_keys,
-                'remapped_keys': remapped_keys,
-            }
-            raise RuntimeError(
-                'Checkpoint initialization encountered mismatched keys beyond the expected stage-to-stage architecture delta: '
-                + json.dumps(details, ensure_ascii=False)
+        state_dict, remapped_keys = remap_open_clip_lora_keys(state_dict, set(target_state.keys()))
+
+    shape_mismatches = [
+        {
+            'key': key,
+            'checkpoint_shape': list(value.shape),
+            'model_shape': list(target_state[key].shape),
+        }
+        for key, value in state_dict.items()
+        if key in target_state and tuple(value.shape) != tuple(target_state[key].shape)
+    ]
+    if shape_mismatches:
+        details = {
+            'checkpoint_path': context['checkpoint_path'],
+            'shape_mismatches': shape_mismatches,
+            'remapped_keys': remapped_keys,
+        }
+        raise RuntimeError(
+            'Checkpoint initialization encountered tensor shape mismatches: '
+            + json.dumps(details, ensure_ascii=False)
+        )
+
+    missing_keys = sorted(set(target_state) - set(state_dict))
+    unexpected_keys = sorted(set(state_dict) - set(target_state))
+    explicit_missing_prefixes = tuple(str(prefix) for prefix in (allowed_missing_prefixes or ()))
+
+    def allowed_missing(key: str) -> bool:
+        return (
+            any(key_matches_prefix(key, prefix) for prefix in explicit_missing_prefixes)
+            or (allow_lora_injection and is_allowed_lora_injection_mismatch(key))
+        )
+
+    def allowed_unexpected(key: str) -> bool:
+        return allow_lora_injection and is_allowed_lora_injection_mismatch(key)
+
+    disallowed_missing = [key for key in missing_keys if not allowed_missing(key)]
+    disallowed_unexpected = [key for key in unexpected_keys if not allowed_unexpected(key)]
+    if (strict and (disallowed_missing or disallowed_unexpected)) or (
+        not strict and explicit_missing_prefixes and disallowed_missing
+    ):
+        details = {
+            'checkpoint_path': context['checkpoint_path'],
+            'missing_keys': missing_keys,
+            'unexpected_keys': unexpected_keys,
+            'allowed_missing_prefixes': list(explicit_missing_prefixes),
+            'disallowed_missing_keys': disallowed_missing,
+            'disallowed_unexpected_keys': disallowed_unexpected,
+            'remapped_keys': remapped_keys,
+        }
+        raise RuntimeError(
+            'Checkpoint initialization encountered keys beyond the explicitly allowed architecture delta: '
+            + json.dumps(details, ensure_ascii=False)
+        )
+
+    compatible_state = {key: value for key, value in state_dict.items() if key in target_state}
+    incompatible = model.load_state_dict(compatible_state, strict=False)
+    loaded_keys = sorted(compatible_state)
+    if sorted(incompatible.missing_keys) != missing_keys or incompatible.unexpected_keys:
+        raise RuntimeError(
+            'Internal checkpoint compatibility audit disagrees with torch.load_state_dict: '
+            + json.dumps(
+                {
+                    'audited_missing_keys': missing_keys,
+                    'torch_missing_keys': sorted(incompatible.missing_keys),
+                    'torch_unexpected_keys': sorted(incompatible.unexpected_keys),
+                },
+                ensure_ascii=False,
             )
+        )
     return {
         'checkpoint_path': context['checkpoint_path'],
+        'checkpoint_sha256': context['checkpoint_sha256'],
         'missing_keys': missing_keys,
         'unexpected_keys': unexpected_keys,
+        'allowed_missing_prefixes': list(explicit_missing_prefixes),
+        'disallowed_missing_keys': disallowed_missing,
+        'disallowed_unexpected_keys': disallowed_unexpected,
         'remapped_keys': remapped_keys,
         'allow_lora_injection': allow_lora_injection,
+        'loaded_tensor_count': len(loaded_keys),
+        'loaded_value_count': int(sum(target_state[key].numel() for key in loaded_keys)),
+        'target_tensor_count': len(target_state),
+        'target_value_count': int(sum(value.numel() for value in target_state.values())),
+        'module_load_report': state_dict_module_report(target_state, loaded_keys),
         'stage_name': context['stage_name'],
         'run_dir': context['run_dir'],
         'run_config_path': context['run_config_path'],
@@ -229,13 +331,105 @@ def resolve_module(root: nn.Module, module_name: str) -> nn.Module | None:
     return current
 
 
-def freeze_modules(model: nn.Module, module_names: list[str]) -> None:
-    for module_name in module_names:
-        module = resolve_module(model, module_name)
+def freeze_modules(
+    model: nn.Module,
+    module_names: list[str],
+    *,
+    strict: bool = True,
+    lock_eval: bool = True,
+    train_mode_module_names: list[str] | tuple[str, ...] | None = None,
+) -> dict[str, Any]:
+    normalized_names = list(dict.fromkeys(str(name).strip() for name in module_names if str(name).strip()))
+    normalized_train_mode_names = list(
+        dict.fromkeys(str(name).strip() for name in (train_mode_module_names or ()) if str(name).strip())
+    )
+    resolved = {name: resolve_module(model, name) for name in normalized_names}
+    missing_names = [name for name, module in resolved.items() if module is None]
+    invalid_train_mode_names = [
+        name for name in normalized_train_mode_names if name not in resolved or resolved[name] is None
+    ]
+    if strict and missing_names:
+        raise ValueError(f'Unknown freeze_modules paths: {missing_names}.')
+    if invalid_train_mode_names:
+        raise ValueError(
+            'frozen train-mode modules must also be listed in freeze_modules: '
+            f'{invalid_train_mode_names}.'
+        )
+
+    frozen_parameter_ids: set[int] = set()
+    for name, module in resolved.items():
         if module is None:
             continue
         for parameter in module.parameters():
             parameter.requires_grad = False
+            frozen_parameter_ids.add(id(parameter))
+        if lock_eval and name not in normalized_train_mode_names:
+            module.eval()
+
+    locked_names = [
+        name
+        for name, module in resolved.items()
+        if module is not None and lock_eval and name not in normalized_train_mode_names
+    ]
+    setattr(model, '_cmg_frozen_eval_module_names', tuple(locked_names))
+    setattr(model, '_cmg_frozen_train_mode_module_names', tuple(normalized_train_mode_names))
+    parameter_names = [
+        name
+        for name, parameter in model.named_parameters()
+        if id(parameter) in frozen_parameter_ids
+    ]
+    return {
+        'requested_module_names': normalized_names,
+        'resolved_module_names': [name for name, module in resolved.items() if module is not None],
+        'missing_module_names': missing_names,
+        'lock_eval': bool(lock_eval),
+        'eval_locked_module_names': locked_names,
+        'train_mode_module_names': normalized_train_mode_names,
+        'parameter_names': parameter_names,
+        'parameter_tensor_count': len(parameter_names),
+        'parameter_value_count': int(
+            sum(parameter.numel() for parameter in model.parameters() if id(parameter) in frozen_parameter_ids)
+        ),
+    }
+
+
+def enforce_frozen_modules_eval(model: nn.Module) -> None:
+    for module_name in getattr(model, '_cmg_frozen_eval_module_names', ()):
+        module = resolve_module(model, str(module_name))
+        if module is None:
+            raise RuntimeError(f'Frozen eval-lock module disappeared after setup: {module_name!r}.')
+        module.eval()
+    if model.training:
+        for module_name in getattr(model, '_cmg_frozen_train_mode_module_names', ()):
+            module = resolve_module(model, str(module_name))
+            if module is None:
+                raise RuntimeError(f'Frozen train-mode module disappeared after setup: {module_name!r}.')
+            module.train()
+
+
+def audit_model_parameters(model: nn.Module) -> dict[str, Any]:
+    trainable_names: list[str] = []
+    frozen_names: list[str] = []
+    trainable_values = 0
+    frozen_values = 0
+    for name, parameter in model.named_parameters():
+        if parameter.requires_grad:
+            trainable_names.append(name)
+            trainable_values += int(parameter.numel())
+        else:
+            frozen_names.append(name)
+            frozen_values += int(parameter.numel())
+    total_values = trainable_values + frozen_values
+    return {
+        'trainable_parameter_names': trainable_names,
+        'frozen_parameter_names': frozen_names,
+        'trainable_tensor_count': len(trainable_names),
+        'frozen_tensor_count': len(frozen_names),
+        'trainable_value_count': trainable_values,
+        'frozen_value_count': frozen_values,
+        'total_value_count': total_values,
+        'trainable_fraction': float(trainable_values / total_values) if total_values else 0.0,
+    }
 
 
 def build_optimizer(model: nn.Module, config: dict[str, Any]) -> AdamW:
@@ -288,6 +482,24 @@ def build_optimizer(model: nn.Module, config: dict[str, Any]) -> AdamW:
     return AdamW(param_groups, weight_decay=weight_decay)
 
 
+def audit_optimizer_groups(model: nn.Module, optimizer: AdamW) -> list[dict[str, Any]]:
+    parameter_names = {id(parameter): name for name, parameter in model.named_parameters()}
+    reports: list[dict[str, Any]] = []
+    for index, group in enumerate(optimizer.param_groups):
+        names = [parameter_names.get(id(parameter), '<unnamed>') for parameter in group['params']]
+        reports.append(
+            {
+                'index': index,
+                'name': str(group.get('name', f'group{index}')),
+                'learning_rate': float(group['lr']),
+                'parameter_names': names,
+                'parameter_tensor_count': len(names),
+                'parameter_value_count': int(sum(parameter.numel() for parameter in group['params'])),
+            }
+        )
+    return reports
+
+
 def numeric_value(metrics: dict[str, Any], metric_name: str, epoch: int) -> float:
     if metric_name == 'epoch':
         return float(epoch)
@@ -311,6 +523,95 @@ def compare_metric(current: float, best: float, mode: str, eps: float = 1e-12) -
     return 0
 
 
+def evaluate_w2a_retention_guard(
+    metrics: dict[str, Any],
+    config: dict[str, Any] | None,
+) -> dict[str, Any]:
+    guard = config if isinstance(config, dict) else {}
+    enabled = bool(guard.get('enabled', False))
+    if not enabled:
+        return {'enabled': False, 'passed': True}
+    metric_name = str(guard.get('metric', '')).strip()
+    if not metric_name:
+        raise RuntimeError('Enabled W2A retention guard requires a metric name.')
+    if not metric_name.endswith('_w2a'):
+        raise RuntimeError('W2A retention guard metric must be an explicit *_w2a metric.')
+    if metric_name not in metrics:
+        raise RuntimeError(f'W2A retention guard metric {metric_name!r} is missing from validation metrics.')
+    default_count_metrics = {
+        'medium_accuracy_w2a': 'medium_window_count_w2a',
+        'medium_macro_f1_w2a': 'medium_window_count_w2a',
+        'medium_f1_water_w2a': 'medium_window_count_w2a',
+        'medium_f1_interface_w2a': 'medium_window_count_w2a',
+        'medium_f1_air_w2a': 'medium_window_count_w2a',
+        'finger_control_interface_mae_w2a': 'finger_control_interface_count_w2a',
+        'finger_delta_interface_mae_w2a': 'finger_delta_interface_count_w2a',
+        'finger_large_delta_wrong_sign_rate_w2a': 'finger_large_delta_count_w2a',
+        'stable_leakage_mean_w2a': 'stable_leakage_count_w2a',
+        'stable_leakage_p95_w2a': 'stable_leakage_count_w2a',
+    }
+    count_metric = str(guard.get('count_metric', default_count_metrics.get(metric_name, ''))).strip()
+    if count_metric:
+        if count_metric not in metrics:
+            raise RuntimeError(f'W2A retention guard count metric {count_metric!r} is missing.')
+        if int(metrics[count_metric]) <= 0:
+            raise RuntimeError(f'W2A retention guard metric {metric_name!r} has no valid W2A observations.')
+    if 'baseline_value' not in guard:
+        raise RuntimeError('Enabled W2A retention guard requires E0 baseline_value.')
+    current = float(metrics[metric_name])
+    baseline = float(guard['baseline_value'])
+    if not math.isfinite(current) or not math.isfinite(baseline):
+        raise RuntimeError('W2A retention guard current and baseline values must be finite.')
+    if baseline < 0.0:
+        raise RuntimeError('W2A retention guard baseline_value must be non-negative.')
+    mode = str(guard.get('mode', 'min')).strip().lower()
+    if mode not in {'min', 'max'}:
+        raise RuntimeError("W2A retention guard mode must be 'min' or 'max'.")
+    tolerance = float(guard.get('max_relative_degradation', 0.05))
+    absolute_tolerance = float(guard.get('absolute_tolerance', 0.0))
+    if tolerance < 0.0 or absolute_tolerance < 0.0:
+        raise RuntimeError('W2A retention guard tolerances must be non-negative.')
+    if mode == 'min':
+        threshold = baseline * (1.0 + tolerance) + absolute_tolerance
+        passed = current <= threshold + 1e-12
+        degradation = current - baseline
+    else:
+        threshold = baseline * (1.0 - tolerance) - absolute_tolerance
+        passed = current >= threshold - 1e-12
+        degradation = baseline - current
+    relative_degradation = degradation / abs(baseline) if baseline != 0.0 else None
+    return {
+        'enabled': True,
+        'passed': bool(passed),
+        'metric': metric_name,
+        'mode': mode,
+        'current_value': current,
+        'baseline_value': baseline,
+        'threshold': threshold,
+        'max_relative_degradation': tolerance,
+        'absolute_tolerance': absolute_tolerance,
+        'relative_degradation': relative_degradation,
+    }
+
+
+def collect_sampler_epoch_metrics(loader: DataLoader) -> dict[str, Any]:
+    """Expose direction-aware sampler coverage without coupling Trainer to its class."""
+    batch_sampler = getattr(loader, 'batch_sampler', None)
+    summary = getattr(batch_sampler, 'last_epoch_summary', None)
+    if not isinstance(summary, dict) or not summary:
+        return {}
+    return {
+        'sampler_balance_mode': str(summary.get('balance_mode', '')),
+        'sampler_batch_count': int(summary.get('batch_count', 0)),
+        'sampler_total_draws': int(summary.get('total_draws', 0)),
+        'sampler_unique_draws': int(summary.get('unique_draws', 0)),
+        'sampler_repeated_draws': int(summary.get('repeated_draws', 0)),
+        'sampler_repeat_rate': float(summary.get('repeat_rate', 0.0)),
+        'sampler_direction_draw_counts': dict(summary.get('direction_draw_counts', {})),
+        'sampler_object_draw_counts': dict(summary.get('object_draw_counts', {})),
+    }
+
+
 def run_model_epoch(
     model: nn.Module,
     loader: DataLoader,
@@ -325,17 +626,23 @@ def run_model_epoch(
     scheduler: LambdaLR | None = None,
     scaler: torch.amp.GradScaler | None = None,
     grad_clip_norm: float = 0.0,
+    loss_reduction_config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if training and (optimizer is None or scheduler is None or scaler is None):
         raise RuntimeError('Training epoch execution requires optimizer, scheduler, and GradScaler.')
 
     mode = 'train' if training else 'eval'
     model.train(training)
+    enforce_frozen_modules_eval(model)
     loss_sums = {
         'total': 0.0,
         'clip': 0.0,
         'inv': 0.0,
         'med': 0.0,
+        'med_original': 0.0,
+        'med_class_balanced': 0.0,
+        'med_class_balanced_w2a': 0.0,
+        'med_class_balanced_a2w': 0.0,
         'attr': 0.0,
         'attr_sample': 0.0,
         'attr_window': 0.0,
@@ -344,6 +651,10 @@ def run_model_epoch(
         'physical_capacity_ratio': 0.0,
         'physical_is_open_container': 0.0,
         'pol': 0.0,
+        'med_w2a': 0.0,
+        'med_a2w': 0.0,
+        'pol_w2a': 0.0,
+        'pol_a2w': 0.0,
     }
     phase_confusion = torch.zeros(3, 3, dtype=torch.long)
     attr_metric_tasks = resolve_attr_metric_tasks(model_config)
@@ -484,6 +795,9 @@ def run_model_epoch(
             policy_loss_config.get('residual_large_delta_threshold', large_delta_threshold),
         )
     )
+    direction_metrics = DirectionMetricAccumulator(
+        finger_large_delta_threshold=finger_large_delta_threshold,
+    )
     delta_normalization_scale = float(policy_loss_config.get('delta_normalization_scale', 100.0))
     direction_magnitude_scale = float(
         policy_loss_config.get(
@@ -521,6 +835,7 @@ def run_model_epoch(
                     temperature_clip=float(model_config['losses']['temperature_clip']),
                     temperature_inv=float(model_config['losses']['temperature_inv']),
                     phase_class_weights=phase_class_weights,
+                    loss_reduction_config=loss_reduction_config,
                 )
             if training:
                 previous_scale = float(scaler.get_scale())
@@ -545,6 +860,8 @@ def run_model_epoch(
         attr_window_metrics.update(outputs, batch)
         attr_aggregation_metrics.update(outputs, batch)
         physical_metrics.update(outputs, batch)
+        if 'direction_ids' in batch:
+            direction_metrics.update(outputs, batch)
 
         force_pred = outputs['force_pred'].reshape_as(batch['expert_forces'])
         force_delta = outputs.get('force_interface_delta')
@@ -916,6 +1233,10 @@ def run_model_epoch(
         'loss_clip': loss_sums['clip'] / denom,
         'loss_inv': loss_sums['inv'] / denom,
         'loss_med': loss_sums['med'] / denom,
+        'loss_med_original': loss_sums['med_original'] / denom,
+        'loss_med_class_balanced': loss_sums['med_class_balanced'] / denom,
+        'loss_med_class_balanced_w2a': loss_sums['med_class_balanced_w2a'] / denom,
+        'loss_med_class_balanced_a2w': loss_sums['med_class_balanced_a2w'] / denom,
         'loss_attr': loss_sums['attr'] / denom,
         'loss_attr_sample': loss_sums['attr_sample'] / denom,
         'loss_attr_window': loss_sums['attr_window'] / denom,
@@ -924,6 +1245,10 @@ def run_model_epoch(
         'loss_physical_capacity_ratio': loss_sums['physical_capacity_ratio'] / denom,
         'loss_physical_is_open_container': loss_sums['physical_is_open_container'] / denom,
         'loss_pol': loss_sums['pol'] / denom,
+        'loss_med_w2a': loss_sums['med_w2a'] / denom,
+        'loss_med_a2w': loss_sums['med_a2w'] / denom,
+        'loss_pol_w2a': loss_sums['pol_w2a'] / denom,
+        'loss_pol_a2w': loss_sums['pol_a2w'] / denom,
         'contrastive_loss_sum': (loss_sums['clip'] + loss_sums['inv']) / denom,
         'medium_accuracy': accuracy_from_confusion(phase_confusion),
         'medium_macro_f1': medium_macro_f1,
@@ -1116,6 +1441,7 @@ def run_model_epoch(
     metrics.update(flatten_window_metrics(attribute_window_diagnostics))
     metrics.update(flatten_aggregation_metrics(attribute_aggregation))
     metrics.update(flatten_physical_metrics(physical_attribute_metrics))
+    metrics.update(direction_metrics.finalize())
     return metrics
 
 
@@ -1130,6 +1456,8 @@ class Trainer:
         model_config: dict[str, Any],
         run_dir: str | Path,
         data_config: dict[str, Any] | None = None,
+        config_sources: dict[str, Any] | None = None,
+        initialization_info: dict[str, Any] | None = None,
     ) -> None:
         self.model = model
         self.train_loader = train_loader
@@ -1138,13 +1466,23 @@ class Trainer:
         self.stage_config = stage_config
         self.model_config = model_config
         self.data_config = data_config or {}
+        self.config_sources = config_sources or {}
+        self.initialization_info = initialization_info
         self.run_dir = Path(run_dir)
         self.device = torch.device(
             config.get('device', 'cuda') if torch.cuda.is_available() else 'cpu'
         )
         self.model.to(self.device)
-        freeze_modules(self.model, stage_config.get('freeze_modules', []))
+        self.freeze_report = freeze_modules(
+            self.model,
+            stage_config.get('freeze_modules', []),
+            strict=True,
+            lock_eval=bool(stage_config.get('lock_frozen_modules_eval', True)),
+            train_mode_module_names=stage_config.get('frozen_train_mode_modules', []),
+        )
         self.optimizer = build_optimizer(self.model, config)
+        self.model_parameter_audit = audit_model_parameters(self.model)
+        self.optimizer_group_audit = audit_optimizer_groups(self.model, self.optimizer)
         total_steps = max(1, int(config['epochs']) * max(1, len(train_loader)))
         self.scheduler = build_scheduler(
             self.optimizer,
@@ -1160,6 +1498,12 @@ class Trainer:
         self.selection_metric = str(stage_config.get('selection_metric', config.get('selection_metric', 'interface_mae')))
         self.maximize_metric = bool(stage_config.get('maximize_metric', config.get('maximize_metric', False)))
         self.tie_breakers = list(stage_config.get('tie_breakers', []))
+        self.w2a_retention_guard = stage_config.get(
+            'w2a_retention_guard',
+            config.get('w2a_retention_guard', {'enabled': False}),
+        )
+        if not isinstance(self.w2a_retention_guard, dict):
+            raise RuntimeError('w2a_retention_guard must be a mapping.')
         self.checkpoint_prefix = str(stage_config.get('checkpoint_prefix', f"stage{stage_config.get('stage_index', 'x')}"))
         self.best_checkpoint_name = str(
             stage_config.get('best_checkpoint_name', f'{self.checkpoint_prefix}_best_{self.selection_metric}.pt')
@@ -1175,15 +1519,50 @@ class Trainer:
         self.generic_best_path = self.checkpoint_dir / 'best.pt'
         self.named_latest_path = self.checkpoint_dir / f'{self.checkpoint_prefix}_latest.pt'
         self.named_best_path = self.checkpoint_dir / self.best_checkpoint_name
+        self.generic_diagnostic_best_path = self.checkpoint_dir / 'diagnostic_best.pt'
+        self.named_diagnostic_best_path = self.checkpoint_dir / f'{self.checkpoint_prefix}_diagnostic_best.pt'
         self.best_metrics_path = self.checkpoint_dir / f'{self.checkpoint_prefix}_best_metrics.json'
         self.generic_best_metrics_path = self.checkpoint_dir / 'best_metrics.json'
         self.metrics_jsonl_path = self.run_dir / 'metrics.jsonl'
         self.metrics_csv_path = self.run_dir / 'metrics.csv'
+        self.parameter_audit_path = self.run_dir / 'parameter_audit.json'
+        parameter_audit_payload = {
+            'freeze': self.freeze_report,
+            'model': self.model_parameter_audit,
+            'optimizer_groups': self.optimizer_group_audit,
+        }
+        with self.parameter_audit_path.open('w', encoding='utf-8') as handle:
+            json.dump(parameter_audit_payload, handle, ensure_ascii=False, indent=2)
+        self.parameter_audit_record = {
+            'path': str(self.parameter_audit_path.resolve()),
+            'sha256': sha256_file(self.parameter_audit_path),
+            'trainable_tensor_count': self.model_parameter_audit['trainable_tensor_count'],
+            'frozen_tensor_count': self.model_parameter_audit['frozen_tensor_count'],
+            'trainable_value_count': self.model_parameter_audit['trainable_value_count'],
+            'frozen_value_count': self.model_parameter_audit['frozen_value_count'],
+            'trainable_fraction': self.model_parameter_audit['trainable_fraction'],
+        }
         with (self.run_dir / 'run_config.yaml').open('w', encoding='utf-8') as handle:
             run_config_payload = {
                 'train': config,
                 'stage': stage_config,
                 'model': model_config,
+                'config_sources': self.config_sources,
+                'initialization': self.initialization_info,
+                'parameter_audit': self.parameter_audit_record,
+                'freeze': {
+                    key: value
+                    for key, value in self.freeze_report.items()
+                    if key != 'parameter_names'
+                },
+                'optimizer_groups': [
+                    {
+                        key: value
+                        for key, value in group.items()
+                        if key != 'parameter_names'
+                    }
+                    for group in self.optimizer_group_audit
+                ],
             }
             if self.data_config:
                 run_config_payload['data'] = self.data_config
@@ -1198,9 +1577,32 @@ class Trainer:
             self.writer = SummaryWriter(log_dir=str(self.run_dir / 'tensorboard'))
 
     def _selection_value(self, metrics: dict[str, Any]) -> float:
+        completion_key = f'{self.selection_metric}_complete'
+        if self.selection_metric.endswith('_macro_direction') and not bool(metrics.get(completion_key, False)):
+            raise RuntimeError(
+                f'Selection metric {self.selection_metric!r} is incomplete because validation did not '
+                'contain valid W2A and A2W supervision.'
+            )
         if self.selection_metric == 'joint_score':
-            return float(metrics['joint_score'])
-        return float(metrics[self.selection_metric])
+            value = float(metrics['joint_score'])
+        else:
+            value = float(metrics[self.selection_metric])
+        if not math.isfinite(value):
+            raise RuntimeError(f'Selection metric {self.selection_metric!r} must be finite, got {value}.')
+        return value
+
+    def _apply_w2a_guard(self, metrics: dict[str, Any]) -> dict[str, Any]:
+        report = evaluate_w2a_retention_guard(metrics, self.w2a_retention_guard)
+        metrics['w2a_guard'] = report
+        metrics['w2a_guard_enabled'] = bool(report['enabled'])
+        metrics['w2a_guard_passed'] = bool(report['passed'])
+        if report['enabled']:
+            metrics['w2a_guard_current_value'] = float(report['current_value'])
+            metrics['w2a_guard_baseline_value'] = float(report['baseline_value'])
+            metrics['w2a_guard_threshold'] = float(report['threshold'])
+            if report['relative_degradation'] is not None:
+                metrics['w2a_guard_relative_degradation'] = float(report['relative_degradation'])
+        return report
 
     def _should_run_validation(self, epoch: int) -> bool:
         if self.val_every_n_epochs <= 1:
@@ -1313,17 +1715,20 @@ class Trainer:
 
     def fit(self) -> dict[str, Any]:
         best_record = self._load_existing_best()
+        diagnostic_record = {'selection_value': -math.inf if self.maximize_metric else math.inf, 'metrics': {}, 'epoch': None}
         best_metrics = best_record.get('metrics', {})
         latest_val_metrics = best_record.get('metrics', {}).copy() if isinstance(best_record.get('metrics'), dict) else {}
         stale_epochs = 0
         try:
             for epoch in range(self.start_epoch, int(self.config['epochs']) + 1):
                 train_metrics = self.run_epoch(self.train_loader, training=True)
+                train_metrics.update(collect_sampler_epoch_metrics(self.train_loader))
                 validation_ran = self._should_run_validation(epoch)
                 val_metrics = None
                 if validation_ran:
                     val_metrics = self.run_epoch(self.val_loader, training=False)
                     val_metrics['selection_value'] = self._selection_value(val_metrics)
+                    self._apply_w2a_guard(val_metrics)
                     latest_val_metrics = val_metrics.copy()
                 metrics = {f'train_{k}': v for k, v in train_metrics.items()}
                 metrics.update({f'val_{k}': v for k, v in latest_val_metrics.items()})
@@ -1340,7 +1745,16 @@ class Trainer:
                 self.save_checkpoint(self.generic_latest_path, epoch, latest_metrics_for_checkpoint)
                 self.save_checkpoint(self.named_latest_path, epoch, latest_metrics_for_checkpoint)
                 if val_metrics is not None:
-                    if self._is_better(val_metrics, epoch, best_record):
+                    if self._is_better(val_metrics, epoch, diagnostic_record):
+                        diagnostic_record = {
+                            'selection_value': float(val_metrics['selection_value']),
+                            'metrics': val_metrics,
+                            'epoch': epoch,
+                        }
+                        self.save_checkpoint(self.generic_diagnostic_best_path, epoch, val_metrics)
+                        self.save_checkpoint(self.named_diagnostic_best_path, epoch, val_metrics)
+                    checkpoint_eligible = bool(val_metrics.get('w2a_guard_passed', True))
+                    if checkpoint_eligible and self._is_better(val_metrics, epoch, best_record):
                         best_record = {
                             'selection_value': float(val_metrics['selection_value']),
                             'metrics': val_metrics,
@@ -1373,6 +1787,9 @@ class Trainer:
                 'run_dir': str(self.run_dir.resolve()),
                 'run_config_path': str((self.run_dir / 'run_config.yaml').resolve()),
                 'checkpoint_prefix': self.checkpoint_prefix,
+                'config_sources': self.config_sources,
+                'initialization': self.initialization_info,
+                'parameter_audit': self.parameter_audit_record,
             },
             path,
         )
@@ -1391,4 +1808,5 @@ class Trainer:
             scheduler=self.scheduler if training else None,
             scaler=self.scaler if training else None,
             grad_clip_norm=self.grad_clip_norm,
+            loss_reduction_config=self.config.get('loss_reduction'),
         )

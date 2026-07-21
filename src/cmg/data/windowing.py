@@ -20,15 +20,17 @@ def compute_phase_label(
     t_if_enter: float,
     t_if_exit: float,
     overlap_threshold: float,
+    source_phase: str = 'Water',
+    target_phase: str = 'Air',
 ) -> str:
     overlap = compute_overlap(window_start, window_end, t_if_enter, t_if_exit)
     if overlap >= overlap_threshold:
         return 'Interface'
     center = 0.5 * (window_start + window_end)
     if center < t_if_enter:
-        return 'Water'
+        return source_phase
     if center > t_if_exit:
-        return 'Air'
+        return target_phase
     return 'Interface'
 
 
@@ -36,13 +38,15 @@ def compute_phase_label_at_timestamp(
     timestamp: float,
     t_if_enter: float,
     t_if_exit: float,
+    source_phase: str = 'Water',
+    target_phase: str = 'Air',
 ) -> str:
     """Return the semantic medium phase at one causal policy timestamp."""
     if timestamp < t_if_enter:
-        return 'Water'
+        return source_phase
     if timestamp <= t_if_exit:
         return 'Interface'
-    return 'Air'
+    return target_phase
 
 
 def compute_stable_mask(
@@ -51,11 +55,13 @@ def compute_stable_mask(
     t_if_enter: float,
     t_if_exit: float,
     stable_margin: float,
+    source_phase: str = 'Water',
+    target_phase: str = 'Air',
 ) -> tuple[bool, str | None]:
     if window_end <= t_if_enter - stable_margin:
-        return True, 'Water'
+        return True, source_phase
     if window_start >= t_if_exit + stable_margin:
-        return True, 'Air'
+        return True, target_phase
     return False, None
 
 
@@ -66,6 +72,8 @@ def label_window(
     t_if_exit: float,
     overlap_threshold: float,
     stable_margin: float,
+    source_phase: str = 'Water',
+    target_phase: str = 'Air',
 ) -> WindowLabel:
     phase_label = compute_phase_label(
         window_start=window_start,
@@ -73,6 +81,8 @@ def label_window(
         t_if_enter=t_if_enter,
         t_if_exit=t_if_exit,
         overlap_threshold=overlap_threshold,
+        source_phase=source_phase,
+        target_phase=target_phase,
     )
     stable, stable_phase = compute_stable_mask(
         window_start=window_start,
@@ -80,6 +90,8 @@ def label_window(
         t_if_enter=t_if_enter,
         t_if_exit=t_if_exit,
         stable_margin=stable_margin,
+        source_phase=source_phase,
+        target_phase=target_phase,
     )
     return WindowLabel(phase_label=phase_label, is_stable_mask=stable, stable_phase=stable_phase)
 

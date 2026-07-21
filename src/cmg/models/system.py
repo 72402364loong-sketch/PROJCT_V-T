@@ -6,11 +6,13 @@ import torch
 from torch import nn
 
 from .modules import (
+    DirectionEmbedding,
     MediumBeliefHead,
     MultiAttributeHead,
     PhaseAwareGateStabilizer,
     PhysicalAttributeHead,
     PolicyHead,
+    ResidualFiLMAdapter,
     TactileContentEncoder,
     TactileEvidenceEncoder,
     VisualEncoder,
@@ -28,6 +30,9 @@ class CrossMediumSystem(nn.Module):
             physical_attribute_config = {}
         medium_config = model_config['medium']
         policy_config = model_config['policy']
+        direction_config = model_config.get('direction_conditioning', {})
+        if not isinstance(direction_config, dict):
+            raise RuntimeError('model.direction_conditioning must be a mapping.')
         proj_dim = int(visual_config['proj_dim'])
         self.visual_proj_dim = proj_dim
         visual_hidden_dim = int(visual_config.get('hidden_dim', visual_config.get('token_dim', proj_dim)))
@@ -44,6 +49,40 @@ class CrossMediumSystem(nn.Module):
         self.use_interface_context = bool(policy_config.get('use_interface_context', False))
         self.use_reference_force_context = bool(policy_config.get('use_reference_force_context', False))
         self.reference_force_context_scale = float(policy_config.get('reference_force_context_scale', 100.0))
+        self.direction_conditioning_enabled = bool(direction_config.get('enabled', False))
+        self.require_explicit_direction = bool(direction_config.get('require_explicit_direction', True))
+        self.direction_num_directions = int(direction_config.get('num_directions', 2))
+        self.direction_embedding_dim = int(direction_config.get('embedding_dim', 16))
+        self.direction_diagnostics_enabled = bool(direction_config.get('return_diagnostics', False))
+        medium_direction_config = direction_config.get('medium', {})
+        policy_direction_config = direction_config.get('policy', {})
+        if not isinstance(medium_direction_config, dict) or not isinstance(policy_direction_config, dict):
+            raise RuntimeError('direction_conditioning.medium and .policy must be mappings.')
+        self.medium_direction_conditioning_enabled = (
+            self.direction_conditioning_enabled and bool(medium_direction_config.get('enabled', True))
+        )
+        self.policy_direction_conditioning_enabled = (
+            self.direction_conditioning_enabled and bool(policy_direction_config.get('enabled', True))
+        )
+        for branch_name, branch_config, enabled in (
+            ('medium', medium_direction_config, self.medium_direction_conditioning_enabled),
+            ('policy', policy_direction_config, self.policy_direction_conditioning_enabled),
+        ):
+            if enabled and str(branch_config.get('mode', 'residual_film')).strip().lower() != 'residual_film':
+                raise RuntimeError(
+                    f'Unsupported direction_conditioning.{branch_name}.mode={branch_config.get("mode")!r}; '
+                    "expected 'residual_film'."
+                )
+        if self.policy_direction_conditioning_enabled and self.policy_head_type not in {
+            'state_residual',
+            'state_residual_sign_specific',
+            'state_residual_per_finger',
+            'state_residual_per_finger_sign_specific',
+        }:
+            raise RuntimeError(
+                'Policy direction conditioning requires a state_residual policy head, '
+                f'got {self.policy_head_type!r}.'
+            )
         if self.reference_force_context_scale <= 0.0:
             raise RuntimeError(
                 f"policy.reference_force_context_scale must be positive, got {self.reference_force_context_scale}."
@@ -73,6 +112,36 @@ class CrossMediumSystem(nn.Module):
                 output_mode=str(gate_stabilizer_config.get('output_mode', 'masked_raw')),
             )
             if self.gate_stabilizer_enabled
+            else None
+        )
+
+        if self.direction_conditioning_enabled:
+            if not self.medium_direction_conditioning_enabled and not self.policy_direction_conditioning_enabled:
+                raise RuntimeError('Direction conditioning is enabled but both Medium and Policy adapters are disabled.')
+            self.direction_embedding = DirectionEmbedding(
+                num_directions=self.direction_num_directions,
+                embedding_dim=self.direction_embedding_dim,
+            )
+        else:
+            self.direction_embedding = None
+        self.medium_direction_adapter = (
+            ResidualFiLMAdapter(
+                condition_dim=self.direction_embedding_dim,
+                feature_dim=int(tactile_config['evidence_hidden_dim']),
+                hidden_dim=int(medium_direction_config.get('hidden_dim', 32)),
+                zero_init=bool(medium_direction_config.get('zero_init', direction_config.get('zero_init', True))),
+            )
+            if self.medium_direction_conditioning_enabled
+            else None
+        )
+        self.policy_direction_adapter = (
+            ResidualFiLMAdapter(
+                condition_dim=self.direction_embedding_dim,
+                feature_dim=int(policy_config['hidden_dim']),
+                hidden_dim=int(policy_direction_config.get('hidden_dim', 64)),
+                zero_init=bool(policy_direction_config.get('zero_init', direction_config.get('zero_init', True))),
+            )
+            if self.policy_direction_conditioning_enabled
             else None
         )
 
@@ -128,6 +197,30 @@ class CrossMediumSystem(nn.Module):
             finger_count=self.policy_finger_count,
             finger_embedding_dim=int(policy_config.get('finger_embedding_dim', 16)),
         )
+
+    def _direction_embedding_from_batch(
+        self,
+        batch: dict[str, torch.Tensor],
+        *,
+        batch_size: int,
+        reference: torch.Tensor,
+    ) -> torch.Tensor | None:
+        if not self.direction_conditioning_enabled:
+            return None
+        direction_ids = batch.get('direction_ids')
+        if direction_ids is None:
+            if self.require_explicit_direction:
+                raise RuntimeError('Direction-conditioned model requires batch["direction_ids"].')
+            direction_ids = torch.zeros(batch_size, dtype=torch.long, device=reference.device)
+        else:
+            direction_ids = direction_ids.to(device=reference.device)
+        if direction_ids.ndim != 1 or direction_ids.shape[0] != batch_size:
+            raise RuntimeError(
+                f'direction_ids must have shape [{batch_size}], got {tuple(direction_ids.shape)}.'
+            )
+        if self.direction_embedding is None:
+            raise RuntimeError('Direction embedding module is missing while direction conditioning is enabled.')
+        return self.direction_embedding(direction_ids).to(dtype=reference.dtype)
 
     @staticmethod
     def _apply_reference_force_base_override(
@@ -272,7 +365,26 @@ class CrossMediumSystem(nn.Module):
         z_content, z_t = self.content_encoder(flat_tactile_high, flat_tactile_mask)
         z_med_window = self.evidence_encoder(flat_tactile_low, flat_tactile_mask)
         z_med_sequence = z_med_window.reshape(batch_size, max_windows, -1)
-        medium_logits, p_medium, medium_hidden, medium_sequence_features = self.medium_head(z_med_sequence, batch['window_lengths'])
+        direction_embedding = self._direction_embedding_from_batch(
+            batch,
+            batch_size=batch_size,
+            reference=z_med_window,
+        )
+        medium_direction_modulation = None
+        conditioned_z_med_sequence = z_med_sequence
+        if self.medium_direction_adapter is not None:
+            if direction_embedding is None:
+                raise RuntimeError('Medium direction adapter requires a direction embedding.')
+            medium_direction_modulation = self.medium_direction_adapter.modulation(direction_embedding)
+            conditioned_z_med_sequence = ResidualFiLMAdapter.apply_modulation(
+                z_med_sequence,
+                medium_direction_modulation[0],
+                medium_direction_modulation[1],
+            )
+        medium_logits, p_medium, medium_hidden, medium_sequence_features = self.medium_head(
+            conditioned_z_med_sequence,
+            batch['window_lengths'],
+        )
         flat_medium = p_medium.reshape(batch_size * max_windows, -1)
         flat_medium_features = medium_sequence_features.reshape(batch_size * max_windows, -1)
         state_context = torch.cat([z_med_window, flat_medium_features, flat_medium], dim=-1)
@@ -355,12 +467,23 @@ class CrossMediumSystem(nn.Module):
             raw_gate = p_medium[..., 1] if p_medium.shape[-1] > 1 else torch.zeros_like(batch['window_mask'], dtype=flat_medium.dtype)
             stabilized_gate = self.gate_stabilizer(raw_gate, batch['window_mask'])
             interface_gate_override = stabilized_gate.reshape(batch_size * max_windows)
+        policy_direction_modulation = None
+        if self.policy_direction_adapter is not None:
+            if direction_embedding is None:
+                raise RuntimeError('Policy direction adapter requires a direction embedding.')
+            flat_direction_embedding = (
+                direction_embedding[:, None, :]
+                .expand(-1, max_windows, -1)
+                .reshape(batch_size * max_windows, -1)
+            )
+            policy_direction_modulation = self.policy_direction_adapter.modulation(flat_direction_embedding)
         policy_outputs = self.policy_head(
             task_context,
             flat_medium,
             state_context=state_context,
             residual_context=residual_context,
             interface_gate_override=interface_gate_override,
+            residual_modulation=policy_direction_modulation,
         )
         if self.policy_base_source == 'reference_force':
             policy_outputs = self._apply_reference_force_base_override(policy_outputs, batch)
@@ -440,6 +563,14 @@ class CrossMediumSystem(nn.Module):
             outputs['interface_context_embedding'] = pooled_context
         if 'force_base_learned' in policy_outputs:
             outputs['force_base_learned'] = policy_outputs['force_base_learned']
+        if direction_embedding is not None:
+            outputs['transition_direction_embedding'] = direction_embedding
+        if self.direction_diagnostics_enabled and medium_direction_modulation is not None:
+            outputs['medium_direction_gamma'] = medium_direction_modulation[0]
+            outputs['medium_direction_beta'] = medium_direction_modulation[1]
+        if self.direction_diagnostics_enabled and policy_direction_modulation is not None:
+            outputs['policy_direction_gamma'] = policy_direction_modulation[0]
+            outputs['policy_direction_beta'] = policy_direction_modulation[1]
         return outputs
 
     def forward_online_step(
@@ -451,10 +582,40 @@ class CrossMediumSystem(nn.Module):
         h_v, z_v = self.visual_encoder(batch['video'], batch['frame_mask'])
         z_content, z_t = self.content_encoder(batch['tactile_high'], batch['tactile_mask'])
         z_med_window = self.evidence_encoder(batch['tactile_low'], batch['tactile_mask'])
-        medium_logits, p_medium, next_hidden, medium_step_features = self.medium_head.step(z_med_window, hidden_state=medium_hidden)
+        direction_embedding = self._direction_embedding_from_batch(
+            batch,
+            batch_size=z_med_window.shape[0],
+            reference=z_med_window,
+        )
+        medium_direction_modulation = None
+        conditioned_z_med_window = z_med_window
+        if self.medium_direction_adapter is not None:
+            if direction_embedding is None:
+                raise RuntimeError('Medium direction adapter requires a direction embedding.')
+            medium_direction_modulation = self.medium_direction_adapter.modulation(direction_embedding)
+            conditioned_z_med_window = ResidualFiLMAdapter.apply_modulation(
+                z_med_window,
+                medium_direction_modulation[0],
+                medium_direction_modulation[1],
+            )
+        medium_logits, p_medium, next_hidden, medium_step_features = self.medium_head.step(
+            conditioned_z_med_window,
+            hidden_state=medium_hidden,
+        )
         state_context = torch.cat([z_med_window, medium_step_features, p_medium], dim=-1)
         attribute_outputs, _, _, g_obj, task_context, _ = self._build_task_context(h_v, z_content)
-        policy_outputs = self.policy_head(task_context, p_medium, state_context=state_context, residual_context=None)
+        policy_direction_modulation = None
+        if self.policy_direction_adapter is not None:
+            if direction_embedding is None:
+                raise RuntimeError('Policy direction adapter requires a direction embedding.')
+            policy_direction_modulation = self.policy_direction_adapter.modulation(direction_embedding)
+        policy_outputs = self.policy_head(
+            task_context,
+            p_medium,
+            state_context=state_context,
+            residual_context=None,
+            residual_modulation=policy_direction_modulation,
+        )
         if self.policy_base_source == 'reference_force':
             policy_outputs = self._apply_reference_force_base_override(policy_outputs, batch)
         outputs = {
@@ -507,4 +668,12 @@ class CrossMediumSystem(nn.Module):
                 outputs[key] = policy_outputs[key]
         if 'force_base_learned' in policy_outputs:
             outputs['force_base_learned'] = policy_outputs['force_base_learned']
+        if direction_embedding is not None:
+            outputs['transition_direction_embedding'] = direction_embedding
+        if self.direction_diagnostics_enabled and medium_direction_modulation is not None:
+            outputs['medium_direction_gamma'] = medium_direction_modulation[0]
+            outputs['medium_direction_beta'] = medium_direction_modulation[1]
+        if self.direction_diagnostics_enabled and policy_direction_modulation is not None:
+            outputs['policy_direction_gamma'] = policy_direction_modulation[0]
+            outputs['policy_direction_beta'] = policy_direction_modulation[1]
         return outputs
